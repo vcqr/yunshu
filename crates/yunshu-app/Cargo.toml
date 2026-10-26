@@ -1,0 +1,23 @@
+[package]
+name = "yunshu-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "yunshu"
+path = "src/main.rs"
+
+[features]
+# 嵌入前端资源必需；前端迭代时可 --no-default-features 配合 vite dev
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+serde = { workspace = true }
+serde_json = "1"
+yunshu-core = { path = "../yunshu-core" }
