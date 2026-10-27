@@ -261,18 +261,23 @@ pub fn open_msg(noise: &Mutex<TransportState>, cipher: &[u8]) -> Result<PigeonIn
 
 // ---------- 发现层 ----------
 
-pub fn make_udp_socket() -> StdUdpSocket {
+pub fn make_udp_socket() -> Option<StdUdpSocket> {
     let sock = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )
-    .expect("创建 UDP socket 失败");
+    .ok()?;
     let _ = sock.set_reuse_address(true);
+    // macOS/BSD：UDP 同端口重复绑定（同机双开）必须 SO_REUSEPORT，SO_REUSEADDR 不够；
+    // Linux 靠 SO_REUSEADDR 即可，Windows 的 SO_REUSEADDR 语义本身允许重复绑定
+    #[cfg(target_os = "macos")]
+    let _ = sock.set_reuse_port(true);
     let _ = sock.set_nonblocking(true);
     let addr: SocketAddr = ([0, 0, 0, 0], PIGEON_UDP_PORT).into();
-    sock.bind(&addr.into()).expect("UDP 34255 绑定失败");
-    sock.into()
+    // 绑定失败（如其他实例占用且无法共存）：降级为无发现，不 panic（panic=abort 会杀掉整个 app）
+    sock.bind(&addr.into()).ok()?;
+    Some(sock.into())
 }
 
 /// 同步上下文非阻塞投递控制消息（UI 线程用；队列满或断开则丢弃并返回 false）
@@ -319,7 +324,11 @@ pub fn emit_peers(st: &AppState) {
 
 /// 发现主循环：广播 + 收包 + 过期清扫
 pub async fn run_discovery(st: Arc<AppState>) {
-    let std_sock = make_udp_socket();
+    let Some(std_sock) = make_udp_socket() else {
+        tracing::warn!("UDP {} 绑定失败，本实例禁用飞鸽发现（PC↔PC），手机传输不受影响", PIGEON_UDP_PORT);
+        st.emit(CoreEvent::Toast { text: format!("UDP {PIGEON_UDP_PORT} 被占用，飞鸽发现已禁用（可能已有云书实例在运行）") });
+        return;
+    };
     let sock = Arc::new(tokio::net::UdpSocket::from_std(std_sock).expect("UDP socket 转换失败"));
     let _ = sock.set_broadcast(true);
 
