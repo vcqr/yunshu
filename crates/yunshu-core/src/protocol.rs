@@ -31,6 +31,9 @@ pub enum WsOut {
         reason: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pc_name: Option<String>,
+        /// HTTP 端口（自签 HTTPS 下部分手机浏览器的下载管理器不走页面信任，备用 HTTP 直连下载用）
+        #[serde(skip_serializing_if = "Option::is_none")]
+        http_port: Option<u16>,
     },
     PcText { text: String },
     PcFile { id: String, name: String, size: u64 },

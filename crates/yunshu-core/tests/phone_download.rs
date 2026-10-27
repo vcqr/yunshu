@@ -113,6 +113,7 @@ async fn phone_file_download_stream_completes() {
     let v: serde_json::Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
     assert_eq!(v["type"], "pair_result", "应为配对结果: {v}");
     assert_eq!(v["ok"], true, "配对应成功: {v}");
+    assert_eq!(v["http_port"], PORT, "应携带 HTTP 备用端口");
     let session = v["session"].as_str().unwrap().to_string();
 
     // 造一个 3MB 测试文件

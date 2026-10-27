@@ -173,6 +173,12 @@
   .act svg.ic { font-size: 15px; }
   .act:active { opacity: .6; }
 
+  .wx-guide { background: rgba(217, 138, 11, .13); color: var(--wait); font-size: 12.5px; line-height: 1.5;
+              padding: 8px 12px; display: flex; align-items: center; gap: 7px; }
+  .wx-guide svg.ic { flex: none; font-size: 15px; }
+  .wx-guide .close { margin-left: auto; border: none; background: none; color: inherit; font-size: 15px;
+                     cursor: pointer; padding: 0 2px; flex: none; }
+
   footer { background: var(--card); border-top: 1px solid var(--line);
            padding: 9px 12px; padding-bottom: max(9px, env(safe-area-inset-bottom));
            display: flex; gap: 9px; align-items: center; }
@@ -279,6 +285,11 @@
       <span id="pc-status"><i class="dot"></i>连接中…</span>
     </div>
   </header>
+  <div id="wechat-guide" class="wx-guide hidden">
+    <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+    <span>微信内无法下载文件：点右上角「···」→「在浏览器打开」后再操作</span>
+    <button class="close" aria-label="关闭" onclick="this.parentElement.classList.add('hidden')">✕</button>
+  </div>
   <div id="chat"></div>
   <footer>
     <button class="round-btn" id="btn-file" aria-label="发送文件" title="发送文件">
@@ -297,6 +308,12 @@
 const $ = id => document.getElementById(id);
 let ws = null, paired = false, retryTimer = null, tokenDead = false;
 let session = '';
+let httpPort = '';
+const IS_WECHAT = /MicroMessenger/i.test(navigator.userAgent);
+function showWeChatGuide() {
+  if (!IS_WECHAT) return;
+  $('wechat-guide').classList.remove('hidden');
+}
 try { session = sessionStorage.getItem('ys-session') || ''; } catch (_) {}
 const token = new URLSearchParams(location.search).get('t') || '';
 let pcName = '电脑';
@@ -374,6 +391,7 @@ function handle(m) {
         paired = true;
         session = m.session;
         storeSession(session);
+        if (m.http_port) httpPort = m.http_port;
         pcName = m.pc_name || '电脑';
         $('pc-name').textContent = pcName;
         $('pc-avatar').textContent = (pcName[0] || '云').toUpperCase();
@@ -597,6 +615,21 @@ function addInFile(m) {
   a.setAttribute('download', m.name);
   a.style.textDecoration = 'none';
   card.appendChild(a);
+  // 备用通道：自签 HTTPS 下部分手机浏览器的下载管理器不继承页面的证书信任，
+  // 头能收到但 body 0 字节；顶级导航到 HTTP 端口可完全绕开
+  if (httpPort && String(httpPort) !== location.port) {
+    const h = el('a', 'act');
+    h.innerHTML = dlSvg + ' HTTP 直连下载（上面失败时用）';
+    h.href = 'http://' + location.hostname + ':' + httpPort + '/file/' + m.id + '?s=' + encodeURIComponent(session);
+    h.setAttribute('download', m.name);
+    h.style.textDecoration = 'none';
+    card.appendChild(h);
+  }
+  // 微信内置浏览器不支持任意文件下载（下载器拿到响应头后不读数据直接失败），引导去浏览器打开
+  if (IS_WECHAT) {
+    a.addEventListener('click', e => { e.preventDefault(); showWeChatGuide(); });
+    showWeChatGuide();
+  }
   row.appendChild(card);
   $('chat').appendChild(row);
   scrollBottom();

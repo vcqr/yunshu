@@ -890,7 +890,7 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
         if let Ok(json) = serde_json::to_string(&WsOut::PairResult {
             ok: false, session: None,
             reason: Some("电脑上已有其他设备连接".into()),
-            pc_name: None,
+            pc_name: None, http_port: None,
         }) {
             let _ = socket.send(Message::text(json)).await;
         }
@@ -955,7 +955,7 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
                     paired = true;
                     let _ = out_tx2.send(serde_json::to_string(&WsOut::PairResult {
                         ok: true, session: Some(s.to_string()), reason: None,
-                        pc_name: Some(st.cfg.pc_name.clone()),
+                        pc_name: Some(st.cfg.pc_name.clone()), http_port: Some(st.cfg.port),
                     }).unwrap());
                     tracing::info!("手机「{}」恢复会话", device.trim());
                     st.emit(CoreEvent::PairOk { device: device.trim().to_string() });
@@ -965,7 +965,7 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
                     let _ = out_tx2.send(serde_json::to_string(&WsOut::PairResult {
                         ok: false, session: None,
                         reason: Some("二维码已过期，请在电脑上刷新后重新扫码".into()),
-                        pc_name: None,
+                        pc_name: None, http_port: None,
                     }).unwrap());
                     break;
                 }
@@ -984,13 +984,14 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
                     tracing::info!("「{device}」配对成功");
                     let _ = out_tx2.send(serde_json::to_string(&WsOut::PairResult {
                         ok: true, session: Some(session), reason: None, pc_name: Some(pc_name),
+                        http_port: Some(st.cfg.port),
                     }).unwrap());
                     st.emit(CoreEvent::PairOk { device });
                 }
                 Err(reason) => {
                     tracing::info!("配对失败：{reason}");
                     let _ = out_tx2.send(serde_json::to_string(&WsOut::PairResult {
-                        ok: false, session: None, reason: Some(reason.into()), pc_name: None,
+                        ok: false, session: None, reason: Some(reason.into()), pc_name: None, http_port: None,
                     }).unwrap());
                     st.emit(CoreEvent::PairFailed { reason: reason.into() });
                 }
@@ -1007,7 +1008,7 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
             }
             WsIn::SendText { .. } => {
                 let _ = out_tx2.send(serde_json::to_string(&WsOut::PairResult {
-                    ok: false, session: None, reason: Some("尚未完成配对".into()), pc_name: None,
+                    ok: false, session: None, reason: Some("尚未完成配对".into()), pc_name: None, http_port: None,
                 }).unwrap());
             }
         }
@@ -1095,13 +1096,19 @@ async fn download(
     });
 
     let encoded = urlencoding::encode(&name);
+    // ASCII 回退名：部分手机浏览器不解析 filename*，至少给出可读的真实名
+    let ascii_name: String = name
+        .chars()
+        .filter(|c| c.is_ascii() && !c.is_control() && *c != '"' && *c != '\\')
+        .collect();
+    let ascii_name = if ascii_name.trim().is_empty() { "download".to_string() } else { ascii_name };
     let mut resp_headers = vec![
         (header::CONTENT_TYPE, "application/octet-stream".to_string()),
         (header::CONTENT_LENGTH, expect_len.to_string()),
         (header::ACCEPT_RANGES, "bytes".to_string()),
         (
             header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"download\"; filename*=UTF-8''{encoded}"),
+            format!("attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"),
         ),
     ];
     if status == StatusCode::PARTIAL_CONTENT {
