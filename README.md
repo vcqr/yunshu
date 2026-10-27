@@ -42,13 +42,63 @@ npm run dev         # 仅浏览器预览（无 Tauri 能力，窗口按钮等自
 3. 手机（与电脑同一局域网）相机扫码 → 浏览器打开 → 输入电脑上显示的 6 位配对码
 4. 互传文件 / 文本
 
+## 本机测试（e2e）
+
+`crates/pigeonbot` 是一个无头飞鸽测试节点，可在同一台机器上与云书实例完成 PC↔PC 双向传输的端到端验证（Noise XX 握手、批次邀请、逐文件 SHA-256 校验、暂停/恢复、断点续传）。
+
+```bash
+cargo build --release -p pigeonbot   # 构建测试节点
+
+# 终端 1：启动云书主程序
+./target/release/yunshu              # Windows 下为 yunshu.exe
+
+# 终端 2：启动测试节点
+./target/release/pigeonbot 1048576 60
+```
+
+bot 参数：第 1 个为 bot→app 推送批次的测试大小（默认 1MB）；第 2 个为推送完成后保持在线等待 app→bot 来件的秒数（默认 30，拖拽测试建议给大些，传 `0` 表示只测 bot→app 后即退）。
+
+**bot→app 方向**：bot 每 2 秒 UDP 广播，app 飞鸽列表出现"e2e测试节点"并自动连入；握手后 bot 发一条加密聊天 + 三文件批次（1MB / 参数大小 / 0 字节，覆盖空文件与暂停恢复）。在 app 里确认接收后由 app 主动拉取，全部校验通过后 bot 打印 `E2E-BOT-DONE <总字节> <批次id>`，文件落在保存目录。
+
+**app→bot 方向**（测拖拽/右键发送）：在等待窗口内把文件拖进 app 选 bot 发送，bot 无条件自动接受、收块写盘、逐文件校验，完成后打印 `E2E-BOT-RECV-DONE`，文件在 `/tmp/pigeonbot_recv/<批次id>/out/`。
+
+### 单机双开互传
+
+不用 bot，直接开两个云书实例互相传（CLI 覆盖只影响本次运行，不写入 config.toml）：
+
+```bash
+# 终端 1（实例 A，默认端口 34256）
+./target/release/yunshu
+
+# 终端 2（实例 B，换 HTTP/WS 端口 + 换广播名）
+./target/release/yunshu --port 8001 --name 电脑B
+```
+
+两个窗口的飞鸽列表都会出现对方（实例 id 每次启动随机生成，必然互相可见；UDP 发现端口支持同机多实例共存：macOS 用 SO_REUSEPORT、Linux/Windows 用 SO_REUSEADDR），选中互发文件/文本即可。给任一实例设 `YUNSHU_AUTO_ACCEPT=1` 可自动接受来件批次，免点确认弹窗。
+
+已知差异（不影响 PC↔PC 互传测试）：HTTPS 34257 只有一个，实例 B 会绑定失败并降级为无 HTTPS（手机端安全上下文功能不可用）；两个实例共享配置目录，静态密钥与信任表相同，互连一般不弹信任确认。
+
+排查：
+
+- 列表能看到节点但连不上——双方约定 id 小者发起连接，bot 只被动接受；bot id 固定来自 `/tmp/pigeonbot_key.bin`，删掉该文件重启 bot 即可换 id
+- 换过 bot key 后连不上——app 已 TOFU 固定旧指纹，重置 `known_peers.json`（配置目录下，Windows 为 `%APPDATA%\yunshu`）
+- 开了防打扰模式会直接拒绝未信任设备，测试时先关掉
+
+纯逻辑单元测试不依赖网络：`cargo test`。
+
 ## 防火墙提示
 
-首次运行 Windows 会弹窗询问是否允许访问网络，**务必允许**（专用网络）。若错过弹窗，手动放行：
+首次运行 Windows 会弹窗询问是否允许访问网络，**务必允许**（专用网络）。若错过弹窗，手动放行（启动时固定监听 3 个端口）：
 
 ```powershell
-netsh advfirewall firewall add rule name="yunshu" dir=in action=allow protocol=TCP localport=34256
+netsh advfirewall firewall add rule name="yunshu-http"  dir=in action=allow protocol=TCP localport=34256
+netsh advfirewall firewall add rule name="yunshu-https" dir=in action=allow protocol=TCP localport=34257
+netsh advfirewall firewall add rule name="yunshu-disc"  dir=in action=allow protocol=UDP localport=34255
 ```
+
+- TCP 34256：HTTP（手机配对/传输页面 + PC↔PC 飞鸽 WebSocket）
+- TCP 34257：HTTPS（自签证书，手机浏览器安全上下文）
+- UDP 34255：飞鸽发现广播（不放行则互相发现不了）
 
 若发现"手机打不开页面"，先查：① 防火墙规则；② 路由器是否开启了 AP 隔离/访客网络；③ 电脑是否连了 VPN 虚拟网卡。
 
