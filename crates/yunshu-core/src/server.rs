@@ -8,7 +8,7 @@ use crate::{
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio_util::io::ReaderStream;
 
@@ -1039,6 +1039,7 @@ fn offer_file(st: &Arc<AppState>, path: PathBuf) {
 async fn download(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Query(_q): Query<HashMap<String, String>>,
 ) -> Response {
     // 文件 id 本身（uuid simple，128 位不可猜测）即下载凭证；
@@ -1046,9 +1047,30 @@ async fn download(
     let Some((path, name, size)) = st.offers.lock().unwrap().get(&id).cloned() else {
         return err_page(StatusCode::NOT_FOUND, "文件不存在或已被清理");
     };
-    let Ok(file) = tokio::fs::File::open(&path).await else {
+    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok()).map(String::from);
+    tracing::info!("手机下载请求: id={id} name={name} size={size} range={range_header:?}");
+    let Ok(mut file) = tokio::fs::File::open(&path).await else {
         return err_page(StatusCode::NOT_FOUND, "文件读取失败");
     };
+
+    // Range 分段（iOS Safari 下载器会先发 bytes=0- 探测；也是断点续传的基础）。
+    // 仅支持单段 bytes=start-end / bytes=start-；size==0 直接 200 空体。
+    let (status, start, expect_len) = if size == 0 {
+        (StatusCode::OK, 0u64, 0u64)
+    } else if let Some(r) = range_header.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
+        let mut it = r.splitn(2, '-');
+        let s: u64 = it.next().unwrap_or("").parse().unwrap_or(0);
+        let e: Option<u64> = it.next().and_then(|x| x.parse().ok());
+        let max = size - 1;
+        let start = s.min(max);
+        let end = e.unwrap_or(max).min(max);
+        (StatusCode::PARTIAL_CONTENT, start, end - start + 1)
+    } else {
+        (StatusCode::OK, 0, size)
+    };
+    if start > 0 && file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return err_page(StatusCode::INTERNAL_SERVER_ERROR, "文件定位失败");
+    }
 
     st.update_transfer(&id, 0, None, TransferStatus::Active, None);
 
@@ -1056,10 +1078,10 @@ async fn download(
     let st2 = st.clone();
     let id2 = id.clone();
     let total2 = total.clone();
-    let stream = ReaderStream::new(file).map(move |chunk| match chunk {
+    let stream = ReaderStream::new(file.take(expect_len)).map(move |chunk| match chunk {
         Ok(b) => {
             let n = total2.fetch_add(b.len() as u64, Ordering::Relaxed) + b.len() as u64;
-            let done = n >= size;
+            let done = n >= expect_len;
             st2.progress_throttled(&id2, n, done);
             if done {
                 st2.update_transfer(&id2, n, None, TransferStatus::Done, None);
@@ -1073,15 +1095,28 @@ async fn download(
     });
 
     let encoded = urlencoding::encode(&name);
-    let headers = [
+    let mut resp_headers = vec![
         (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-        (header::CONTENT_LENGTH, size.to_string()),
+        (header::CONTENT_LENGTH, expect_len.to_string()),
+        (header::ACCEPT_RANGES, "bytes".to_string()),
         (
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"download\"; filename*=UTF-8''{encoded}"),
         ),
     ];
-    (StatusCode::OK, headers, Body::from_stream(stream)).into_response()
+    if status == StatusCode::PARTIAL_CONTENT {
+        resp_headers.push((
+            header::CONTENT_RANGE,
+            // RFC 7233 格式："bytes 1000-1999/3000000"，连字符两侧与斜杠前不留空格
+            format!("bytes {start}-{}/{}", start + expect_len - 1, size),
+        ));
+    }
+    let mut resp = (status, Body::from_stream(stream)).into_response();
+    for (k, v) in resp_headers {
+        resp.headers_mut()
+            .insert(k, axum::http::HeaderValue::from_str(&v).expect("响应头值非法"));
+    }
+    resp
 }
 
 pub(crate) fn sanitize_name(name: &str) -> String {
