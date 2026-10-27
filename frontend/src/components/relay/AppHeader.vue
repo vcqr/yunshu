@@ -2,7 +2,7 @@
 /**
  * AppHeader：桌面软件式紧凑标题栏（h-11），同时是无边框窗口的自绘标题栏
  * （data-tauri-drag-region="deep" 整条子树可拖拽，双击最大化走 onTitlebarDblclick）：
- * macOS 红绿灯 | logo + 名称 | 传输（lg+ 第三栏开关 / 小屏浮层）| 主题 | 设置 | 窗口控制
+ * macOS 红绿灯 | logo + 名称（仅 Win/Linux，macOS 惯例不放）| 传输（lg+ 第三栏开关 / 小屏浮层）| 主题 | 设置 | 窗口控制
  * 连接状态只在底部状态栏展示（此前头部/底栏重复展示，已收敛）。
  */
 import { computed, ref } from 'vue'
@@ -60,8 +60,11 @@ const transferOpen = ref(false)
       <Menu class="size-4.5" />
     </button>
 
-    <AppLogo size="sm" />
-    <span class="text-sm font-semibold tracking-tight">云书</span>
+    <!-- macOS 惯例：窗口标题栏不放 logo/应用名（应用名在系统菜单栏），Windows/Linux 保留 -->
+    <template v-if="!IS_MAC">
+      <AppLogo size="sm" />
+      <span class="text-sm font-semibold tracking-tight">云书</span>
+    </template>
 
     <div class="ml-auto flex items-center gap-0.5">
       <!-- 传输任务 — 小屏：浮层 -->
