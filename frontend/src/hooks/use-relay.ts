@@ -4,6 +4,8 @@
  */
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { reactive } from 'vue'
 import { store, mutations } from '../stores/relay-store'
 import { toast } from './use-toast'
@@ -82,6 +84,19 @@ export function peerNameOf(peerId: string): string {
   return store.devices.find((d) => d.id === peerId)?.name || '电脑'
 }
 
+/* ---------- 收信感知：未读计数 + 后台时任务栏闪烁 ---------- */
+
+/**
+ * 窗口在后台时闪烁任务栏图标（Windows 惯例），窗口获得焦点后系统自动停止。
+ * 角标/toast 都在窗口内，最小化或被遮挡时不可见，需要这个窗口级提示补位。
+ */
+function flashTaskbar() {
+  if (document.hasFocus()) return
+  try {
+    void getCurrentWindow().requestUserAttention(UserAttentionType.Critical)
+  } catch { /* 非 Tauri 环境（浏览器预览） */ }
+}
+
 /* ---------- 飞鸽设备上下线 → 广播会话系统消息 ---------- */
 
 let peersInitialized = false
@@ -153,7 +168,9 @@ async function apply(ev: any) {
         kind: 'clipboard', content: ev.text, createdAt: Date.now(),
       })
       if (store.selectedPeer !== 'phone') {
+        mutations.bumpUnread('phone')
         toast.info('手机发来了文本（已复制到电脑剪贴板）')
+        flashTaskbar()
       }
       break
     case 'toast':
@@ -178,7 +195,9 @@ async function apply(ev: any) {
         kind: 'text', content: ev.text, createdAt: Date.now(),
       })
       if (store.selectedPeer !== ev.peer_id) {
+        mutations.bumpUnread(ev.peer_id)
         toast.info(`${ev.peer_name}：${ev.text}`)
+        flashTaskbar()
       }
       break
     case 'chat_broadcast':
@@ -188,7 +207,9 @@ async function apply(ev: any) {
         to: 'broadcast', kind: 'text', content: ev.text, createdAt: Date.now(),
       })
       if (store.selectedPeer !== 'broadcast' && ev.peer_id !== 'me') {
+        mutations.bumpUnread('broadcast')
         toast.info(`${ev.peer_name}（广播）：${ev.text}`)
+        flashTaskbar()
       }
       break
     case 'pigeon_trust_request':
@@ -335,7 +356,9 @@ export async function startRelay() {
 
   if (!isTauri) return
   await listen('core-event', (e: any) => { void apply(e.payload) })
-  await listen('tauri://drag-drop', (e: any) => {
+  // 拖拽必须走 onDragDropEvent：裸 tauri://drag-drop 的载荷只有 paths/position，
+  // enter/over/drop/leave 的 type 字段是这层封装归一化出来的，裸听永远匹配不上
+  await getCurrentWebview().onDragDropEvent((e: any) => {
     const p = e.payload || {}
     if (p.type === 'enter' || p.type === 'over') {
       if (p.paths?.length) dragState.active = true

@@ -33,6 +33,8 @@ export interface RelayState {
   chatStyle: ChatStyle
   /** 防打扰：仅已信任设备可连接，广播静音 */
   dnd: boolean
+  /** 未读消息数：key 为 peer id（'broadcast' | 'phone' | 设备 id），切入会话即清零 */
+  unread: Record<string, number>
 }
 
 export const store = reactive<RelayState>({
@@ -56,6 +58,7 @@ export const store = reactive<RelayState>({
   transferPanelOpen: true,
   chatStyle: 'bubble',
   dnd: false,
+  unread: {},
 })
 
 export const mutations = {
@@ -73,7 +76,11 @@ export const mutations = {
     if (name) store.phoneName = name
   },
   setDevices(devices: Device[]) { store.devices = devices },
-  setSelectedPeer(peer: string) { store.selectedPeer = peer },
+  setSelectedPeer(peer: string) {
+    store.selectedPeer = peer
+    // 切入会话即视为已读
+    delete store.unread[peer]
+  },
   addMessage(m: ChatMessage) {
     // 同 id 去重（避免本地插入与服务端回显重复）
     if (store.messages.some((x) => x.id === m.id)) return
@@ -116,6 +123,13 @@ export const mutations = {
   setTransferPanelOpen(open: boolean) { store.transferPanelOpen = open },
   setChatStyle(style: ChatStyle) { store.chatStyle = style },
   setDnd(enabled: boolean) { store.dnd = enabled },
+  bumpUnread(peer: string) {
+    if (peer === 'me') return
+    store.unread[peer] = (store.unread[peer] || 0) + 1
+  },
+  clearUnread(peer: string) {
+    delete store.unread[peer]
+  },
 }
 
 /* --------------------------- 第三栏面板偏好 --------------------------- */
@@ -193,6 +207,11 @@ export function filterEntriesForPeer(peer: string) {
     return ta - tb
   })
   return entries
+}
+
+/** 某 peer 的未读消息数 */
+export function unreadFor(peer: string): number {
+  return store.unread[peer] || 0
 }
 
 export function deviceHasActiveTransfer(deviceId: string): boolean {

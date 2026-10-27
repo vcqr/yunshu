@@ -9,7 +9,8 @@ import {
   FileUp, FolderUp, Laptop, Lock, MessagesSquare, Radio, Satellite, Smartphone,
 } from '@lucide/vue'
 import RelayAvatar from './RelayAvatar.vue'
-import { store, deviceHasActiveTransfer } from '../../stores/relay-store'
+import UnreadBadge from './UnreadBadge.vue'
+import { store, deviceHasActiveTransfer, unreadFor } from '../../stores/relay-store'
 import { relayActions } from '../../hooks/use-relay'
 import { toast } from '../../hooks/use-toast'
 import { cn } from '../../lib/utils'
@@ -157,8 +158,12 @@ async function ctxSendFolderPhone() {
         >
           <Radio class="size-3.5" />
         </span>
-        <span class="min-w-0 flex-1 truncate text-[13px] font-medium">所有人</span>
-        <span class="shrink-0 text-[10px] text-muted-foreground">广播</span>
+        <span
+          class="min-w-0 flex-1 truncate text-[13px]"
+          :class="unreadFor('broadcast') > 0 ? 'font-semibold' : 'font-medium'"
+        >所有人</span>
+        <UnreadBadge v-if="unreadFor('broadcast') > 0" :count="unreadFor('broadcast')" />
+        <span v-else class="shrink-0 text-[10px] text-muted-foreground">广播</span>
       </button>
     </div>
 
@@ -191,16 +196,21 @@ async function ctxSendFolderPhone() {
         >
           <Smartphone class="size-3.5" />
         </span>
-        <span class="min-w-0 flex-1 truncate text-[13px] font-medium">{{ phoneName }}</span>
+        <span
+          class="min-w-0 flex-1 truncate text-[13px]"
+          :class="unreadFor('phone') > 0 ? 'font-semibold' : 'font-medium'"
+        >{{ phoneName }}</span>
         <span
           v-if="activeFor('phone')"
           role="status"
           aria-label="有传输进行中"
           class="size-1.5 shrink-0 animate-pulse rounded-full bg-emerald-500"
         ></span>
-        <span v-else class="shrink-0 text-[10px] text-muted-foreground">
-          {{ phoneOnline ? '已配对' : '扫码配对' }}
-        </span>
+        <UnreadBadge v-if="unreadFor('phone') > 0" :count="unreadFor('phone')" />
+        <span
+          v-else-if="!activeFor('phone')"
+          class="shrink-0 text-[10px] text-muted-foreground"
+        >{{ phoneOnline ? '已配对' : '扫码配对' }}</span>
       </button>
     </div>
 
@@ -243,7 +253,11 @@ async function ctxSendFolderPhone() {
             @contextmenu.prevent="openCtx($event, d)"
           >
             <RelayAvatar :name="d.name" size="sm" :online="d.online" />
-            <span class="min-w-0 flex-1 truncate text-[13px] font-medium" :title="d.name">
+            <span
+              class="min-w-0 flex-1 truncate text-[13px]"
+              :class="unreadFor(d.id) > 0 ? 'font-semibold' : 'font-medium'"
+              :title="d.name"
+            >
               {{ d.name }}
             </span>
             <Lock
@@ -257,7 +271,11 @@ async function ctxSendFolderPhone() {
               aria-label="有传输进行中"
               class="size-1.5 shrink-0 animate-pulse rounded-full bg-emerald-500"
             ></span>
-            <span v-else class="shrink-0 font-mono text-[10px] text-muted-foreground">
+            <UnreadBadge v-if="unreadFor(d.id) > 0" :count="unreadFor(d.id)" />
+            <span
+              v-else-if="!activeFor(d.id)"
+              class="shrink-0 font-mono text-[10px] text-muted-foreground"
+            >
               {{ d.ip }}
             </span>
           </button>

@@ -14,7 +14,7 @@ import TransferPanel from './components/relay/TransferPanel.vue'
 import OfferDialog from './components/relay/OfferDialog.vue'
 import StatusBar from './components/relay/StatusBar.vue'
 import { startRelay } from './hooks/use-relay'
-import { store, toggleTransferPanelPersist, restoreTransferPanelPref, restoreChatStylePref } from './stores/relay-store'
+import { store, mutations, toggleTransferPanelPersist, restoreTransferPanelPref, restoreChatStylePref } from './stores/relay-store'
 import { toast, toastState } from './hooks/use-toast'
 import { cn } from './lib/utils'
 import { installTauriDblclickGuard, initWindowControls } from './lib/window-controls'
@@ -104,7 +104,7 @@ onMounted(async () => {
         aria-label="设备侧栏"
       >
         <DeviceSidebar
-          @select="(p: string) => { store.selectedPeer = p }"
+          @select="(p: string) => mutations.setSelectedPeer(p)"
         />
       </aside>
 
@@ -132,7 +132,7 @@ onMounted(async () => {
         <div class="bg-background absolute inset-y-0 left-0 w-72 border-r pt-12 shadow-xl">
           <p class="sr-only">设备与会话</p>
           <div class="h-full min-h-0">
-            <DeviceSidebar @select="(p: string) => { store.selectedPeer = p; sidebarOpen = false }" />
+            <DeviceSidebar @select="(p: string) => { mutations.setSelectedPeer(p); sidebarOpen = false }" />
           </div>
         </div>
       </div>
