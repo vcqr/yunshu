@@ -318,7 +318,7 @@ export const relayActions = {
       .catch((e) => toast.error(`切换失败：${String(e)}`))
   },
   openFolder(path: string) {
-    invoke('open_folder', { path })
+    invoke('open_folder', { path }).catch((e) => toast.error(`打开文件夹失败：${String(e)}`))
   },
   disconnectPeer(peerId: string) {
     invoke('pigeon_disconnect', { peerId })

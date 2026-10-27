@@ -179,9 +179,37 @@ fn set_save_dir(state: tauri::State<AppState>, batch: String, dir: Option<String
     });
 }
 
+/// 打开文件所在文件夹：Windows 资源管理器选中文件，macOS 在 Finder 中显示，Linux 打开所在目录
 #[tauri::command]
-fn open_folder(path: String) {
-    let _ = std::process::Command::new("explorer").arg(format!("/select,{path}")).spawn();
+fn open_folder(path: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{path}"))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-R", &path])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let dir = std::path::Path::new(&path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from(&path));
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
 }
 
 /// 粘贴的文件在浏览器侧拿不到路径：把 blob 落到临时目录，返回路径供 send_paths 使用
