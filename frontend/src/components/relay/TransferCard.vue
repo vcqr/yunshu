@@ -11,6 +11,7 @@ import {
   fileIconStyle, folderIconStyle, formatBytes, formatTime, formatSpeed, transferTitle,
 } from '../../lib/relay-format'
 import { relayActions } from '../../hooks/use-relay'
+import { toast } from '../../hooks/use-toast'
 import type { Transfer, TransferStatus } from '../../lib/relay-types'
 import { cn } from '../../lib/utils'
 
@@ -188,7 +189,21 @@ watch(
       </div>
 
       <div v-if="isReceiver && transfer.status === 'pending'" class="flex items-center gap-2 text-[11px] text-muted-foreground">
-        收到传输请求，请在弹窗中处理…
+        收到传输请求
+        <button
+          class="ml-auto flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] text-red-600 transition-colors hover:bg-red-500/10 dark:text-red-400"
+          @click="relayActions.respondTransfer(transfer.id, false); toast.info('已拒绝该传输')"
+        >
+          <X class="size-3" />
+          拒绝
+        </button>
+        <button
+          class="flex h-7 items-center gap-1 rounded-md bg-emerald-600 px-2 text-[11px] font-medium text-white transition-colors hover:bg-emerald-700"
+          @click="relayActions.respondTransfer(transfer.id, true); toast.success('已接受，等待对方发送…')"
+        >
+          <CheckCircle2 class="size-3" />
+          接受
+        </button>
       </div>
       <div v-if="isReceiver && transfer.status === 'uploading'" class="flex items-center gap-2 text-[11px] text-muted-foreground">
         <LoaderCircle class="size-3.5 animate-spin text-emerald-500" />

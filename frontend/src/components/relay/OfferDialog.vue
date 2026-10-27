@@ -1,12 +1,12 @@
 <script setup lang="ts">
 /**
  * OfferDialog：接收方确认传输请求（队列逐个弹出）
- * Esc / 点击遮罩视为拒绝；防止同一请求重复应答
+ * 支持稍后处理（Esc / 遮罩 / X）：仅关闭弹窗，请求保留在传输列表中随时可接受/拒绝
  */
-import { computed, ref } from 'vue'
+import { computed, onMounted, onUnmounted } from 'vue'
 import { Check, FileText, Folder, X } from '@lucide/vue'
 import { fileIconStyle, folderIconStyle, formatBytes } from '../../lib/relay-format'
-import { store } from '../../stores/relay-store'
+import { store, mutations } from '../../stores/relay-store'
 import { relayActions } from '../../hooks/use-relay'
 import { toast } from '../../hooks/use-toast'
 import { cn } from '../../lib/utils'
@@ -20,9 +20,6 @@ const files = computed(() => transfer.value?.files ?? [])
 const previewFiles = computed(() => files.value.slice(0, 5))
 const moreCount = computed(() => files.value.length - previewFiles.value.length)
 
-/** 防止 Action 自动关闭触发 onOpenChange 重复应答 */
-const handledRef = ref<string | null>(null)
-
 function iconFor(name: string) {
   return transfer.value?.kind === 'folder' ? folderIconStyle() : fileIconStyle(name)
 }
@@ -30,18 +27,36 @@ function iconFor(name: string) {
 function handleRespond(accepted: boolean) {
   const t = transfer.value
   if (!t) return
-  if (handledRef.value === t.id) return
-  handledRef.value = t.id
+  mutations.dequeueOffer()
   relayActions.respondTransfer(t.id, accepted)
-  store.dequeueOffer()
   if (accepted) toast.success('已接受，等待对方发送…')
   else toast.info('已拒绝该传输')
 }
+
+/** 稍后处理：仅关闭弹窗，请求保留在传输列表中随时可接受/拒绝 */
+function handleDismiss() {
+  mutations.dequeueOffer()
+  toast.info('已稍后处理，可在传输列表中继续操作')
+}
+
+function onKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && open.value) handleDismiss()
+}
+onMounted(() => window.addEventListener('keydown', onKeydown))
+onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 </script>
 
 <template>
-  <div v-if="open" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45" @click.self="handleRespond(false)">
-    <div class="bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
+  <div v-if="open" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45" @click.self="handleDismiss">
+    <div class="bg-card relative w-full max-w-md rounded-xl border p-5 shadow-xl">
+      <button
+        aria-label="稍后处理"
+        title="稍后处理：关闭弹窗，请求保留在传输列表中"
+        class="text-muted-foreground hover:text-foreground absolute top-3 right-3 flex size-7 items-center justify-center rounded-md transition-colors hover:bg-accent"
+        @click="handleDismiss"
+      >
+        <X class="size-4" />
+      </button>
       <div class="mb-1 flex items-center gap-2.5">
         <span
           :class="cn(
@@ -76,6 +91,13 @@ function handleRespond(accepted: boolean) {
       </div>
 
       <div class="mt-4 flex justify-end gap-2">
+        <button
+          class="flex h-10 items-center gap-1.5 rounded-lg px-3 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          title="关闭弹窗，请求保留在传输列表中随时处理"
+          @click="handleDismiss"
+        >
+          稍后处理
+        </button>
         <button
           class="flex h-10 items-center gap-1.5 rounded-lg border px-4 text-sm hover:bg-accent"
           @click="handleRespond(false)"

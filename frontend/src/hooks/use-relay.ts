@@ -252,8 +252,13 @@ export const relayActions = {
     const pid = peerId || (t ? (t.from === 'me' ? t.to : t.from) : '')
     if (t && !accepted) {
       t.status = 'rejected'
+    } else if (t && accepted) {
+      // 接受后 FileStart 会创建正式传输行，移除邀请占位行
+      mutations.removeTransfer(transferId)
     }
-    invoke(accepted ? 'pigeon_accept' : 'pigeon_reject', { peerId: pid, offerId: transferId })
+    try {
+      invoke(accepted ? 'pigeon_accept' : 'pigeon_reject', { peerId: pid, offerId: transferId }).catch(() => {})
+    } catch { /* 非 Tauri 环境（浏览器预览） */ }
   },
   /** 取消一次飞鸽传输（等待中或推送中，双向皆可；手机链路不支持） */
   cancelTransfer(transferId: string) {

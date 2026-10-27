@@ -899,12 +899,26 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
             }
         }
         PigeonIn::Control(PigeonWire::FileCancel { id }) => {
+            // 发送方向：推送中置取消标记；未被接受的批次直接撤回
+            if let Some(flag) = st.pigeon_push_cancel.lock().unwrap().get(&id) {
+                flag.store(true, Ordering::Relaxed);
+            }
+            if let Some(flag) = st.pigeon_push_paused.lock().unwrap().get(&id) {
+                flag.store(true, Ordering::Relaxed);
+            }
+            st.pigeon_offers.lock().unwrap().remove(&id);
             let state = st.recv_files.lock().await.remove(&id);
             if let Some(mut s) = state {
                 s.file = None;
                 let _ = std::fs::remove_dir_all(&s.dir);
                 st.update_transfer(&s.row_id, s.have, None, TransferStatus::Cancelled, None);
                 st.emit(CoreEvent::Toast { text: format!("「{}」的传输已取消", s.name) });
+            } else if let Some(t) = st.transfers.lock().unwrap().iter().find(|t| t.id == id).map(|t| (t.transferred, t.size, t.status)) {
+                // 本端是发送方：批次被对方取消/撤回
+                if !matches!(t.2, TransferStatus::Done | TransferStatus::Cancelled | TransferStatus::Refused) {
+                    st.update_transfer(&id, t.0, Some(t.1), TransferStatus::Cancelled, None);
+                }
+                tracing::info!("批次 {} 已被对方取消", &id[..8.min(id.len())]);
             } else if !st.transfers.lock().unwrap().iter().any(|t| t.id == id) {
                 // 等待接受阶段被对方撤回：本端可能挂着确认弹窗，推一条取消状态让 UI 收尾
                 let info = TransferInfo {

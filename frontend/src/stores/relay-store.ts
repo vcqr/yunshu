@@ -109,7 +109,8 @@ export const mutations = {
     store.currentOfferId = store.currentOfferId ?? store.offerQueue[0] ?? null
   },
   dequeueOffer() {
-    store.offerQueue.shift()
+    const cur = store.currentOfferId
+    store.offerQueue = store.offerQueue.filter((x) => x !== cur)
     store.currentOfferId = store.offerQueue[0] ?? null
   },
   setTransferPanelOpen(open: boolean) { store.transferPanelOpen = open },

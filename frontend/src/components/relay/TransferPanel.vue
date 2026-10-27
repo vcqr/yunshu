@@ -11,6 +11,7 @@ import {
 import { formatBytes, formatTime, transferTitle } from '../../lib/relay-format'
 import { splitTransfers } from '../../stores/relay-store'
 import { relayActions } from '../../hooks/use-relay'
+import { toast } from '../../hooks/use-toast'
 import { cn } from '../../lib/utils'
 import type { Transfer } from '../../lib/relay-types'
 
@@ -127,7 +128,7 @@ function cardMeta(t: Transfer): string {
                 aria-label="已完成"
               />
               <button
-                v-if="(t.status === 'pending' || t.status === 'uploading' || t.status === 'paused') && t.from !== 'phone' && t.to !== 'phone'"
+                v-if="(t.status === 'uploading' || t.status === 'paused') && t.from !== 'phone' && t.to !== 'phone'"
                 :aria-label="t.status === 'paused' ? '继续传输' : '暂停传输'"
                 :title="t.status === 'paused' ? '继续传输' : '暂停传输'"
                 class="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-amber-600 dark:hover:text-amber-400"
@@ -135,6 +136,24 @@ function cardMeta(t: Transfer): string {
               >
                 <Play v-if="t.status === 'paused'" class="size-3.5" />
                 <Pause v-else class="size-3.5" />
+              </button>
+              <button
+                v-if="t.status === 'pending' && t.to === 'me'"
+                aria-label="拒绝"
+                title="拒绝该传输"
+                class="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-red-500/10 hover:text-red-600 dark:hover:text-red-400"
+                @click="relayActions.respondTransfer(t.id, false); toast.info('已拒绝该传输')"
+              >
+                <X class="size-3.5" />
+              </button>
+              <button
+                v-if="t.status === 'pending' && t.to === 'me'"
+                aria-label="接受"
+                title="接受该传输"
+                class="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-emerald-500/10 hover:text-emerald-600 dark:hover:text-emerald-400"
+                @click="relayActions.respondTransfer(t.id, true); toast.success('已接受，等待对方发送…')"
+              >
+                <CheckCircle2 class="size-3.5" />
               </button>
               <button
                 v-if="(t.status === 'pending' || t.status === 'uploading' || t.status === 'paused') && t.from !== 'phone' && t.to !== 'phone'"
