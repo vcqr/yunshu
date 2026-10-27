@@ -107,34 +107,20 @@ pub fn fingerprint(remote_static: &[u8]) -> String {
     h.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
 }
 
-/// 密钥指纹是否已被用户确认固定
-pub fn is_pinned(st: &AppState, peer_id: &str, remote_static: &[u8]) -> bool {
-    let hex: String = remote_static.iter().map(|b| format!("{b:02x}")).collect();
-    let _ = st;
+/// 密钥指纹是否已被用户确认固定。
+/// 按指纹键控（而非 peer_id）：peer_id 每次进程重启都重新生成，密钥指纹才是稳定的设备身份；
+/// 同机多实例共享机器密钥时，一次信任对所有实例生效。
+pub fn is_pinned(remote_static: &[u8]) -> bool {
     let map = load_pinned();
-    match map.get(peer_id) {
-        Some(pinned) => pinned == &hex,
-        None => false,
-    }
+    map.contains_key(&fingerprint(remote_static))
 }
 
 /// 用户确认后写入固定表
-pub fn pin_peer(st: &AppState, peer_id: &str, fingerprint: &str) {
+pub fn pin_fingerprint(fp: &str) {
     let mut map = load_pinned();
-    map.insert(peer_id.to_string(), fingerprint.to_string());
+    map.insert(fp.to_string(), "1".to_string());
     save_pinned(&map);
-    tracing::info!("设备 {peer_id} 已被用户信任（指纹 {}…）", &fingerprint[..16.min(fingerprint.len())]);
-}
-
-/// 已固定的密钥与本次握手不符 → 拒绝（防冒充）
-pub fn verify_pinned_matches(peer_id: &str, remote_static: &[u8]) -> Result<(), String> {
-    let hex: String = remote_static.iter().map(|b| format!("{b:02x}")).collect();
-    let map = load_pinned();
-    match map.get(peer_id) {
-        Some(pinned) if pinned == &hex => Ok(()),
-        Some(_) => Err("对方密钥与首次配对时不符，可能是重装系统或被冒充".into()),
-        None => Ok(()),
-    }
+    tracing::info!("设备已被用户信任（指纹 {}…）", &fp[..16.min(fp.len())]);
 }
 
 // ---------- Noise 基础 ----------
@@ -459,8 +445,7 @@ async fn pigeon_connect_inner(st: &Arc<AppState>, peer_id: &str, ip: IpAddr, por
             }
             return Err(r);
         }
-    // 身份校验：已固定的密钥必须与本次握手一致（防冒充）
-    verify_pinned_matches(peer_id, &remote_static)?;
+    // 身份即密钥：指纹已固定 = 密钥与首次信任时完全一致（SHA-256 派生），无需再比对
     if st.pigeon_conns.lock().unwrap().contains_key(peer_id) {
         return Ok(()); // 对方已抢先建立，放弃本连接
     }

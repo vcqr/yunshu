@@ -166,17 +166,17 @@ pub mod util {
         let file = std::fs::File::create(&out).map_err(|e| e.to_string())?;
         let mut w = zip::ZipWriter::new(file);
         let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        w.add_directory(format!("{name}/"), opts.clone()).map_err(|e| e.to_string())?;
+        w.add_directory(format!("{name}/"), opts).map_err(|e| e.to_string())?;
         fn walk(w: &mut zip::ZipWriter<std::fs::File>, dir: &std::path::Path, rel: &str, opts: zip::write::SimpleFileOptions) -> Result<(), String> {
             for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
                 let path = entry.map_err(|e| e.to_string())?.path();
                 let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                 let child_rel = format!("{rel}/{fname}");
                 if path.is_dir() {
-                    w.add_directory(child_rel.clone(), opts.clone()).map_err(|e| e.to_string())?;
+                    w.add_directory(child_rel.clone(), opts).map_err(|e| e.to_string())?;
                     walk(w, &path, &child_rel, opts)?;
                 } else {
-                    w.start_file(child_rel.clone(), opts.clone()).map_err(|e| e.to_string())?;
+                    w.start_file(child_rel.clone(), opts).map_err(|e| e.to_string())?;
                     let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
                     std::io::copy(&mut f, w).map_err(|e| e.to_string())?;
                 }

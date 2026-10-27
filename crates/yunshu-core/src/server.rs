@@ -301,7 +301,7 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                         Some((_, fp)) if fp == &fingerprint => {
                             pending.remove(&peer_id);
                             st.trust_rejected.lock().unwrap().remove(&peer_id);
-                            crate::pigeon::pin_peer(&st, &peer_id, &fingerprint);
+                            crate::pigeon::pin_fingerprint(&fingerprint);
                             st.emit(CoreEvent::Toast {
                                 text: format!("已信任设备（指纹 {}…）", &fingerprint[..16.min(fingerprint.len())]),
                             });
@@ -488,7 +488,7 @@ async fn handle_pigeon_socket(st: Arc<AppState>, socket: WebSocket) {
         PigeonWire::PigeonWelcome { ok: false, reason: Some("不在线上发现列表中".into()), pc_name: None }
     } else if st.trust_rejected.lock().unwrap().contains(&peer_id) {
         PigeonWire::PigeonWelcome { ok: false, reason: Some("你已被拒绝接入".into()), pc_name: None }
-    } else if !crate::pigeon::is_pinned(&st, &peer_id, &remote_static) {
+    } else if !crate::pigeon::is_pinned(&remote_static) {
         let fp = crate::pigeon::fingerprint(&remote_static);
         st.pending_trusts.lock().unwrap().insert(peer_id.clone(), (peer_name.clone(), fp.clone()));
         tracing::info!("新设备「{peer_name}」待确认（指纹 {fp}）");
