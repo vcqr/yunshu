@@ -27,3 +27,4 @@ zip = { version = "9.1.0", default-features = false, features = ["deflate"] }
 rcgen = "0.14.10"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 sha2 = "0.11.1"
+windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }

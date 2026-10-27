@@ -3,7 +3,7 @@
 use crate::pairing::Pairing;
 use crate::protocol::{WsIn, WsOut};
 use crate::{
-    CoreConfig, CoreEvent, Direction, TransferInfo, TransferKind, TransferStatus, UiRequest,
+    CoreConfig, CoreEvent, Direction, FileEntry, TransferInfo, TransferKind, TransferStatus, UiRequest,
 };
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -65,10 +65,16 @@ pub struct AppState {
     pub(crate) pigeon_conns: Mutex<HashMap<String, crate::pigeon::PigeonLink>>,
     /// 正在发起连接的 peer（防重入）
     pub(crate) pigeon_connecting: Mutex<std::collections::HashSet<String>>,
-    /// 正在接收的加密推送文件：offer_id -> 组装状态
-    pub(crate) recv_files: tokio::sync::Mutex<HashMap<String, RecvFileState>>,
+    /// 正在接收的加密推送批次：offer_id -> 组装状态
+    pub(crate) recv_files: tokio::sync::Mutex<HashMap<String, BatchRecvState>>,
+    /// 收到邀请、尚未 FileStart 的批次清单：offer_id -> (peer_id, 清单)
+    pub(crate) pigeon_incoming: Mutex<HashMap<String, IncomingBatch>>,
+    /// 已发出邀请、待对方决策的批次：offer_id -> 来源
+    pub(crate) pigeon_offers: Mutex<HashMap<String, BatchSource>>,
     /// 正在推送的文件：offer_id -> 取消标记（推送协程轮询）
     pub(crate) pigeon_push_cancel: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// 正在推送的文件：offer_id -> 暂停标记（推送协程在块间挂起）
+    pub(crate) pigeon_push_paused: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// 等待接收方 FileResume 应答的推送：offer_id -> have 应答通道
     pub(crate) pigeon_push_resume: Mutex<HashMap<String, tokio::sync::oneshot::Sender<u64>>>,
     /// 待确认的新设备：peer_id -> (设备名, 指纹)
@@ -77,14 +83,48 @@ pub struct AppState {
     pub(crate) trust_rejected: Mutex<std::collections::HashSet<String>>,
 }
 
-/// 接收加密推送文件的组装状态（半成品写在 .yunshu-parts/，完成后改名）
-pub(crate) struct RecvFileState {
+/// 正在接收的加密推送批次：offer_id -> 组装状态（半成品在 .yunshu-parts/{id}/，manifest 支持续传）
+pub(crate) struct BatchRecvState {
     pub row_id: String,
-    pub file: tokio::fs::File,
-    pub written: u64,
-    pub name: String,
-    pub part: PathBuf,
     pub peer_id: String,
+    pub name: String,
+    pub dir: PathBuf,
+    pub files: Vec<BatchFileState>,
+    /// 当前推送到的文件下标
+    pub index: usize,
+    /// 当前文件句柄（惰性打开，写满即落盘关闭）
+    pub file: Option<tokio::fs::File>,
+    /// 当前文件已写字节
+    pub written: u64,
+    /// 批次流偏移（= 已完成前缀 + 当前文件已写）
+    pub have: u64,
+    /// 当前文件已写满、等待 FileHash 校验
+    pub hash_pending: bool,
+    /// 当前文件的滚动 SHA-256
+    pub running_hash: Option<sha2::Sha256>,
+    /// 上次 manifest 落盘时的流偏移（节流）
+    pub saved_mark: u64,
+}
+
+/// 批次清单条目（接收侧持久化到 manifest.json）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BatchFileState {
+    pub name: String,
+    pub size: u64,
+    pub written: u64,
+    pub sha: Option<String>,
+}
+
+/// 待接收批次的邀请清单（FileStart 前暂存）：peer_id -> 清单
+pub(crate) type IncomingBatch = (String, Vec<BatchFileState>);
+
+/// 发送侧批次来源
+#[derive(Clone)]
+pub(crate) struct BatchSource {
+    /// (绝对路径, 相对名, 大小)
+    pub files: Vec<(PathBuf, String, u64)>,
+    pub name: String,
+    pub total_size: u64,
 }
 
 impl AppState {
@@ -179,7 +219,10 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
         pigeon_conns: Mutex::new(HashMap::new()),
         pigeon_connecting: Mutex::new(std::collections::HashSet::new()),
         recv_files: tokio::sync::Mutex::new(HashMap::new()),
+        pigeon_incoming: Mutex::new(HashMap::new()),
+        pigeon_offers: Mutex::new(HashMap::new()),
         pigeon_push_cancel: Mutex::new(HashMap::new()),
+        pigeon_push_paused: Mutex::new(HashMap::new()),
         pigeon_push_resume: Mutex::new(HashMap::new()),
         pending_trusts: Mutex::new(HashMap::new()),
         trust_rejected: Mutex::new(std::collections::HashSet::new()),
@@ -271,8 +314,31 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                         st.emit(CoreEvent::Toast { text: "对方已断开，无法发送".into() });
                         continue;
                     }
-                    for f in paths {
-                        offer_to_pigeon(&st, &peer_id, f);
+                    // 多文件/文件夹合并为一个批次，对方一次确认
+                    match build_batch_source(&paths) {
+                        Ok((id, src)) => {
+                            let entries: Vec<FileEntry> = src.files.iter().map(|(_, rel, size)| FileEntry { name: rel.clone(), size: *size }).collect();
+                            st.pigeon_offers.lock().unwrap().insert(id.clone(), src.clone());
+                            st.new_transfer(TransferInfo::batch(
+                                id.clone(),
+                                Direction::ToPhone,
+                                src.name.clone(),
+                                src.total_size,
+                                entries,
+                                Some(peer_id.to_string()),
+                            ));
+                            crate::pigeon::try_push(
+                                &st,
+                                &peer_id,
+                                crate::protocol::PigeonWire::PcFileOffer {
+                                    id,
+                                    name: src.name.clone(),
+                                    total_size: src.total_size,
+                                    files: src.files.iter().map(|(_, rel, size)| crate::protocol::OfferFile { name: rel.clone(), size: *size }).collect(),
+                                },
+                            );
+                        }
+                        Err(e) => st.emit(CoreEvent::Toast { text: format!("发送失败：{e}") }),
                     }
                 }
                 Ok(UiRequest::PigeonDisconnect { peer_id }) => {
@@ -332,10 +398,29 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                     st.trust_rejected.lock().unwrap().insert(peer_id);
                 }
                 Ok(UiRequest::PigeonAcceptFile { peer_id, offer_id }) => {
+                    // 磁盘空间预检：剩余空间容不下批次就直接拒绝
+                    let total = st
+                        .pigeon_incoming
+                        .lock()
+                        .unwrap()
+                        .get(&offer_id)
+                        .map(|(_, files)| files.iter().map(|f| f.size).sum::<u64>());
+                    if let Some(total) = total
+                        && let Some(free) = crate::pigeon::free_space(&st.cfg.save_dir)
+                        && free < total
+                    {
+                        crate::pigeon::try_push(&st, &peer_id, crate::protocol::PigeonWire::FileDecision { id: offer_id.clone(), accepted: false });
+                        st.pigeon_incoming.lock().unwrap().remove(&offer_id);
+                        st.emit(CoreEvent::Toast {
+                            text: format!("磁盘空间不足（需要 {} 字节），已拒绝接收", total),
+                        });
+                        continue;
+                    }
                     // 接受后由对方在加密通道内推送文件，这里只需答复
                     crate::pigeon::try_push(&st, &peer_id, crate::protocol::PigeonWire::FileDecision { id: offer_id, accepted: true });
                 }
                 Ok(UiRequest::PigeonRejectFile { peer_id, offer_id }) => {
+                    st.pigeon_incoming.lock().unwrap().remove(&offer_id);
                     crate::pigeon::try_push(&st, &peer_id, crate::protocol::PigeonWire::FileDecision { id: offer_id, accepted: false });
                 }
                 Ok(UiRequest::PigeonCancelFile { peer_id, offer_id }) => {
@@ -345,16 +430,18 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                         flag.store(true, Ordering::Relaxed);
                         cancelled_locally = true;
                     }
-                    // 接收方向：停止写入并删除半成品（文件句柄在异步侧，投递回 runtime 清理）
+                    // 接收方向：停止写入并删除半成品目录（文件句柄在异步侧，投递回 runtime 清理）
                     if st.recv_files.blocking_lock().contains_key(&offer_id) {
                         let st2 = st.clone();
                         let id = offer_id.clone();
                         st.rt_handle.spawn(async move {
                             if let Some(mut s) = st2.recv_files.lock().await.remove(&id) {
-                                let _ = s.file.flush().await;
-                                drop(s.file);
-                                let _ = tokio::fs::remove_file(&s.part).await;
-                                st2.update_transfer(&s.row_id, s.written, None, TransferStatus::Cancelled, None);
+                                if let Some(f) = s.file.as_mut() {
+                                    let _ = f.flush().await;
+                                }
+                                s.file = None;
+                                let _ = tokio::fs::remove_dir_all(&s.dir).await;
+                                st2.update_transfer(&s.row_id, s.have, None, TransferStatus::Cancelled, None);
                             }
                         });
                         cancelled_locally = true;
@@ -382,9 +469,38 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                             status: TransferStatus::Cancelled,
                             path: None,
                             peer: Some(peer_id.clone()),
+                            files: Vec::new(),
                         };
                         st.emit(CoreEvent::TransferUpdate { t: Box::new(info) });
                     }
+                }
+                Ok(UiRequest::PigeonPauseFile { peer_id, offer_id, paused }) => {
+                    let mut acted = false;
+                    // 发送方向：设置暂停标记，推送协程在块间挂起，并同步本端行状态
+                    if let Some(flag) = st.pigeon_push_paused.lock().unwrap().get(&offer_id) {
+                        flag.store(paused, Ordering::Relaxed);
+                        acted = true;
+                        let cur = st.transfers.lock().unwrap().iter().find(|t| t.id == offer_id).map(|t| (t.transferred, t.size));
+                        if let Some((transferred, size)) = cur {
+                            let status = if paused { TransferStatus::Paused } else { TransferStatus::Active };
+                            st.update_transfer(&offer_id, transferred, Some(size), status, None);
+                        }
+                    }
+                    // 接收方向：本地行状态同步（数据是否真停取决于发送方是否配合）
+                    {
+                        let info = {
+                            let states = st.recv_files.blocking_lock();
+                            states.get(&offer_id).map(|s| (s.row_id.clone(), s.have, s.files.iter().map(|f| f.size).sum::<u64>()))
+                        };
+                        if let Some((row_id, have, total)) = info {
+                            let status = if paused { TransferStatus::Paused } else { TransferStatus::Active };
+                            st.update_transfer(&row_id, have, Some(total), status, None);
+                            acted = true;
+                        }
+                    }
+                    // 通知对方同步（发送方收到后控制推送节奏，接收方收到后同步行状态）
+                    crate::pigeon::try_push(&st, &peer_id, crate::protocol::PigeonWire::FilePause { id: offer_id, paused });
+                    let _ = acted;
                 }
                 Ok(UiRequest::ForgetTransfer { id }) => {
                     st.transfers.lock().unwrap().retain(|t| t.id != *id);
@@ -668,21 +784,104 @@ async fn handle_pigeon_socket(st: Arc<AppState>, socket: WebSocket) {
     crate::pigeon::emit_peers(&st);
 }
 
-fn offer_to_pigeon(st: &Arc<AppState>, peer_id: &str, path: PathBuf) {
-    let Ok(meta) = std::fs::metadata(&path) else {
-        st.emit(CoreEvent::ServerError { reason: format!("无法读取文件：{}", path.display()) });
-        return;
+/// 把若干路径（文件/文件夹混合）整理成一个传输批次：文件夹递归展开为相对路径清单。
+/// 批次 id 由全部条目的（名称|大小|mtime）派生，内容不变重发时可续传。
+pub(crate) fn build_batch_source(paths: &[PathBuf]) -> Result<(String, BatchSource), String> {
+    fn walk(
+        dir: &PathBuf,
+        rel_prefix: &str,
+        files: &mut Vec<(PathBuf, String, u64)>,
+        items: &mut Vec<(String, u64, u128)>,
+    ) -> Result<(), String> {
+        for entry in std::fs::read_dir(dir).map_err(|e| format!("无法读取目录 {}: {e}", dir.display()))? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let p = entry.path();
+            let fname = entry.file_name().to_string_lossy().to_string();
+            let child_rel = format!("{rel_prefix}/{fname}");
+            if p.is_dir() {
+                walk(&p, &child_rel, files, items)?;
+            } else if p.is_file() {
+                let meta = entry.metadata().map_err(|e| e.to_string())?;
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                files.push((p.clone(), child_rel.clone(), meta.len()));
+                items.push((child_rel, meta.len(), mtime));
+            }
+        }
+        Ok(())
+    }
+
+    let mut files: Vec<(PathBuf, String, u64)> = Vec::new();
+    let mut items: Vec<(String, u64, u128)> = Vec::new();
+    for p in paths {
+        if p.is_dir() {
+            let root = p
+                .file_name()
+                .map(|n| sanitize_name(&n.to_string_lossy()))
+                .unwrap_or_else(|| "文件夹".into());
+            walk(p, &root, &mut files, &mut items)?;
+        } else if p.is_file() {
+            let meta = std::fs::metadata(p).map_err(|e| format!("无法读取文件 {}: {e}", p.display()))?;
+            let rel = sanitize_name(&p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            files.push((p.clone(), rel.clone(), meta.len()));
+            items.push((rel, meta.len(), mtime));
+        }
+    }
+    if files.is_empty() {
+        return Err("没有可发送的文件".into());
+    }
+    // 排序保证 id 与清单顺序稳定（read_dir 顺序依赖系统）
+    files.sort_by(|a, b| a.1.cmp(&b.1));
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let id = crate::pigeon::batch_id(&items);
+    let total_size = items.iter().map(|i| i.1).sum();
+    let name = if files.len() == 1 {
+        files[0].1.rsplit('/').next().unwrap_or(&files[0].1).to_string()
+    } else {
+        let first_root = files[0].1.split('/').next().unwrap_or_default();
+        let all_same_root = files.iter().all(|f| f.1.split('/').next() == Some(first_root));
+        if all_same_root && !first_root.is_empty() {
+            format!("{first_root}/")
+        } else {
+            format!("{} 项", files.len())
+        }
     };
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "未命名文件".into());
-    let size = meta.len();
-    // 稳定文件 id：同一磁盘文件（名+大小+mtime）重发时 id 不变，接收方据此续传
-    let id = crate::pigeon::file_id(&name, size, &meta);
-    st.offers.lock().unwrap().insert(id.clone(), (path, name.clone(), size));
-    st.new_transfer(TransferInfo::file(id.clone(), Direction::ToPhone, name.clone(), size, Some(peer_id.to_string())));
-    crate::pigeon::try_push(st, peer_id, crate::protocol::PigeonWire::PcFile { id, name, size });
+    Ok((id, BatchSource { files, name, total_size }))
+}
+
+/// 相对路径安全拼接：逐段 sanitize，拒绝空段与穿越（..）
+pub(crate) fn safe_join(root: &std::path::Path, rel: &str) -> Option<PathBuf> {
+    let mut out = root.to_path_buf();
+    for seg in rel.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return None;
+        }
+        out.push(sanitize_name(seg));
+    }
+    Some(out)
+}
+
+/// 批次清单落盘（断点续传依据；小文件同步写即可）
+pub(crate) fn save_manifest(dir: &std::path::Path, files: &[BatchFileState]) {
+    match serde_json::to_string(files) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(dir.join("manifest.json"), json) {
+                tracing::warn!("写入 manifest 失败: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("序列化 manifest 失败: {e}"),
+    }
 }
 
 async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
@@ -1010,4 +1209,76 @@ fn err_page(code: StatusCode, msg: &str) -> Response {
 
 fn json_err(msg: &str) -> Response {
     (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"ok": false, "error": msg}))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_name_strips_separators() {
+        assert_eq!(sanitize_name("a/b/c.txt"), "a_b_c.txt");
+        assert_eq!(sanitize_name("..\\evil"), ".._evil");
+        assert_eq!(sanitize_name("  正常名.txt "), "正常名.txt");
+        // 控制字符与盘符
+        assert_eq!(sanitize_name("C:\\x"), "C__x");
+        // 空名兜底
+        assert_eq!(sanitize_name("  "), "未命名文件");
+    }
+
+    #[test]
+    fn safe_join_rejects_traversal() {
+        let root = std::path::Path::new("C:\\save");
+        assert!(safe_join(root, "docs/a.txt").is_some());
+        assert!(safe_join(root, "..\\evil").is_none() || safe_join(root, "../evil").is_none());
+        assert!(safe_join(root, "a/../b").is_none());
+        assert!(safe_join(root, "").is_none());
+        // 正常相对路径逐段 sanitize
+        let joined = safe_join(root, "docs/子目录/文件.txt").unwrap();
+        assert!(joined.starts_with(root));
+    }
+
+    #[test]
+    fn unique_path_avoids_collision() {
+        let dir = std::env::temp_dir().join(format!("yunshu-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = unique_path(&dir, "a.txt");
+        std::fs::write(&first, b"x").unwrap();
+        let second = unique_path(&dir, "a.txt");
+        assert_ne!(first, second);
+        assert!(second.to_string_lossy().contains("a (1)"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn build_batch_source_mixed_and_stable() {
+        let base = std::env::temp_dir().join(format!("yunshu-test-{}", uuid::Uuid::new_v4().simple()));
+        let folder = base.join("资料包");
+        std::fs::create_dir_all(folder.join("子目录")).unwrap();
+        std::fs::write(folder.join("b.txt"), b"bb").unwrap();
+        std::fs::write(folder.join("子目录/c.bin"), b"ccc").unwrap();
+        std::fs::write(base.join("a top.bin"), b"a").unwrap();
+
+        let (id, src) = build_batch_source(&[folder.clone(), base.join("a top.bin")]).unwrap();
+        // 清单按相对名排序：资料包/… 在前（'资' > 'a'？按字节序 a top.bin 的 'a' 更小）
+        assert_eq!(src.files.len(), 3);
+        assert_eq!(src.total_size, 1 + 2 + 3);
+        // 名称排序后 a top.bin 在前
+        assert_eq!(src.files[0].1, "a top.bin");
+        assert!(src.files.iter().any(|(_, rel, _)| rel == "资料包/b.txt"));
+        assert!(src.files.iter().any(|(_, rel, _)| rel == "资料包/子目录/c.bin"));
+        assert_eq!(id.len(), 32);
+        // 同内容重建 id 稳定
+        let (id2, _) = build_batch_source(&[base.join("a top.bin"), folder]).unwrap();
+        assert_eq!(id, id2);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn free_space_smoke() {
+        // 仅验证不 panic 且数量级合理（存在卷）
+        if let Some(free) = crate::pigeon::free_space(&std::env::temp_dir()) {
+            assert!(free > 0);
+        }
+    }
 }

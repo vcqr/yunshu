@@ -73,6 +73,10 @@ impl Pairing {
         Ok((session, device))
     }
 
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     pub fn session_valid(&self, session: &str) -> bool {
         self.session.as_deref() == Some(session)
     }
@@ -85,5 +89,67 @@ impl Pairing {
     pub fn reset(&mut self) {
         self.pending = None;
         self.session = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_roundtrip() {
+        let mut p = Pairing::default();
+        p.add_token("tok123".to_string());
+        assert!(p.token_valid("tok123"));
+        assert!(!p.token_valid("other"));
+    }
+
+    #[test]
+    fn pending_code_survives_rehello() {
+        // 手机改名字重发 hello 不应使用户正在输入的配对码失效
+        let mut p = Pairing::default();
+        let code1 = p.begin_pending("手机A".to_string());
+        let code2 = p.begin_pending("手机B".to_string());
+        assert_eq!(code1, code2);
+        assert_eq!(code2.len(), 6);
+    }
+
+    #[test]
+    fn verify_success_creates_session() {
+        let mut p = Pairing::default();
+        let code = p.begin_pending("手机A".to_string());
+        let (session, device) = p.verify(&code).unwrap();
+        assert_eq!(device, "手机A");
+        assert!(p.session_valid(&session));
+        assert!(!p.has_pending());
+    }
+
+    #[test]
+    fn verify_attempts_limited() {
+        let mut p = Pairing::default();
+        let code = p.begin_pending("手机A".to_string());
+        let wrong = if code == "000000" { "111111" } else { "000000" };
+        for _ in 0..MAX_ATTEMPTS {
+            // 前 MAX_ATTEMPTS 次错误码不通过（最后一次触发锁定）
+            let _ = p.verify(wrong);
+        }
+        // 错误次数超限后 pending 被清空，正确码也失效
+        assert!(p.verify(&code).is_err());
+    }
+
+    #[test]
+    fn verify_without_pending_fails() {
+        let mut p = Pairing::default();
+        assert!(p.verify("123456").is_err());
+    }
+
+    #[test]
+    fn reset_clears_session() {
+        let mut p = Pairing::default();
+        let code = p.begin_pending("手机A".to_string());
+        let (session, _) = p.verify(&code).unwrap();
+        assert!(p.session_valid(&session));
+        p.reset();
+        assert!(!p.session_valid(&session));
     }
 }

@@ -31,6 +31,7 @@ export type TransferStatus =
   | 'pending'
   | 'rejected'
   | 'uploading'
+  | 'paused'
   | 'completed'
   | 'cancelled'
 

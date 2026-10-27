@@ -206,7 +206,7 @@ export function splitTransfers(): { active: Transfer[]; finished: Transfer[] } {
   const active: Transfer[] = []
   const finished: Transfer[] = []
   for (const t of Object.values(store.transfers)) {
-    if (t.status === 'pending' || t.status === 'uploading') active.push(t)
+    if (t.status === 'pending' || t.status === 'uploading' || t.status === 'paused') active.push(t)
     else finished.push(t)
   }
   active.sort((a, b) => b.createdAt - a.createdAt)

@@ -5,7 +5,7 @@
  */
 import { computed, ref, watch } from 'vue'
 import {
-  CheckCircle2, ChevronRight, LoaderCircle, X,
+  CheckCircle2, ChevronRight, LoaderCircle, Pause, Play, X,
 } from '@lucide/vue'
 import {
   fileIconStyle, folderIconStyle, formatBytes, formatTime, formatSpeed, transferTitle,
@@ -22,6 +22,7 @@ const STATUS_MAP: Record<TransferStatus, { label: string; cls: string; pulse?: b
   completed: { label: '已完成', cls: 'border-green-500/30 bg-green-500/10 text-green-600 dark:text-green-400' },
   rejected: { label: '已拒绝', cls: 'border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400' },
   cancelled: { label: '已取消', cls: 'border-border bg-muted text-muted-foreground' },
+  paused: { label: '已暂停', cls: 'border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-400' },
 }
 const status = computed(() => STATUS_MAP[props.transfer.status] ?? STATUS_MAP.pending)
 
@@ -163,7 +164,15 @@ watch(
         正在上传
         <button
           v-if="isPcTransfer"
-          class="ml-auto flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] text-red-600 transition-colors hover:bg-red-500/10 dark:text-red-400"
+          class="ml-auto flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] text-amber-600 transition-colors hover:bg-amber-500/10 dark:text-amber-400"
+          @click="relayActions.pauseTransfer(transfer.id, true)"
+        >
+          <Pause class="size-3" />
+          暂停
+        </button>
+        <button
+          v-if="isPcTransfer"
+          class="flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] text-red-600 transition-colors hover:bg-red-500/10 dark:text-red-400"
           @click="relayActions.cancelTransfer(transfer.id)"
         >
           <X class="size-3" />
@@ -186,7 +195,15 @@ watch(
         对方正在发送，接收中…
         <button
           v-if="isPcTransfer"
-          class="ml-auto flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] text-red-600 transition-colors hover:bg-red-500/10 dark:text-red-400"
+          class="ml-auto flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] text-amber-600 transition-colors hover:bg-amber-500/10 dark:text-amber-400"
+          @click="relayActions.pauseTransfer(transfer.id, true)"
+        >
+          <Pause class="size-3" />
+          暂停
+        </button>
+        <button
+          v-if="isPcTransfer"
+          class="flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] text-red-600 transition-colors hover:bg-red-500/10 dark:text-red-400"
           @click="relayActions.cancelTransfer(transfer.id)"
         >
           <X class="size-3" />
@@ -216,6 +233,26 @@ watch(
       </div>
       <div v-if="isReceiver && transfer.status === 'rejected'" class="text-[11px] text-muted-foreground">
         你已拒绝该传输
+      </div>
+      <div v-if="transfer.status === 'paused'" class="flex items-center gap-2 text-[11px] text-muted-foreground">
+        <Pause class="size-3.5 text-sky-500" />
+        已暂停
+        <button
+          v-if="isPcTransfer"
+          class="ml-auto flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] text-emerald-600 transition-colors hover:bg-emerald-500/10 dark:text-emerald-400"
+          @click="relayActions.pauseTransfer(transfer.id, false)"
+        >
+          <Play class="size-3" />
+          继续
+        </button>
+        <button
+          v-if="isPcTransfer"
+          class="flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] text-red-600 transition-colors hover:bg-red-500/10 dark:text-red-400"
+          @click="relayActions.cancelTransfer(transfer.id)"
+        >
+          <X class="size-3" />
+          取消
+        </button>
       </div>
       <div v-if="transfer.status === 'cancelled'" class="flex items-center gap-2 text-[11px] text-muted-foreground">
         <X class="size-3.5" />

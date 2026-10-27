@@ -65,27 +65,30 @@ fn get_state(state: tauri::State<AppState>) -> serde_json::Value {
 
 #[tauri::command]
 fn send_paths(state: tauri::State<AppState>, kind: String, peer_id: Option<String>, paths: Vec<String>) {
-    let mut files = Vec::new();
-    for p in paths {
-        let path = std::path::PathBuf::from(&p);
-        if path.is_dir() {
-            match yunshu_core::util::zip_folder(&path) {
-                Ok(z) => files.push(z.to_string_lossy().to_string()),
-                Err(e) => {
-                    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                    let _ = state.ui_tx.send(UiRequest::Toast(format!("打包「{name}」失败：{e}")));
+    let paths: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
+    let _ = match kind.as_str() {
+        // 手机：文件夹打包 zip 后按单文件发送（手机端是浏览器下载）
+        "phone" => {
+            let mut files = Vec::new();
+            for path in paths {
+                if path.is_dir() {
+                    match yunshu_core::util::zip_folder(&path) {
+                        Ok(z) => files.push(z),
+                        Err(e) => {
+                            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                            let _ = state.ui_tx.send(UiRequest::Toast(format!("打包「{name}」失败：{e}")));
+                        }
+                    }
+                } else {
+                    files.push(path);
                 }
             }
-        } else {
-            files.push(p);
+            if files.is_empty() {
+                return;
+            }
+            state.ui_tx.send(UiRequest::SendFiles(files))
         }
-    }
-    if files.is_empty() {
-        return;
-    }
-    let paths: Vec<std::path::PathBuf> = files.into_iter().map(std::path::PathBuf::from).collect();
-    let _ = match kind.as_str() {
-        "phone" => state.ui_tx.send(UiRequest::SendFiles(paths)),
+        // 电脑：文件夹原生直传（core 递归展开为批次，一次确认）
         "pc" => {
             if let Some(peer_id) = peer_id {
                 state.ui_tx.send(UiRequest::PigeonSendFiles { peer_id, paths })
@@ -138,6 +141,11 @@ fn pigeon_cancel(state: tauri::State<AppState>, peer_id: String, offer_id: Strin
 }
 
 /// 忘记一条传输记录（仅 UI 列表；已收文件用 delete_received_file 删）
+#[tauri::command]
+fn pigeon_pause(state: tauri::State<AppState>, peer_id: String, offer_id: String, paused: bool) {
+    let _ = state.ui_tx.send(UiRequest::PigeonPauseFile { peer_id, offer_id, paused });
+}
+
 #[tauri::command]
 fn forget_transfer(state: tauri::State<AppState>, id: String) {
     let _ = state.ui_tx.send(UiRequest::ForgetTransfer { id });
@@ -261,14 +269,31 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState { ui_tx, cache: Arc::new(Mutex::new(state_snapshot())) })
         .setup(move |app| {
             let handle = app.handle().clone();
             let cache = app.state::<AppState>().cache.clone();
             // 核心事件 → 前端（同时维护初始状态快照）
             std::thread::spawn(move || {
+                let mut done_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 while let Ok(ev) = event_rx.recv() {
                     apply_to_cache(&cache, &ev);
+                    // 传输完成且窗口隐藏时弹系统通知
+                    if let CoreEvent::TransferUpdate { t } = &ev
+                        && t.status == yunshu_core::TransferStatus::Done
+                        && done_seen.insert(t.id.clone())
+                        && let Some(w) = handle.get_webview_window("main")
+                        && let Ok(false) = w.is_visible()
+                    {
+                        use tauri_plugin_notification::NotificationExt;
+                        let _ = handle
+                            .notification()
+                            .builder()
+                            .title("云书")
+                            .body(format!("「{}」传输完成", t.name))
+                            .show();
+                    }
                     if let Ok(v) = serde_json::to_value(&ev) {
                         let _ = handle.emit("core-event", v);
                     }
@@ -324,6 +349,7 @@ fn main() {
             pigeon_accept,
             pigeon_reject,
             pigeon_cancel,
+            pigeon_pause,
             forget_transfer,
             delete_received_file,
             pigeon_disconnect,

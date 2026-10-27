@@ -34,6 +34,15 @@ pub enum TransferStatus {
     Refused,
     /// 任一方主动取消（半成品已清理）
     Cancelled,
+    /// 任一方主动暂停（链路保持，恢复后继续）
+    Paused,
+}
+
+/// 批次清单条目（用于 UI 明细展示）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub size: u64,
 }
 
 /// 一条传输记录（UI 列表数据源，每次变化全量推送）
@@ -50,15 +59,41 @@ pub struct TransferInfo {
     pub path: Option<PathBuf>,
     /// 所属设备："phone" 或飞鸽 peer_id
     pub peer: Option<String>,
+    /// 批次文件清单（飞鸽批次传输有值；文本/手机单文件为空）
+    pub files: Vec<FileEntry>,
 }
 
 impl TransferInfo {
     pub fn file(id: String, direction: Direction, name: String, size: u64, peer: Option<String>) -> Self {
-        TransferInfo { id, direction, kind: TransferKind::File, name, size, transferred: 0, status: TransferStatus::Waiting, path: None, peer }
+        TransferInfo {
+            id,
+            direction,
+            kind: TransferKind::File,
+            files: vec![FileEntry { name: name.clone(), size }],
+            name,
+            size,
+            transferred: 0,
+            status: TransferStatus::Waiting,
+            path: None,
+            peer,
+        }
+    }
+
+    /// 批次传输（多文件/文件夹）
+    pub fn batch(id: String, direction: Direction, name: String, size: u64, files: Vec<FileEntry>, peer: Option<String>) -> Self {
+        TransferInfo {
+            id, direction, kind: TransferKind::File, name, size,
+            transferred: 0, status: TransferStatus::Waiting, path: None, peer,
+            files,
+        }
     }
 
     pub fn text(id: String, direction: Direction, chars: usize, peer: Option<String>) -> Self {
-        TransferInfo { id, direction, kind: TransferKind::Text, name: format!("文本（{chars} 字）"), size: chars as u64, transferred: chars as u64, status: TransferStatus::Done, path: None, peer }
+        TransferInfo {
+            id, direction, kind: TransferKind::Text, name: format!("文本（{chars} 字）"), size: chars as u64,
+            transferred: chars as u64, status: TransferStatus::Done, path: None, peer,
+            files: Vec::new(),
+        }
     }
 }
 
@@ -97,8 +132,15 @@ pub enum CoreEvent {
     ChatBroadcast { peer_id: String, peer_name: String, text: String },
     /// 飞鸽：新设备首次连入，等待用户确认指纹
     PigeonTrustRequest { peer_id: String, name: String, fingerprint: String },
-    /// 飞鸽：对方发来文件，等待用户确认
-    PigeonOfferIncoming { peer_id: String, peer_name: String, offer_id: String, name: String, size: u64 },
+    /// 飞鸽：对方发来文件，等待用户确认（批量：多文件/文件夹一次确认）
+    PigeonOfferIncoming {
+        peer_id: String,
+        peer_name: String,
+        offer_id: String,
+        name: String,
+        size: u64,
+        files: Vec<FileEntry>,
+    },
     /// 飞鸽：新设备静态密钥已固定（TOFU 首次配对）
     PigeonFingerprint { peer_id: String, fingerprint: String },
 }
@@ -124,6 +166,8 @@ pub enum UiRequest {
     PigeonRejectFile { peer_id: String, offer_id: String },
     /// 用户取消一次飞鸽传输（等待中或推送中，双向皆可发起）
     PigeonCancelFile { peer_id: String, offer_id: String },
+    /// 用户暂停/恢复一次飞鸽推送（仅 PC↔PC）
+    PigeonPauseFile { peer_id: String, offer_id: String, paused: bool },
     /// 忘记一条传输记录（仅 UI 列表，不影响磁盘文件）
     ForgetTransfer { id: String },
     /// 切换防打扰模式（仅已信任设备可连接、广播静音）

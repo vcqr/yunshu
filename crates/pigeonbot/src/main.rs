@@ -16,16 +16,31 @@ const BOT_PORT: u16 = 9000;
 const CHUNK: usize = 60_000;
 
 #[derive(serde::Serialize, serde::Deserialize)]
+struct OfferFile {
+    name: String,
+    size: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Wire {
     PigeonHello { id: String, name: String, port: u16 },
     PigeonWelcome { ok: bool, #[serde(default)] pc_name: Option<String> },
     PcText { text: String },
-    PcFile { id: String, name: String, size: u64 },
+    PcFileOffer {
+        id: String,
+        name: String,
+        total_size: u64,
+        files: Vec<OfferFile>,
+    },
     FileDecision { id: String, accepted: bool },
-    FileStart { id: String, name: String, size: u64 },
+    FileStart { id: String },
     /// 接收方应答：本地已有 have 字节，发送方从断点续推
     FileResume { id: String, have: u64 },
+    /// 单文件推送完成，携带整文件 SHA-256
+    FileHash { id: String, index: u32, sha: String },
+    /// 任一方暂停/恢复传输
+    FilePause { id: String, paused: bool },
     FileEnd { id: String, ok: bool },
 }
 
@@ -151,16 +166,45 @@ async fn main() {
         .unwrap();
     println!("[bot] → 已发加密聊天");
 
-    // 推文件：先 offer，等决策
-    let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-    let file_id = format!("{}{}", hex(&sha(&payload)), hex(&sha(&(payload.len() as u64).to_be_bytes())));
+    // 推文件：三文件批次（小文件 / 大文件 / 空文件），字节按需生成，零内存驻留
+    struct FileSpec {
+        name: &'static str,
+        size: u64,
+        pattern: u64,
+    }
+    let specs = [
+        FileSpec { name: "pigeon-a.bin", size: 1_048_576, pattern: 251 },
+        FileSpec { name: "pigeon-b.bin", size: size as u64, pattern: 7 },
+        FileSpec { name: "pigeon-c.bin", size: 0, pattern: 1 },
+    ];
+    let total_size: u64 = specs.iter().map(|s| s.size).sum();
+    // 稳定批次 id：sha256(逐项 名称|大小) 前 32 hex
+    let mut idh = sha2::Sha256::new();
+    use sha2::Digest;
+    idh.update((specs.len() as u64).to_le_bytes());
+    for s in &specs {
+        idh.update(s.name.as_bytes());
+        idh.update([0]);
+        idh.update(s.size.to_le_bytes());
+        idh.update([0]);
+    }
+    let file_id = hex(&idh.finalize())[..32].to_string();
+    let offer_files: Vec<OfferFile> = specs
+        .iter()
+        .map(|s| OfferFile { name: s.name.to_string(), size: s.size })
+        .collect();
     sink.send(Message::binary(control_msg(
         &noise,
-        &Wire::PcFile { id: file_id.clone(), name: "pigeon-e2e.bin".into(), size: payload.len() as u64 },
+        &Wire::PcFileOffer {
+            id: file_id.clone(),
+            name: format!("e2e批次（{}）", size),
+            total_size,
+            files: offer_files,
+        },
     )))
     .await
     .unwrap();
-    println!("[bot] → 已发文件邀请（{} 字节），等待决策…", payload.len());
+    println!("[bot] → 已发批次邀请（{} 项，{} 字节），等待决策…", specs.len(), total_size);
 
     // 收消息循环：等 FileDecision
     let mut id16 = [0u8; 16];
@@ -200,13 +244,10 @@ async fn main() {
     assert!(decision_ok);
     let _ = decision_ok;
 
-    // FileStart → 等接收方应答 FileResume（支持断点续传的接收方会带本地已有字节数）
-    sink.send(Message::binary(control_msg(
-        &noise,
-        &Wire::FileStart { id: file_id.clone(), name: "pigeon-e2e.bin".into(), size: payload.len() as u64 },
-    )))
-    .await
-    .unwrap();
+    // FileStart → 等接收方应答 FileResume（支持断点续传的接收方会带流偏移）
+    sink.send(Message::binary(control_msg(&noise, &Wire::FileStart { id: file_id.clone() })))
+        .await
+        .unwrap();
     let resume_from: u64 = loop {
         let msg = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
             .await
@@ -233,22 +274,79 @@ async fn main() {
         println!("[bot] ✓ 接收方已有 {} 字节，从断点续传", resume_from);
     }
 
-    // 推送块（带 offset，接收方据此校验/续传）
+    // 推送块：流偏移定位到 (文件, 文件内偏移)，逐文件推 + FileHash（整文件 SHA-256）
+    let sizes: Vec<u64> = specs.iter().map(|s| s.size).collect();
     let mut sent: u64 = resume_from;
-    let total_blocks = payload.len().div_ceil(CHUNK);
-    let start_block = (resume_from as usize) / CHUNK;
-    for (i, chunk) in payload[resume_from as usize..].chunks(CHUNK).enumerate() {
-        sink.send(Message::binary(chunk_msg(&noise, &id16, sent, chunk))).await.unwrap();
-        sent += chunk.len() as u64;
-        if (start_block + i + 1).is_multiple_of(4) {
-            println!("[bot] 推送进度 {}/{} 块", start_block + i + 1, total_blocks);
+    let mut loc = sent;
+    let mut idx = specs.len();
+    let mut in_off = 0u64;
+    for (i, sz) in sizes.iter().enumerate() {
+        if loc < *sz {
+            idx = i;
+            in_off = loc;
+            break;
         }
+        loc -= sz;
+    }
+    let total_blocks: usize = sizes.iter().map(|s| s.div_ceil(CHUNK as u64)).sum::<u64>() as usize;
+    let start_block: usize = (sizes[..idx].iter().map(|s| s.div_ceil(CHUNK as u64)).sum::<u64>() + in_off.div_ceil(CHUNK as u64)) as usize;
+    let mut pushed_blocks = 0usize;
+    for (fi, spec) in specs.iter().enumerate().skip(idx) {
+        // 进入大文件前演示暂停/恢复：验证接收方 FilePause 处理路径
+        if fi == 1 && in_off == 0 {
+            sink.send(Message::binary(control_msg(
+                &noise,
+                &Wire::FilePause { id: file_id.clone(), paused: true },
+            )))
+            .await
+            .unwrap();
+            println!("[bot] → 已请求接收方暂停 3 秒");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            sink.send(Message::binary(control_msg(
+                &noise,
+                &Wire::FilePause { id: file_id.clone(), paused: false },
+            )))
+            .await
+            .unwrap();
+            println!("[bot] → 已请求恢复");
+        }
+        let mut hasher = sha2::Sha256::new();
+        // 续传前缀（若有）按同一模式重算，计入整文件哈希
+        let mut off = in_off;
+        while off > 0 {
+            let start = off.saturating_sub(CHUNK as u64);
+            let seg: Vec<u8> = (start..off).map(|i| (i % spec.pattern) as u8).collect();
+            hasher.update(&seg);
+            off = start;
+        }
+        off = in_off;
+        while off < spec.size {
+            let end = (off + CHUNK as u64).min(spec.size);
+            let chunk: Vec<u8> = (off..end).map(|i| (i % spec.pattern) as u8).collect();
+            sink.send(Message::binary(chunk_msg(&noise, &id16, sent, &chunk))).await.unwrap();
+            hasher.update(&chunk);
+            sent += chunk.len() as u64;
+            off = end;
+            pushed_blocks += 1;
+            if pushed_blocks.is_multiple_of(64) {
+                println!("[bot] 推送进度 {}/{} 块", start_block + pushed_blocks, total_blocks);
+            }
+        }
+        let digest = hasher.finalize();
+        let sha: String = digest.iter().map(|x| format!("{x:02x}")).collect();
+        sink.send(Message::binary(control_msg(
+            &noise,
+            &Wire::FileHash { id: file_id.clone(), index: fi as u32, sha },
+        )))
+        .await
+        .unwrap();
+        println!("[bot] ✓ 「{}」推送完成（{} 字节）", spec.name, spec.size);
     }
     sink.send(Message::binary(control_msg(&noise, &Wire::FileEnd { id: file_id.clone(), ok: true })))
         .await
         .unwrap();
-    println!("[bot] ✓ 加密推送完成（{} 字节，hash 前 16 位 {}）", payload.len(), &hex(&sha(&payload))[..16]);
-    println!("E2E-BOT-DONE {} {}", payload.len(), hex(&sha(&payload)));
+    println!("[bot] ✓ 批次加密推送完成（{} 项，{} 字节）", specs.len(), sent);
+    println!("E2E-BOT-DONE {} {}", total_size, file_id);
     // 等一会让对方写完盘
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 }
@@ -257,15 +355,6 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn sha(data: &[u8]) -> [u8; 8] {
-    // 简单 FNV 累计做内容指纹（e2e 用足够）
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h.to_be_bytes()
-}
 
 // HashMap 占位引用（保留以便扩展）
 #[allow(dead_code)]

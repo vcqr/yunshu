@@ -6,7 +6,7 @@
  */
 import { computed, ref } from 'vue'
 import {
-  ArrowDownToLine, ArrowUpFromLine, CheckCircle2, FolderOpen, Inbox, LoaderCircle, PanelRightClose, X,
+  ArrowDownToLine, ArrowUpFromLine, CheckCircle2, FolderOpen, Inbox, LoaderCircle, PanelRightClose, Pause, Play, X,
 } from '@lucide/vue'
 import { formatBytes, formatTime, transferTitle } from '../../lib/relay-format'
 import { splitTransfers } from '../../stores/relay-store'
@@ -127,7 +127,17 @@ function cardMeta(t: Transfer): string {
                 aria-label="已完成"
               />
               <button
-                v-if="(t.status === 'pending' || t.status === 'uploading') && t.from !== 'phone' && t.to !== 'phone'"
+                v-if="(t.status === 'pending' || t.status === 'uploading' || t.status === 'paused') && t.from !== 'phone' && t.to !== 'phone'"
+                :aria-label="t.status === 'paused' ? '继续传输' : '暂停传输'"
+                :title="t.status === 'paused' ? '继续传输' : '暂停传输'"
+                class="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-amber-600 dark:hover:text-amber-400"
+                @click="relayActions.pauseTransfer(t.id, t.status !== 'paused')"
+              >
+                <Play v-if="t.status === 'paused'" class="size-3.5" />
+                <Pause v-else class="size-3.5" />
+              </button>
+              <button
+                v-if="(t.status === 'pending' || t.status === 'uploading' || t.status === 'paused') && t.from !== 'phone' && t.to !== 'phone'"
                 aria-label="取消传输"
                 title="取消传输"
                 class="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-red-500/10 hover:text-red-600 dark:hover:text-red-400"

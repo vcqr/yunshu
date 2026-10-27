@@ -22,6 +22,7 @@ const STATUS_MAP: Record<string, TransferStatus> = {
   Refused: 'rejected',
   Failed: 'cancelled',
   Cancelled: 'cancelled',
+  Paused: 'paused',
 }
 
 function upsertFromInfo(info: any) {
@@ -31,14 +32,18 @@ function upsertFromInfo(info: any) {
   const toMe = info.direction === 'FromPhone'
   const peerId = info.peer || ''
   const peerName = isPhone ? (store.phoneConnected ? store.phoneName : '手机') : peerNameOf(peerId)
+  const files: TransferFileMeta[] = (info.files?.length
+    ? info.files
+    : [{ name: info.name, size: info.size }]
+  ).map((f: { name: string; size: number }, i: number) => ({ id: `${info.id}-${i}`, name: f.name, size: f.size }));
   const t: Transfer = {
     id: info.id,
     from: toMe ? peerId : 'me',
     fromName: toMe ? peerName : store.meName,
     to: toMe ? 'me' : peerId,
     toName: toMe ? store.meName : peerName,
-    kind: 'files',
-    files: [{ id: info.id, name: info.name, size: info.size }],
+    kind: files.some((f) => f.name.includes('/')) ? 'folder' : 'files',
+    files,
     totalSize: info.size || info.transferred || 0,
     status: STATUS_MAP[info.status] ?? 'pending',
     sentBytes: info.transferred || 0,
@@ -196,7 +201,7 @@ async function apply(ev: any) {
     case 'pigeon_offer_incoming': {
       // 构造 pending 传输（对方发来的邀请）
       upsertFromInfo({
-        id: ev.offer_id, name: ev.name, size: ev.size, peer: ev.peer_id,
+        id: ev.offer_id, name: ev.name, size: ev.size, files: ev.files, peer: ev.peer_id,
         direction: 'FromPhone', status: 'Waiting', transferred: 0,
       })
       const t = store.transfers[ev.offer_id]
@@ -271,6 +276,14 @@ export const relayActions = {
         toast.success('文件已删除')
       })
       .catch((e) => toast.error(`删除失败：${String(e)}`))
+  },
+  /** 暂停/恢复一次飞鸽推送（双向皆可发起；手机链路不支持） */
+  pauseTransfer(transferId: string, paused: boolean) {
+    const t = store.transfers[transferId]
+    if (!t) return
+    if (t.from === 'phone' || t.to === 'phone') return
+    const pid = t.from === 'me' ? t.to : t.from
+    invoke('pigeon_pause', { peerId: pid, offerId: transferId, paused })
   },
   /** 防打扰开关（仅已信任设备可连接、广播静音），立即生效并持久化 */
   setDnd(enabled: boolean) {
