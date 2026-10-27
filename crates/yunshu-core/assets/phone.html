@@ -609,27 +609,29 @@ function addInFile(m) {
   addMeta('left', pcName + ' ' + now());
   const row = el('div', 'row');
   const card = fileCard(m.name, m.size, false);
-  const a = el('a', 'act');
-  a.innerHTML = dlSvg + ' 下载到手机';
-  a.href = '/file/' + m.id + '?s=' + encodeURIComponent(session);
-  a.setAttribute('download', m.name);
-  a.style.textDecoration = 'none';
-  card.appendChild(a);
-  // 备用通道：自签 HTTPS 下部分手机浏览器的下载管理器不继承页面的证书信任，
-  // 头能收到但 body 0 字节；顶级导航到 HTTP 端口可完全绕开
-  if (httpPort && String(httpPort) !== location.port) {
-    const h = el('a', 'act');
-    h.innerHTML = dlSvg + ' HTTP 直连下载（上面失败时用）';
-    h.href = 'http://' + location.hostname + ':' + httpPort + '/file/' + m.id + '?s=' + encodeURIComponent(session);
-    h.setAttribute('download', m.name);
-    h.style.textDecoration = 'none';
-    card.appendChild(h);
+  const sameOrigin = '/file/' + m.id + '?s=' + encodeURIComponent(session);
+  const httpUrl = httpPort && String(httpPort) !== location.port
+    ? 'http://' + location.hostname + ':' + httpPort + '/file/' + m.id + '?s=' + encodeURIComponent(session)
+    : '';
+  // 主通道走 HTTP 直连：自签 HTTPS 下多数国产手机浏览器的下载管理器不继承页面的
+  // 证书信任（响应头能到、body 0 字节或无反应），顶级导航到 HTTP 可完全绕开。
+  // 跨域时 download 属性被忽略，但服务端的 Content-Disposition: attachment 仍会触发下载。
+  function fileLink(url, label) {
+    const a = el('a', 'act');
+    a.innerHTML = dlSvg + label;
+    a.href = url;
+    a.setAttribute('download', m.name);
+    a.style.textDecoration = 'none';
+    if (IS_WECHAT) a.addEventListener('click', e => { e.preventDefault(); showWeChatGuide(); });
+    return a;
   }
-  // 微信内置浏览器不支持任意文件下载（下载器拿到响应头后不读数据直接失败），引导去浏览器打开
-  if (IS_WECHAT) {
-    a.addEventListener('click', e => { e.preventDefault(); showWeChatGuide(); });
-    showWeChatGuide();
+  if (httpUrl) {
+    card.appendChild(fileLink(httpUrl, ' 下载到手机'));
+    card.appendChild(fileLink(sameOrigin, ' 本页直连下载（备用）'));
+  } else {
+    card.appendChild(fileLink(sameOrigin, ' 下载到手机'));
   }
+  if (IS_WECHAT) showWeChatGuide();
   row.appendChild(card);
   $('chat').appendChild(row);
   scrollBottom();
