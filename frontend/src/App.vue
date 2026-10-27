@@ -17,6 +17,7 @@ import { startRelay } from './hooks/use-relay'
 import { store, toggleTransferPanelPersist, restoreTransferPanelPref, restoreChatStylePref } from './stores/relay-store'
 import { toast, toastState } from './hooks/use-toast'
 import { cn } from './lib/utils'
+import { installTauriDblclickGuard, initWindowControls } from './lib/window-controls'
 
 /* 移动端/窄窗抽屉 */
 const sidebarOpen = ref(false)
@@ -81,6 +82,9 @@ async function saveSettings() {
 onMounted(async () => {
   restoreTransferPanelPref()
   restoreChatStylePref()
+  // 无边框窗口：标题栏双击/三击守卫 + 窗口状态跟随（最大化/全屏图标切换）
+  installTauriDblclickGuard()
+  initWindowControls()
   await startRelay()
   window.addEventListener('yunshu-drop', onDrop)
 })

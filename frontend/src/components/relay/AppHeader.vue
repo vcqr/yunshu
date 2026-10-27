@@ -1,28 +1,31 @@
 <script setup lang="ts">
 /**
- * AppHeader：桌面软件式紧凑标题栏（h-11）
- * logo + 名称 | 行内连接状态 | 传输（lg+ 第三栏开关 / 小屏浮层）| 主题 | 设置
+ * AppHeader：桌面软件式紧凑标题栏（h-11），同时是无边框窗口的自绘标题栏
+ * （data-tauri-drag-region="deep" 整条子树可拖拽，双击最大化走 onTitlebarDblclick）：
+ * macOS 红绿灯 | logo + 名称 | 传输（lg+ 第三栏开关 / 小屏浮层）| 主题 | 设置 | 窗口控制
+ * 连接状态只在底部状态栏展示（此前头部/底栏重复展示，已收敛）。
  */
 import { computed, ref } from 'vue'
 import {
-  ArrowLeftRight, Bell, BellOff, LoaderCircle, Menu, Moon, PanelRight, Settings2, Sun, Wifi, WifiOff,
+  ArrowLeftRight, Bell, BellOff, Menu, Moon, PanelRight, Settings2, Sun,
 } from '@lucide/vue'
 import AppLogo from './AppLogo.vue'
+import TrafficLights from './TrafficLights.vue'
 import TransferPanel from './TransferPanel.vue'
 import { store, toggleTransferPanelPersist } from '../../stores/relay-store'
 import { relayActions } from '../../hooks/use-relay'
 import { toggleTheme } from '../../lib/theme'
 import { cn } from '../../lib/utils'
+import {
+  appWin, IS_MAC, isMax,
+  minimize, toggleMaximize, closeWindow,
+  onTitlebarDblclick,
+} from '../../lib/window-controls'
 
 const emit = defineEmits<{
   (e: 'open-settings'): void
   (e: 'toggle-sidebar'): void
 }>()
-
-const conn = computed(() => store.connection)
-const connLabel = computed(() =>
-  conn.value === 'connected' ? '已连接' : conn.value === 'connecting' ? '连接中…' : '已断开'
-)
 
 const activeCount = computed(
   () => Object.values(store.transfers).filter(
@@ -41,7 +44,14 @@ const transferOpen = ref(false)
 </script>
 
 <template>
-  <header class="bg-background/80 sticky top-0 z-40 flex h-11 shrink-0 items-center gap-2 border-b px-2 backdrop-blur-md sm:px-3">
+  <header
+    data-tauri-drag-region="deep"
+    class="bg-background/80 sticky top-0 z-40 flex h-11 shrink-0 select-none items-center gap-2 border-b px-2 backdrop-blur-md sm:px-3"
+    @dblclick="onTitlebarDblclick($event, toggleMaximize)"
+  >
+    <!-- macOS 红绿灯（仅 macOS + Tauri 壳渲染；Windows/Linux 自隐藏） -->
+    <TrafficLights class="mr-1" />
+
     <button
       aria-label="打开设备列表"
       class="flex size-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground md:hidden"
@@ -52,18 +62,6 @@ const transferOpen = ref(false)
 
     <AppLogo size="sm" />
     <span class="text-sm font-semibold tracking-tight">云书</span>
-
-    <div class="mx-1 hidden h-4 w-px bg-border sm:block" aria-hidden="true" />
-    <span
-      role="status"
-      :aria-label="`连接状态：${connLabel}`"
-      class="hidden items-center gap-1.5 text-xs text-muted-foreground sm:flex"
-    >
-      <Wifi v-if="conn === 'connected'" class="size-3 text-emerald-500" aria-hidden="true" />
-      <LoaderCircle v-else-if="conn === 'connecting'" class="size-3 animate-spin text-amber-500" aria-hidden="true" />
-      <WifiOff v-else class="size-3 text-red-500" aria-hidden="true" />
-      {{ connLabel }}
-    </span>
 
     <div class="ml-auto flex items-center gap-0.5">
       <!-- 传输任务 — 小屏：浮层 -->
@@ -85,14 +83,17 @@ const transferOpen = ref(false)
             class="animate-pulse absolute top-0.5 right-0.5 flex size-3.5 items-center justify-center rounded-full bg-emerald-500 text-[9px] font-bold text-white"
           >{{ badge }}</span>
         </button>
+        <!-- 小屏浮层挂在标题栏子树内：false 豁免拖拽/双击最大化（点击外部关闭的遮罩同理） -->
         <div
           v-if="transferOpen"
           class="fixed inset-0 z-40"
+          data-tauri-drag-region="false"
           @click="transferOpen = false"
         ></div>
         <div
           v-if="transferOpen"
           class="bg-popover absolute top-11 right-0 z-50 h-[380px] w-88 overflow-hidden rounded-xl border shadow-lg"
+          data-tauri-drag-region="false"
           aria-label="传输任务面板"
         >
           <TransferPanel />
@@ -155,6 +156,36 @@ const transferOpen = ref(false)
       >
         <Settings2 class="size-4" />
       </button>
+
+      <!-- Windows/Linux 方块窗口按钮：只在 Tauri 壳里渲染；浏览器里不显示（关闭=隐藏进托盘，退出走托盘菜单） -->
+      <template v-if="appWin && !IS_MAC">
+        <span class="mx-1 h-4 w-px bg-border" aria-hidden="true" />
+        <button
+          aria-label="最小化"
+          title="最小化"
+          class="flex size-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          @click="minimize"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 12h14" /></svg>
+        </button>
+        <button
+          :aria-label="isMax ? '还原' : '最大化'"
+          :title="isMax ? '还原' : '最大化'"
+          class="flex size-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          @click="toggleMaximize"
+        >
+          <svg v-if="isMax" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M9 9h10v10H9z" /><path d="M5 15V5h10" /></svg>
+          <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M6 6h12v12H6z" /></svg>
+        </button>
+        <button
+          aria-label="关闭"
+          title="关闭（隐藏到托盘）"
+          class="flex size-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-[#e04444] hover:text-white"
+          @click="closeWindow"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
+        </button>
+      </template>
     </div>
   </header>
 </template>

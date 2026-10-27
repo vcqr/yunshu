@@ -4,6 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.yunshu.desktop",
   "build": {
+    "beforeDevCommand": { "script": "npm run dev", "cwd": "../../frontend" },
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": { "script": "npm run build", "cwd": "../../frontend" },
     "frontendDist": "../../frontend/dist"
   },
   "app": {
@@ -14,7 +17,8 @@
         "width": 1180,
         "height": 760,
         "minWidth": 960,
-        "minHeight": 600
+        "minHeight": 600,
+        "decorations": false
       }
     ],
     "security": {

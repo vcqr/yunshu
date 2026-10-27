@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build"
+    "build": "vite build",
+    "tauri:dev": "cd ../crates/yunshu-app && tauri dev"
   },
   "dependencies": {
     "@lucide/vue": "^1.61.0",

@@ -25,6 +25,16 @@ cargo run --release
 
 产物为单文件 `target/release/yunshu.exe`（约 5 MB，无任何运行时依赖）。
 
+### 前端开发（热重载）
+
+```bash
+cd frontend
+npm run tauri:dev   # vite 热重载直达桌面窗口（首次为 debug 编译，较慢）
+npm run dev         # 仅浏览器预览（无 Tauri 能力，窗口按钮等自动隐藏）
+```
+
+注意 Tauri 配置在 `crates/yunshu-app/tauri.conf.json`（非标准 `src-tauri` 布局），`tauri:dev` 已处理好目录跳转；vite 固定 5173 端口（strictPort），被占用时宁可报错也不静默漂移导致白屏。
+
 ## 使用步骤
 
 1. 启动云书，托盘出现信封图标
