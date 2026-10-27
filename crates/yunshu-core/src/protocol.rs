@@ -53,6 +53,10 @@ pub enum PigeonWire {
     FileDecision { id: String, accepted: bool },
     /// 文件推送开始（接收方据此建文件与传输行）
     FileStart { id: String, name: String, size: u64 },
+    /// 接收方对 FileStart 的应答：告知本地已续传字节数（0 = 全新传输）
+    FileResume { id: String, have: u64 },
+    /// 任一方取消传输：接收方删除半成品，发送方停止推送
+    FileCancel { id: String },
     /// 文件推送结束
     FileEnd { id: String, ok: bool },
     Progress { id: String, transferred: u64, size: u64, done: bool },

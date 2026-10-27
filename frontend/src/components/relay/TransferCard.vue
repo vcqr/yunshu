@@ -27,6 +27,8 @@ const status = computed(() => STATUS_MAP[props.transfer.status] ?? STATUS_MAP.pe
 
 const isSender = computed(() => props.transfer.from === 'me')
 const isReceiver = computed(() => props.transfer.to === 'me')
+/** 手机链路（浏览器下载/网页上传）无法从 PC 侧取消 */
+const isPcTransfer = computed(() => props.transfer.from !== 'phone' && props.transfer.to !== 'phone')
 
 const detailsOpen = ref(false)
 const speed = ref(0)
@@ -159,6 +161,14 @@ watch(
       <div v-if="isSender && transfer.status === 'uploading'" class="flex items-center gap-2 text-[11px] text-muted-foreground">
         <LoaderCircle class="size-3.5 animate-spin text-emerald-500" />
         正在上传
+        <button
+          v-if="isPcTransfer"
+          class="ml-auto flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] text-red-600 transition-colors hover:bg-red-500/10 dark:text-red-400"
+          @click="relayActions.cancelTransfer(transfer.id)"
+        >
+          <X class="size-3" />
+          取消
+        </button>
       </div>
       <div v-if="isSender && transfer.status === 'completed'" class="flex items-center gap-2 text-[11px] font-medium text-emerald-600 dark:text-emerald-400">
         <CheckCircle2 class="size-3.5" />
@@ -174,6 +184,14 @@ watch(
       <div v-if="isReceiver && transfer.status === 'uploading'" class="flex items-center gap-2 text-[11px] text-muted-foreground">
         <LoaderCircle class="size-3.5 animate-spin text-emerald-500" />
         对方正在发送，接收中…
+        <button
+          v-if="isPcTransfer"
+          class="ml-auto flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] text-red-600 transition-colors hover:bg-red-500/10 dark:text-red-400"
+          @click="relayActions.cancelTransfer(transfer.id)"
+        >
+          <X class="size-3" />
+          取消
+        </button>
       </div>
       <div v-if="isReceiver && transfer.status === 'completed'" class="text-[11px]">
         <div class="flex items-center gap-2 font-medium text-emerald-600 dark:text-emerald-400">
@@ -188,6 +206,12 @@ watch(
           >
             打开所在文件夹
           </button>
+          <button
+            class="shrink-0 rounded-md px-2 py-0.5 text-[11px] font-medium text-red-600 transition-colors hover:bg-red-500/10 dark:text-red-400"
+            @click="relayActions.deleteReceivedFile(transfer.id, transfer.path!)"
+          >
+            删除文件
+          </button>
         </div>
       </div>
       <div v-if="isReceiver && transfer.status === 'rejected'" class="text-[11px] text-muted-foreground">
@@ -195,7 +219,13 @@ watch(
       </div>
       <div v-if="transfer.status === 'cancelled'" class="flex items-center gap-2 text-[11px] text-muted-foreground">
         <X class="size-3.5" />
-        传输失败或已取消
+        {{ isReceiver && !transfer.path ? '你已取消该传输' : isSender ? '传输已取消' : '传输失败或已取消' }}
+        <button
+          class="ml-auto flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] transition-colors hover:bg-accent"
+          @click="relayActions.forgetTransfer(transfer.id)"
+        >
+          删除记录
+        </button>
       </div>
     </div>
   </div>

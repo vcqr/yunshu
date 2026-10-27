@@ -31,6 +31,8 @@ export interface RelayState {
   transferPanelOpen: boolean
   /** 聊天消息显示格式：bubble 气泡 / list 列表（IRC 式）；偏好持久化 */
   chatStyle: ChatStyle
+  /** 防打扰：仅已信任设备可连接，广播静音 */
+  dnd: boolean
 }
 
 export const store = reactive<RelayState>({
@@ -53,6 +55,7 @@ export const store = reactive<RelayState>({
   pairPending: null,
   transferPanelOpen: true,
   chatStyle: 'bubble',
+  dnd: false,
 })
 
 export const mutations = {
@@ -91,6 +94,9 @@ export const mutations = {
     const t = store.transfers[id]
     if (t && t.status !== 'completed') t.status = 'completed'
   },
+  removeTransfer(id: string) {
+    delete store.transfers[id]
+  },
   enqueueTrust(req: { peer_id: string; name: string; fingerprint: string }) {
     if (store.trustRequests.some((r) => r.peer_id === req.peer_id)) return
     store.trustRequests.push(req)
@@ -108,6 +114,7 @@ export const mutations = {
   },
   setTransferPanelOpen(open: boolean) { store.transferPanelOpen = open },
   setChatStyle(style: ChatStyle) { store.chatStyle = style },
+  setDnd(enabled: boolean) { store.dnd = enabled },
 }
 
 /* --------------------------- 第三栏面板偏好 --------------------------- */

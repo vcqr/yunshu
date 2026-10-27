@@ -21,6 +21,7 @@ const STATUS_MAP: Record<string, TransferStatus> = {
   Done: 'completed',
   Refused: 'rejected',
   Failed: 'cancelled',
+  Cancelled: 'cancelled',
 }
 
 function upsertFromInfo(info: any) {
@@ -46,7 +47,18 @@ function upsertFromInfo(info: any) {
   }
   // 保留已有 createdAt（避免每次进度事件刷新时间）
   const prev = store.transfers[info.id]
-  if (prev) t.createdAt = prev.createdAt
+  if (prev) {
+    t.createdAt = prev.createdAt
+    // 局部更新保护：取消回执等可能缺名称/进度，不覆盖已有信息
+    if (!info.name && prev.name) {
+      t.name = prev.name
+      t.files = prev.files
+      t.totalSize = prev.totalSize
+    }
+    if (t.sentBytes === 0 && prev.sentBytes > 0 && (t.status === 'cancelled' || t.status === 'rejected')) {
+      t.sentBytes = prev.sentBytes
+    }
+  }
   mutations.upsertTransfer(t)
 }
 
@@ -238,6 +250,34 @@ export const relayActions = {
     }
     invoke(accepted ? 'pigeon_accept' : 'pigeon_reject', { peerId: pid, offerId: transferId })
   },
+  /** 取消一次飞鸽传输（等待中或推送中，双向皆可；手机链路不支持） */
+  cancelTransfer(transferId: string) {
+    const t = store.transfers[transferId]
+    if (!t) return
+    if (t.from === 'phone' || t.to === 'phone') return
+    const pid = t.from === 'me' ? t.to : t.from
+    invoke('pigeon_cancel', { peerId: pid, offerId: transferId })
+  },
+  /** 删除传输记录（不影响磁盘文件） */
+  forgetTransfer(transferId: string) {
+    invoke('forget_transfer', { id: transferId }).catch(() => {})
+    mutations.removeTransfer(transferId)
+  },
+  /** 删除已接收的文件并移除记录（仅限保存目录内） */
+  deleteReceivedFile(transferId: string, path: string) {
+    invoke('delete_received_file', { path })
+      .then(() => {
+        relayActions.forgetTransfer(transferId)
+        toast.success('文件已删除')
+      })
+      .catch((e) => toast.error(`删除失败：${String(e)}`))
+  },
+  /** 防打扰开关（仅已信任设备可连接、广播静音），立即生效并持久化 */
+  setDnd(enabled: boolean) {
+    invoke('set_dnd', { enabled })
+      .then(() => mutations.setDnd(enabled))
+      .catch((e) => toast.error(`切换失败：${String(e)}`))
+  },
   openFolder(path: string) {
     invoke('open_folder', { path })
   },
@@ -257,6 +297,7 @@ export async function startRelay() {
 
   const settings = await invoke<any>('get_settings').catch(() => ({}))
   if (settings.device_name) store.meName = settings.device_name
+  mutations.setDnd(!!settings.dnd_mode)
 
   const snap = await invoke<any>('get_state').catch(() => null)
   if (snap) {

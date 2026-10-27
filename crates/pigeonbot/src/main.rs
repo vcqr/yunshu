@@ -24,6 +24,8 @@ enum Wire {
     PcFile { id: String, name: String, size: u64 },
     FileDecision { id: String, accepted: bool },
     FileStart { id: String, name: String, size: u64 },
+    /// 接收方应答：本地已有 have 字节，发送方从断点续推
+    FileResume { id: String, have: u64 },
     FileEnd { id: String, ok: bool },
 }
 
@@ -46,9 +48,10 @@ fn control_msg(noise: &Mutex<TransportState>, w: &Wire) -> Vec<u8> {
     seal(noise, &plain)
 }
 
-fn chunk_msg(noise: &Mutex<TransportState>, id16: &[u8; 16], data: &[u8]) -> Vec<u8> {
+fn chunk_msg(noise: &Mutex<TransportState>, id16: &[u8; 16], offset: u64, data: &[u8]) -> Vec<u8> {
     let mut plain = vec![b'F'];
     plain.extend_from_slice(id16);
+    plain.extend_from_slice(&offset.to_le_bytes());
     plain.extend_from_slice(data);
     seal(noise, &plain)
 }
@@ -197,17 +200,48 @@ async fn main() {
     assert!(decision_ok);
     let _ = decision_ok;
 
-    // 推送块
+    // FileStart → 等接收方应答 FileResume（支持断点续传的接收方会带本地已有字节数）
     sink.send(Message::binary(control_msg(
         &noise,
         &Wire::FileStart { id: file_id.clone(), name: "pigeon-e2e.bin".into(), size: payload.len() as u64 },
     )))
     .await
     .unwrap();
-    for (i, chunk) in payload.chunks(CHUNK).enumerate() {
-        sink.send(Message::binary(chunk_msg(&noise, &id16, chunk))).await.unwrap();
-        if (i + 1) % 4 == 0 {
-            println!("[bot] 推送进度 {}/{} 块", i + 1, payload.len().div_ceil(CHUNK));
+    let resume_from: u64 = loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("等待 FileResume 超时")
+            .expect("连接断开")
+            .expect("ws 错误");
+        let plain = match msg {
+            Message::Binary(b) => open(&noise, &b),
+            Message::Close(_) => panic!("对方关闭"),
+            _ => continue,
+        };
+        if plain.first() != Some(&b'C') {
+            continue;
+        }
+        match serde_json::from_slice::<Wire>(&plain[1..]).unwrap() {
+            Wire::FileResume { id, have } => {
+                assert_eq!(id, file_id, "FileResume id 不符");
+                break have;
+            }
+            _ => continue,
+        }
+    };
+    if resume_from > 0 {
+        println!("[bot] ✓ 接收方已有 {} 字节，从断点续传", resume_from);
+    }
+
+    // 推送块（带 offset，接收方据此校验/续传）
+    let mut sent: u64 = resume_from;
+    let total_blocks = payload.len().div_ceil(CHUNK);
+    let start_block = (resume_from as usize) / CHUNK;
+    for (i, chunk) in payload[resume_from as usize..].chunks(CHUNK).enumerate() {
+        sink.send(Message::binary(chunk_msg(&noise, &id16, sent, chunk))).await.unwrap();
+        sent += chunk.len() as u64;
+        if (start_block + i + 1).is_multiple_of(4) {
+            println!("[bot] 推送进度 {}/{} 块", start_block + i + 1, total_blocks);
         }
     }
     sink.send(Message::binary(control_msg(&noise, &Wire::FileEnd { id: file_id.clone(), ok: true })))

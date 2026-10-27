@@ -11,7 +11,7 @@
 
 use crate::protocol::PigeonWire;
 use crate::server::AppState;
-use crate::{CoreEvent, Direction, PigeonPeerInfo, TransferInfo, TransferStatus};
+use crate::{CoreEvent, Direction, PigeonPeerInfo, TransferInfo, TransferKind, TransferStatus};
 use futures_util::{SinkExt, StreamExt};
 use snow::TransportState;
 use std::collections::HashMap;
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub const PIGEON_UDP_PORT: u16 = 34255;
@@ -40,13 +40,13 @@ pub struct PeerRecord {
 /// 出站明文消息（pump 统一加密后发送）
 pub enum PigeonOut {
     Control(PigeonWire),
-    Chunk { offer_id: [u8; 16], data: Vec<u8> },
+    Chunk { offer_id: [u8; 16], offset: u64, data: Vec<u8> },
 }
 
 /// 解密后的入站消息
 pub enum PigeonIn {
     Control(PigeonWire),
-    Chunk { offer_id: [u8; 16], data: Vec<u8> },
+    Chunk { offer_id: [u8; 16], offset: u64, data: Vec<u8> },
 }
 
 /// 一条已建立的加密链路（无论本端是握手发起方还是响应方）
@@ -107,6 +107,26 @@ pub fn fingerprint(remote_static: &[u8]) -> String {
     h.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
 }
 
+/// 稳定文件 id：sha256(名称 | 大小 | mtime毫秒) 前 32 位 hex。
+/// 同一磁盘文件重发时 id 不变，接收方按 id 找到半成品续传；文件被修改（mtime 变化）→ 新 id 全新传输。
+pub fn file_id(name: &str, size: u64, meta: &std::fs::Metadata) -> String {
+    use sha2::{Digest, Sha256};
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut h = Sha256::new();
+    h.update(name.as_bytes());
+    h.update([0]);
+    h.update(size.to_le_bytes());
+    h.update([0]);
+    h.update(mtime.to_le_bytes());
+    let digest = h.finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect::<String>()[..32].to_string()
+}
+
 /// 密钥指纹是否已被用户确认固定。
 /// 按指纹键控（而非 peer_id）：peer_id 每次进程重启都重新生成，密钥指纹才是稳定的设备身份；
 /// 同机多实例共享机器密钥时，一次信任对所有实例生效。
@@ -145,9 +165,10 @@ pub fn seal_msg(noise: &Mutex<TransportState>, msg: &PigeonOut) -> Result<Vec<u8
             plain.push(b'C');
             serde_json::to_writer(&mut plain, w).map_err(|e| e.to_string())?;
         }
-        PigeonOut::Chunk { offer_id, data } => {
+        PigeonOut::Chunk { offer_id, offset, data } => {
             plain.push(b'F');
             plain.extend_from_slice(offer_id);
+            plain.extend_from_slice(&offset.to_le_bytes());
             plain.extend_from_slice(data);
         }
     }
@@ -162,10 +183,11 @@ pub fn open_msg(noise: &Mutex<TransportState>, cipher: &[u8]) -> Result<PigeonIn
     let n = noise.lock().unwrap().read_message(cipher, &mut buf).map_err(|e| e.to_string())?;
     match buf.first() {
         Some(b'C') => Ok(PigeonIn::Control(serde_json::from_slice(&buf[1..n]).map_err(|e| e.to_string())?)),
-        Some(b'F') if n >= 17 => {
+        Some(b'F') if n >= 25 => {
             let mut id = [0u8; 16];
             id.copy_from_slice(&buf[1..17]);
-            Ok(PigeonIn::Chunk { offer_id: id, data: buf[17..n].to_vec() })
+            let offset = u64::from_le_bytes(buf[17..25].try_into().unwrap());
+            Ok(PigeonIn::Chunk { offer_id: id, offset, data: buf[25..n].to_vec() })
         }
         _ => Err("未知消息前缀".into()),
     }
@@ -366,6 +388,13 @@ async fn pigeon_connect_inner(st: &Arc<AppState>, peer_id: &str, ip: IpAddr, por
     if st.pigeon_conns.lock().unwrap().contains_key(peer_id) {
         return Ok(());
     }
+    let addr_key = format!("{ip}:{port}");
+    // 防打扰：近期握手后判为未信任的地址，10 分钟内不再反复握手
+    if st.dnd.load(Ordering::Relaxed)
+        && st.dnd_skipped.lock().unwrap().get(&addr_key).is_some_and(|t| t.elapsed() < Duration::from_secs(600))
+    {
+        return Err("防打扰：跳过未信任设备".into());
+    }
     let name = st
         .pigeon_peers
         .lock()
@@ -407,6 +436,17 @@ async fn pigeon_connect_inner(st: &Arc<AppState>, peer_id: &str, ip: IpAddr, por
     let noise = hs.into_transport_mode().map_err(|e| e.to_string())?;
     let noise = Arc::new(Mutex::new(noise));
     let remote_static = noise.lock().unwrap().get_remote_static().map(|s| s.to_vec()).unwrap_or_default();
+
+    // 防打扰：未信任设备在 hello 前静默断开（对方不会收到连接确认，也不弹任何窗）
+    if st.dnd.load(Ordering::Relaxed) && !is_pinned(&remote_static) {
+        st.dnd_skipped
+            .lock()
+            .unwrap()
+            .insert(format!("{ip}:{port}"), Instant::now());
+        let _ = sink.close().await;
+        tracing::info!("防打扰：跳过未信任设备（{ip}:{port}），10 分钟内不再尝试");
+        return Err("防打扰：跳过未信任设备".into());
+    }
 
     // ---- 加密 hello ----
     let hello = PigeonOut::Control(PigeonWire::PigeonHello {
@@ -565,7 +605,7 @@ pub async fn pump(
             break;
         }
     }
-    drop_link(&st, &peer_id);
+    drop_link(st.clone(), peer_id.clone()).await;
     tracing::info!("「{peer_name}」的加密链路泵结束");
     emit_peers(&st);
 }
@@ -578,6 +618,11 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
             st.emit(CoreEvent::ChatFromPc { peer_id: peer_id.to_string(), peer_name, text });
         }
         PigeonIn::Control(PigeonWire::BroadcastText { text }) => {
+            // 防打扰：广播消息整体静音（能连上的都是已信任设备，按用户要求一并静音）
+            if st.dnd.load(Ordering::Relaxed) {
+                tracing::info!("防打扰：已静音来自「{}」的广播消息", link_name(st, peer_id));
+                return;
+            }
             let peer_name = link_name(st, peer_id);
             tracing::info!("收到「{peer_name}」的广播消息：{text}");
             st.emit(CoreEvent::ChatBroadcast { peer_id: peer_id.to_string(), peer_name, text });
@@ -617,93 +662,239 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
             }
         }
         PigeonIn::Control(PigeonWire::FileStart { id, name, size }) => {
-            let dest = crate::server::unique_path(&st.cfg.save_dir, &crate::server::sanitize_name(&name));
-            let display = dest
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| name.clone());
-            match tokio::fs::File::create(&dest).await {
-                Ok(f) => {
-                    let row_id = uuid::Uuid::new_v4().simple().to_string();
-                    st.new_transfer(TransferInfo::file(row_id.clone(), Direction::FromPhone, display.clone(), size, Some(peer_id.to_string())));
-                    st.update_transfer(&row_id, 0, None, TransferStatus::Active, None);
-                    st.recv_files.lock().await.insert(
-                        id,
-                        crate::server::RecvFileState { row_id, file: f, written: 0, dest },
-                    );
+            // 半成品统一放 .yunshu-parts/，完成后改名进保存目录；按 id 找已有半成品续传
+            let parts_dir = st.cfg.save_dir.join(".yunshu-parts");
+            let _ = tokio::fs::create_dir_all(&parts_dir).await;
+            let part = parts_dir.join(format!("{id}.part"));
+            let display = crate::server::sanitize_name(&name);
+            let (file, have) = match tokio::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false) // 续传：保留已有半成品
+                .open(&part)
+                .await
+            {
+                Ok(mut f) => {
+                    let len = f.metadata().await.map(|m| m.len()).unwrap_or(0);
+                    let have = if size > 0 { len.min(size) } else { len };
+                    let _ = f.set_len(have).await; // 截掉可能写了一半的最后一个块
+                    let _ = f.seek(std::io::SeekFrom::Start(have)).await;
+                    (f, have)
                 }
                 Err(e) => {
-                    tracing::error!("创建接收文件失败: {e}");
+                    tracing::error!("创建半成品文件失败 {part:?}: {e}");
                     let _ = push_control(st, peer_id, PigeonWire::FileDecision { id, accepted: false }).await;
+                    return;
                 }
+            };
+            let row_id = uuid::Uuid::new_v4().simple().to_string();
+            st.new_transfer(TransferInfo::file(row_id.clone(), Direction::FromPhone, display.clone(), size, Some(peer_id.to_string())));
+            st.update_transfer(&row_id, have, Some(size), TransferStatus::Active, None);
+            st.recv_files.lock().await.insert(
+                id.clone(),
+                crate::server::RecvFileState {
+                    row_id,
+                    file,
+                    written: have,
+                    name: display,
+                    part,
+                    peer_id: peer_id.to_string(),
+                },
+            );
+            if have > 0 {
+                tracing::info!("「{name}」从 {} 字节处续传接收", have);
+            }
+            let _ = push_control(st, peer_id, PigeonWire::FileResume { id, have }).await;
+        }
+        PigeonIn::Control(PigeonWire::FileResume { id, have }) => {
+            if let Some(tx) = st.pigeon_push_resume.lock().unwrap().remove(&id) {
+                let _ = tx.send(have);
+            }
+        }
+        PigeonIn::Control(PigeonWire::FileCancel { id }) => {
+            let state = st.recv_files.lock().await.remove(&id);
+            if let Some(mut s) = state {
+                let _ = s.file.flush().await;
+                drop(s.file);
+                let _ = tokio::fs::remove_file(&s.part).await;
+                st.update_transfer(&s.row_id, s.written, None, TransferStatus::Cancelled, None);
+                st.emit(CoreEvent::Toast { text: format!("「{}」的传输已取消", s.name) });
+            } else if !st.transfers.lock().unwrap().iter().any(|t| t.id == id) {
+                // 等待接受阶段被对方撤回：本端可能挂着确认弹窗，推一条取消状态让 UI 收尾
+                let info = TransferInfo {
+                    id,
+                    direction: Direction::FromPhone,
+                    kind: TransferKind::File,
+                    name: String::new(),
+                    size: 0,
+                    transferred: 0,
+                    status: TransferStatus::Cancelled,
+                    path: None,
+                    peer: Some(peer_id.to_string()),
+                };
+                st.emit(CoreEvent::TransferUpdate { t: Box::new(info) });
             }
         }
         PigeonIn::Control(PigeonWire::FileEnd { id, ok }) => {
             let state = st.recv_files.lock().await.remove(&id);
             match state {
-                Some(s) => {
+                Some(mut s) => {
                     if ok {
-                        st.update_transfer(&s.row_id, s.written, Some(s.written), TransferStatus::Done, Some(s.dest.clone()));
-                        st.emit(CoreEvent::Toast { text: format!("收到电脑传来的「{}」", s.dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()) });
+                        let _ = s.file.flush().await;
+                        drop(s.file);
+                        let dest = crate::server::unique_path(&st.cfg.save_dir, &s.name);
+                        if tokio::fs::rename(&s.part, &dest).await.is_ok() {
+                            st.update_transfer(&s.row_id, s.written, Some(s.written), TransferStatus::Done, Some(dest.clone()));
+                            st.emit(CoreEvent::Toast { text: format!("收到电脑传来的「{}」", s.name) });
+                        } else {
+                            st.update_transfer(&s.row_id, s.written, Some(s.written), TransferStatus::Failed, None);
+                        }
                     } else {
-                        st.update_transfer(&s.row_id, s.written, Some(s.written), TransferStatus::Failed, None);
-                        let _ = tokio::fs::remove_file(&s.dest).await;
+                        // 发送方异常中断：保留半成品，对方重发同一文件时自动续传
+                        st.update_transfer(&s.row_id, s.written, None, TransferStatus::Failed, None);
+                        tracing::info!("「{}」推送中断，已保留 {} 字节半成品待续传", s.name, s.written);
                     }
                 }
                 None => tracing::warn!("FileEnd 找不到对应的接收状态（{id}）"),
             }
         }
         PigeonIn::Control(_) => {}
-        PigeonIn::Chunk { offer_id, data } => {
+        PigeonIn::Chunk { offer_id, offset, data } => {
             let key = uuid::Uuid::from_bytes(offer_id).simple().to_string();
-            let mut states = st.recv_files.lock().await;
-            if let Some(s) = states.get_mut(&key)
-                && s.file.write_all(&data).await.is_ok()
-            {
-                s.written += data.len() as u64;
-                st.progress_throttled(&s.row_id, s.written, false);
+            let outcome = {
+                let mut states = st.recv_files.lock().await;
+                match states.get_mut(&key) {
+                    Some(s) => {
+                        // 按块自带 offset 自校验：offset 落后于本地 → 发送方从更早处重推
+                        // （旧版本对端不支持续传时会从 0 重发），回退覆盖，保证内容正确
+                        if offset > s.written {
+                            tracing::warn!("收到越位数据块（offset {offset} > 已写 {}），忽略等待重发", s.written);
+                            None
+                        } else {
+                            if offset < s.written {
+                                let _ = s.file.set_len(offset).await;
+                                let _ = s.file.seek(std::io::SeekFrom::Start(offset)).await;
+                                s.written = offset;
+                            }
+                            match s.file.write_all(&data).await {
+                                Ok(()) => {
+                                    s.written += data.len() as u64;
+                                    st.progress_throttled(&s.row_id, s.written, false);
+                                    None
+                                }
+                                Err(e) => {
+                                    tracing::error!("写入半成品失败: {e}");
+                                    Some((s.row_id.clone(), s.written, s.peer_id.clone()))
+                                }
+                            }
+                        }
+                    }
+                    None => None,
+                }
+            };
+            if let Some((row_id, written, peer)) = outcome {
+                st.recv_files.lock().await.remove(&key);
+                st.update_transfer(&row_id, written, None, TransferStatus::Failed, None);
+                // 通知发送方停止推送（半成品保留，修复磁盘后可续传）
+                let _ = push_control(st, &peer, PigeonWire::FileCancel { id: key }).await;
             }
         }
     }
 }
 
-/// 发送方：对方接受后，把文件切块经加密通道推送
+/// 发送方：对方接受后，把文件切块经加密通道推送（支持断点续传与取消）
 pub async fn push_file(st: Arc<AppState>, peer_id: String, offer_id: String, path: PathBuf, name: String, size: u64) {
-    let out = st.pigeon_conns.lock().unwrap().get(&peer_id).map(|l| l.out.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    st.pigeon_push_cancel.lock().unwrap().insert(offer_id.clone(), cancel.clone());
+    push_file_impl(&st, &peer_id, &offer_id, &path, &name, size, &cancel).await;
+    st.pigeon_push_cancel.lock().unwrap().remove(&offer_id);
+    st.pigeon_push_resume.lock().unwrap().remove(&offer_id);
+}
+
+async fn push_file_impl(
+    st: &Arc<AppState>,
+    peer_id: &str,
+    offer_id: &str,
+    path: &PathBuf,
+    name: &str,
+    size: u64,
+    cancel: &AtomicBool,
+) {
+    let out = st.pigeon_conns.lock().unwrap().get(peer_id).map(|l| l.out.clone());
     let Some(out) = out else {
-        st.update_transfer(&offer_id, 0, None, TransferStatus::Failed, None);
+        st.update_transfer(offer_id, 0, None, TransferStatus::Failed, None);
         return;
     };
-    let Ok(uuid) = uuid::Uuid::parse_str(&offer_id) else { return };
+    let Ok(uuid) = uuid::Uuid::parse_str(offer_id) else { return };
     let id16 = *uuid.as_bytes();
-    let Ok(mut file) = tokio::fs::File::open(&path).await else {
-        st.update_transfer(&offer_id, 0, None, TransferStatus::Failed, None);
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        st.update_transfer(offer_id, 0, None, TransferStatus::Failed, None);
         return;
     };
-    let _ = out.send(PigeonOut::Control(PigeonWire::FileStart { id: offer_id.clone(), name: name.clone(), size })).await;
-    st.update_transfer(&offer_id, 0, None, TransferStatus::Active, None);
-    let mut sent: u64 = 0;
+
+    // FileStart → 等接收方应答本地已有字节数（旧版本对端不回复，超时按 0 全量推）
+    let _ = out.send(PigeonOut::Control(PigeonWire::FileStart { id: offer_id.to_string(), name: name.to_string(), size })).await;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    st.pigeon_push_resume.lock().unwrap().insert(offer_id.to_string(), tx);
+    let mut sent = tokio::select! {
+        r = tokio::time::timeout(Duration::from_secs(10), rx) => match r {
+            Ok(Ok(have)) => have.min(size),
+            _ => 0,
+        },
+        // 等待应答期间被取消
+        _ = wait_cancelled(cancel) => {
+            let _ = out.send(PigeonOut::Control(PigeonWire::FileCancel { id: offer_id.to_string() })).await;
+            st.update_transfer(offer_id, 0, Some(size), TransferStatus::Cancelled, None);
+            return;
+        }
+    };
+    if sent > 0 {
+        if file.seek(std::io::SeekFrom::Start(sent)).await.is_err() {
+            sent = 0;
+        } else {
+            tracing::info!("文件「{name}」从 {} 字节处续传", sent);
+        }
+    }
+    st.update_transfer(offer_id, sent, Some(size), TransferStatus::Active, None);
+
     let mut buf = vec![0u8; CHUNK_SIZE];
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = out.send(PigeonOut::Control(PigeonWire::FileCancel { id: offer_id.to_string() })).await;
+            st.update_transfer(offer_id, sent, Some(size), TransferStatus::Cancelled, None);
+            tracing::info!("文件「{name}」的推送已被用户取消");
+            return;
+        }
         match file.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
-                if out.send(PigeonOut::Chunk { offer_id: id16, data: buf[..n].to_vec() }).await.is_err() {
-                    st.update_transfer(&offer_id, sent, Some(size), TransferStatus::Failed, None);
+                if out.send(PigeonOut::Chunk { offer_id: id16, offset: sent, data: buf[..n].to_vec() }).await.is_err() {
+                    st.update_transfer(offer_id, sent, Some(size), TransferStatus::Failed, None);
                     return;
                 }
                 sent += n as u64;
-                st.progress_throttled(&offer_id, sent, false);
+                st.progress_throttled(offer_id, sent, false);
             }
             Err(_) => {
-                st.update_transfer(&offer_id, sent, Some(size), TransferStatus::Failed, None);
+                st.update_transfer(offer_id, sent, Some(size), TransferStatus::Failed, None);
                 return;
             }
         }
     }
-    let _ = out.send(PigeonOut::Control(PigeonWire::FileEnd { id: offer_id.clone(), ok: true })).await;
-    st.update_transfer(&offer_id, sent, Some(size), TransferStatus::Done, Some(path));
+    let _ = out.send(PigeonOut::Control(PigeonWire::FileEnd { id: offer_id.to_string(), ok: true })).await;
+    st.update_transfer(offer_id, sent, Some(size), TransferStatus::Done, Some(path.clone()));
     tracing::info!("文件「{name}」已加密推送完成（{sent} 字节）");
+}
+
+/// 轮询取消标记（推送协程与取消指令分属不同任务）
+async fn wait_cancelled(cancel: &AtomicBool) {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn link_name(st: &AppState, peer_id: &str) -> String {
@@ -715,8 +906,23 @@ fn link_name(st: &AppState, peer_id: &str) -> String {
         .unwrap_or_else(|| "电脑".into())
 }
 
-pub fn drop_link(st: &AppState, peer_id: &str) {
-    if st.pigeon_conns.lock().unwrap().remove(peer_id).is_some() {
-        emit_peers(st);
+pub async fn drop_link(st: Arc<AppState>, peer_id: String) {
+    if st.pigeon_conns.lock().unwrap().remove(&peer_id).is_some() {
+        emit_peers(&st);
+    }
+    // 断链清理：该 peer 接收中的文件落盘关闭、保留半成品（重连重发后可续传），传输行标失败
+    let stale: Vec<crate::server::RecvFileState> = {
+        let mut states = st.recv_files.lock().await;
+        let keys: Vec<String> = states
+            .iter()
+            .filter(|(_, s)| s.peer_id == peer_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.iter().filter_map(|k| states.remove(k)).collect()
+    };
+    for mut s in stale {
+        let _ = s.file.flush().await;
+        st.update_transfer(&s.row_id, s.written, None, TransferStatus::Failed, None);
+        tracing::info!("链路断开，「{}」已保留 {} 字节半成品待续传", s.name, s.written);
     }
 }

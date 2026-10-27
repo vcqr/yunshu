@@ -32,6 +32,8 @@ pub enum TransferStatus {
     Failed,
     /// 接收方明确拒绝了这次传输
     Refused,
+    /// 任一方主动取消（半成品已清理）
+    Cancelled,
 }
 
 /// 一条传输记录（UI 列表数据源，每次变化全量推送）
@@ -120,6 +122,12 @@ pub enum UiRequest {
     PigeonAcceptFile { peer_id: String, offer_id: String },
     /// 用户拒绝接收
     PigeonRejectFile { peer_id: String, offer_id: String },
+    /// 用户取消一次飞鸽传输（等待中或推送中，双向皆可发起）
+    PigeonCancelFile { peer_id: String, offer_id: String },
+    /// 忘记一条传输记录（仅 UI 列表，不影响磁盘文件）
+    ForgetTransfer { id: String },
+    /// 切换防打扰模式（仅已信任设备可连接、广播静音）
+    SetDnd(bool),
 }
 
 /// 核心配置
@@ -129,6 +137,8 @@ pub struct CoreConfig {
     pub https_port: u16,
     pub save_dir: PathBuf,
     pub pc_name: String,
+    /// 防打扰：仅已信任（指纹固定）设备可连接，广播静音
+    pub dnd_mode: bool,
 }
 
 /// 在后台线程启动 tokio runtime 与 axum 服务

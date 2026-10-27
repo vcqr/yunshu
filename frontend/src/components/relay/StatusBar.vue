@@ -58,6 +58,16 @@ const percent = computed(() =>
       {{ connLabel }}
     </span>
 
+    <!-- 防打扰标识 -->
+    <span
+      v-if="store.dnd"
+      class="text-emerald-600 dark:text-emerald-400 flex items-center gap-1"
+      title="防打扰：仅已信任设备可连接，广播消息静音"
+    >
+      <span class="h-3 w-px bg-border" aria-hidden="true" />
+      防打扰
+    </span>
+
     <!-- 在线设备 -->
     <span class="hidden items-center gap-1 sm:flex">
       <span class="h-3 w-px bg-border" aria-hidden="true" />

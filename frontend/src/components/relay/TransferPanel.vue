@@ -6,7 +6,7 @@
  */
 import { computed, ref } from 'vue'
 import {
-  ArrowDownToLine, ArrowUpFromLine, CheckCircle2, FolderOpen, Inbox, LoaderCircle, PanelRightClose,
+  ArrowDownToLine, ArrowUpFromLine, CheckCircle2, FolderOpen, Inbox, LoaderCircle, PanelRightClose, X,
 } from '@lucide/vue'
 import { formatBytes, formatTime, transferTitle } from '../../lib/relay-format'
 import { splitTransfers } from '../../stores/relay-store'
@@ -126,6 +126,24 @@ function cardMeta(t: Transfer): string {
                 class="size-3.5 shrink-0 text-green-500"
                 aria-label="已完成"
               />
+              <button
+                v-if="(t.status === 'pending' || t.status === 'uploading') && t.from !== 'phone' && t.to !== 'phone'"
+                aria-label="取消传输"
+                title="取消传输"
+                class="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-red-500/10 hover:text-red-600 dark:hover:text-red-400"
+                @click="relayActions.cancelTransfer(t.id)"
+              >
+                <X class="size-3.5" />
+              </button>
+              <button
+                v-if="t.status !== 'pending' && t.status !== 'uploading'"
+                aria-label="删除记录"
+                title="删除记录"
+                class="text-muted-foreground hover:text-foreground flex size-7 shrink-0 items-center justify-center rounded-md transition-colors hover:bg-accent"
+                @click="relayActions.forgetTransfer(t.id)"
+              >
+                <X class="size-3.5" />
+              </button>
               <button
                 v-if="t.status === 'completed' && t.to === 'me' && t.path"
                 aria-label="打开所在文件夹"

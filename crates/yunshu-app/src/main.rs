@@ -133,6 +133,32 @@ fn pigeon_reject(state: tauri::State<AppState>, peer_id: String, offer_id: Strin
 }
 
 #[tauri::command]
+fn pigeon_cancel(state: tauri::State<AppState>, peer_id: String, offer_id: String) {
+    let _ = state.ui_tx.send(UiRequest::PigeonCancelFile { peer_id, offer_id });
+}
+
+/// 忘记一条传输记录（仅 UI 列表；已收文件用 delete_received_file 删）
+#[tauri::command]
+fn forget_transfer(state: tauri::State<AppState>, id: String) {
+    let _ = state.ui_tx.send(UiRequest::ForgetTransfer { id });
+}
+
+/// 删除已接收的文件（仅允许保存目录内的路径，防止误删任意文件）
+#[tauri::command]
+fn delete_received_file(path: String) -> Result<(), String> {
+    let p = std::path::PathBuf::from(&path);
+    let save_dir = yunshu_core::settings::Settings::load_or_default().save_dir_path();
+    let in_save_dir = match (p.parent().and_then(|d| d.canonicalize().ok()), save_dir.canonicalize().ok()) {
+        (Some(parent), Some(dir)) => parent == dir,
+        _ => false,
+    };
+    if !in_save_dir {
+        return Err("只允许删除保存目录内的文件".into());
+    }
+    std::fs::remove_file(&p).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn pigeon_disconnect(state: tauri::State<AppState>, peer_id: String) {
     let _ = state.ui_tx.send(UiRequest::PigeonDisconnect { peer_id });
 }
@@ -176,7 +202,14 @@ fn get_settings() -> serde_json::Value {
 }
 
 #[tauri::command]
-fn save_settings(device_name: String, port: u16, save_dir: String, autostart: bool) -> Result<(), String> {
+fn save_settings(
+    state: tauri::State<AppState>,
+    device_name: String,
+    port: u16,
+    save_dir: String,
+    autostart: bool,
+    dnd_mode: bool,
+) -> Result<(), String> {
     let mut s = yunshu_core::settings::Settings::load_or_default();
     s.device_name = device_name;
     s.port = port;
@@ -185,6 +218,19 @@ fn save_settings(device_name: String, port: u16, save_dir: String, autostart: bo
         yunshu_core::settings::Settings::apply_autostart(autostart)?;
         s.autostart = autostart;
     }
+    if s.dnd_mode != dnd_mode {
+        let _ = state.ui_tx.send(UiRequest::SetDnd(dnd_mode));
+        s.dnd_mode = dnd_mode;
+    }
+    s.save()
+}
+
+/// 防打扰开关（头部铃铛）：立即生效并持久化
+#[tauri::command]
+fn set_dnd(state: tauri::State<AppState>, enabled: bool) -> Result<(), String> {
+    let _ = state.ui_tx.send(UiRequest::SetDnd(enabled));
+    let mut s = yunshu_core::settings::Settings::load_or_default();
+    s.dnd_mode = enabled;
     s.save()
 }
 
@@ -277,12 +323,16 @@ fn main() {
             pigeon_send_text,
             pigeon_accept,
             pigeon_reject,
+            pigeon_cancel,
+            forget_transfer,
+            delete_received_file,
             pigeon_disconnect,
             set_save_dir,
             open_folder,
             stage_blob,
             get_settings,
-            save_settings
+            save_settings,
+            set_dnd
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏进托盘；退出走托盘菜单

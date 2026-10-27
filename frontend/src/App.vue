@@ -51,7 +51,7 @@ function rejectTrust() {
 
 /* ------------------------------ 设置 ------------------------------ */
 const showSettings = ref(false)
-const settingsForm = ref({ device_name: '', port: 34256, save_dir: '', autostart: false })
+const settingsForm = ref({ device_name: '', port: 34256, save_dir: '', autostart: false, dnd_mode: false })
 async function openSettings() {
   const s = await invoke<any>('get_settings').catch(() => null)
   if (s) settingsForm.value = { ...s }
@@ -66,9 +66,10 @@ async function saveSettings() {
   const s = settingsForm.value
   try {
     await invoke('save_settings', {
-      deviceName: s.device_name, port: s.port, saveDir: s.save_dir, autostart: s.autostart,
+      deviceName: s.device_name, port: s.port, saveDir: s.save_dir, autostart: s.autostart, dndMode: s.dnd_mode,
     })
     store.meName = s.device_name
+    store.dnd = s.dnd_mode
     toast.success('设置已保存（端口、目录重启后生效）')
     showSettings.value = false
   } catch (e) {
@@ -200,6 +201,10 @@ onMounted(async () => {
           <label class="flex items-center gap-2.5 text-sm">
             <input v-model="settingsForm.autostart" type="checkbox" class="size-4 accent-emerald-600" />
             开机自启
+          </label>
+          <label class="flex items-center gap-2.5 text-sm">
+            <input v-model="settingsForm.dnd_mode" type="checkbox" class="size-4 accent-emerald-600" />
+            防打扰（仅已信任设备可连接，广播消息静音）
           </label>
         </div>
         <p class="mt-3 text-xs text-muted-foreground">端口、目录修改后需重启云书生效</p>

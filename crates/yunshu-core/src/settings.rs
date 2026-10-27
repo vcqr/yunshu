@@ -11,13 +11,15 @@ pub struct Settings {
     pub https_port: u16,
     pub save_dir: String,
     pub autostart: bool,
+    /// 防打扰：仅已固定指纹（信任过）的设备可连接，广播消息静音
+    pub dnd_mode: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         let device_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "我的电脑".into());
         let save_dir = default_save_dir().to_string_lossy().to_string();
-        Settings { device_name, port: 34256, https_port: 34257, save_dir, autostart: false }
+        Settings { device_name, port: 34256, https_port: 34257, save_dir, autostart: false, dnd_mode: false }
     }
 }
 
@@ -63,6 +65,7 @@ impl Settings {
             https_port: self.https_port,
             save_dir: self.save_dir_path(),
             pc_name: self.device_name.clone(),
+            dnd_mode: self.dnd_mode,
         }
     }
 
