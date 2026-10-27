@@ -3,8 +3,8 @@
  * core（yunshu_core）事件 → store；relayActions → Tauri invoke
  */
 import { invoke } from '@tauri-apps/api/core'
-import { reactive } from 'vue'
 import { listen } from '@tauri-apps/api/event'
+import { reactive } from 'vue'
 import { store, mutations } from '../stores/relay-store'
 import { toast } from './use-toast'
 import { uuid } from '../lib/relay-format'
@@ -24,6 +24,8 @@ const STATUS_MAP: Record<string, TransferStatus> = {
 }
 
 function upsertFromInfo(info: any) {
+  // 文本互发以聊天消息呈现（core 另发 TextFromPhone/聊天事件），不再生成传输卡
+  if (info.kind === 'Text') return
   const isPhone = info.peer === 'phone'
   const toMe = info.direction === 'FromPhone'
   const peerId = info.peer || ''
@@ -44,10 +46,7 @@ function upsertFromInfo(info: any) {
   }
   // 保留已有 createdAt（避免每次进度事件刷新时间）
   const prev = store.transfers[info.id]
-  if (prev) {
-    t.createdAt = prev.createdAt
-    t.fromName = prev.from === t.from ? t.fromName : t.fromName
-  }
+  if (prev) t.createdAt = prev.createdAt
   mutations.upsertTransfer(t)
 }
 
@@ -61,9 +60,38 @@ function firstSeen(id: string): number {
   return t
 }
 
-function peerNameOf(peerId: string): string {
-  if (peerId === 'phone') return store.phoneName
+export function peerNameOf(peerId: string): string {
+  if (peerId === 'phone') return store.phoneConnected ? store.phoneName : '手机'
   return store.devices.find((d) => d.id === peerId)?.name || '电脑'
+}
+
+/* ---------- 飞鸽设备上下线 → 广播会话系统消息 ---------- */
+
+let peersInitialized = false
+function systemMessage(content: string) {
+  mutations.addMessage({
+    id: uuid(), from: 'server', fromName: '系统', to: 'broadcast',
+    kind: 'system', content, createdAt: Date.now(),
+  })
+}
+
+function applyPeers(peers: any[]) {
+  const devices = (peers || []).map((p: any) => ({ id: p.id, name: p.name, ip: p.ip, online: p.connected }))
+  if (peersInitialized) {
+    for (const d of devices) {
+      if (!store.devices.some((x) => x.id === d.id)) systemMessage(`${d.name} 上线了`)
+    }
+    for (const d of store.devices) {
+      if (!devices.some((x: any) => x.id === d.id)) systemMessage(`${d.name} 离开了`)
+    }
+  }
+  peersInitialized = true
+  mutations.setDevices(devices)
+  // 选中设备消失时回到广播会话
+  if (store.selectedPeer && store.selectedPeer !== 'phone' && store.selectedPeer !== 'broadcast' &&
+      !store.devices.some((d) => d.id === store.selectedPeer)) {
+    mutations.setSelectedPeer('broadcast')
+  }
 }
 
 /* ---------- core 事件 → store ---------- */
@@ -84,6 +112,7 @@ async function apply(ev: any) {
       break
     case 'pair_pending':
       mutations.setPairPending({ code: ev.code, device: ev.device })
+      mutations.setSelectedPeer('phone')
       toast.info(`手机「${ev.device}」发起配对，请在手机上输入配对码`)
       break
     case 'pair_ok':
@@ -91,6 +120,9 @@ async function apply(ev: any) {
       mutations.setPhoneConnected(ev.device)
       mutations.setSelectedPeer('phone')
       toast.success(`手机「${ev.device}」配对成功`)
+      break
+    case 'pair_failed':
+      toast.error(ev.reason || '配对失败')
       break
     case 'peer_disconnected':
       if (store.phoneConnected) {
@@ -100,11 +132,11 @@ async function apply(ev: any) {
       break
     case 'text_from_phone':
       mutations.addMessage({
-        id: uuid(), from: 'phone', fromName: store.phoneName, to: 'me',
+        id: uuid(), from: 'phone', fromName: store.phoneConnected ? store.phoneName : '手机', to: 'me',
         kind: 'clipboard', content: ev.text, createdAt: Date.now(),
       })
       if (store.selectedPeer !== 'phone') {
-        toast.info(`📱 手机发来了文本（已复制到电脑剪贴板）`)
+        toast.info('手机发来了文本（已复制到电脑剪贴板）')
       }
       break
     case 'toast':
@@ -120,34 +152,26 @@ async function apply(ev: any) {
         invoke('set_save_dir', { batch: ev.batch, dir })
       }
       break
-    case 'pigeon_peers': {
-      mutations.setDevices(
-        (ev.peers || []).map((p: any) => ({ id: p.id, name: p.name, ip: p.ip, online: p.connected }))
-      )
-      // 选中设备消失时清空选中
-      if (store.selectedPeer && store.selectedPeer !== 'phone' &&
-          !store.devices.some((d) => d.id === store.selectedPeer)) {
-        mutations.setSelectedPeer('')
-      }
+    case 'pigeon_peers':
+      applyPeers(ev.peers || [])
       break
-    }
     case 'chat_from_pc':
       mutations.addMessage({
         id: uuid(), from: ev.peer_id, fromName: ev.peer_name, to: 'me',
         kind: 'text', content: ev.text, createdAt: Date.now(),
       })
       if (store.selectedPeer !== ev.peer_id) {
-        toast.info(`💻 ${ev.peer_name}：${ev.text}`)
+        toast.info(`${ev.peer_name}：${ev.text}`)
       }
       break
     case 'chat_broadcast':
-      {
-        const dev = ev.peer_id === 'me' ? 'me' : ev.peer_id
-        mutations.addMessage({
-          id: uuid(), from: dev, fromName: ev.peer_name, to: 'broadcast',
-          kind: 'text', content: ev.text, createdAt: Date.now(),
-        })
-        if (store.selectedPeer !== 'broadcast') toast.info(`📢 ${ev.peer_name}（广播）：${ev.text}`)
+      // 本机广播由 core 回显（peer_id='me'），直接采用即可
+      mutations.addMessage({
+        id: uuid(), from: ev.peer_id, fromName: ev.peer_id === 'me' ? store.meName : ev.peer_name,
+        to: 'broadcast', kind: 'text', content: ev.text, createdAt: Date.now(),
+      })
+      if (store.selectedPeer !== 'broadcast' && ev.peer_id !== 'me') {
+        toast.info(`${ev.peer_name}（广播）：${ev.text}`)
       }
       break
     case 'pigeon_trust_request':
@@ -155,7 +179,7 @@ async function apply(ev: any) {
       break
     case 'pigeon_fingerprint':
       store.fingerprints[ev.peer_id] = ev.fingerprint
-      toast.info(`🔒 新设备已固定指纹 ${String(ev.fingerprint).slice(0, 23)}…`)
+      toast.info(`新设备已固定指纹 ${String(ev.fingerprint).slice(0, 23)}…`)
       break
     case 'pigeon_offer_incoming': {
       // 构造 pending 传输（对方发来的邀请）
@@ -176,31 +200,27 @@ async function apply(ev: any) {
 
 export const relayActions = {
   sendText(to: string, content: string): boolean {
-    const m = {
-      id: uuid(), from: 'me', fromName: store.meName,
-      to, kind: 'text' as const, content, createdAt: Date.now(),
-    }
     if (to === 'phone') {
       if (!store.phoneConnected) { toast.error('手机未配对，请先扫码'); return false }
       invoke('send_text', { text: content })
     } else {
       invoke('pigeon_send_text', { peerId: to, text: content })
     }
-    mutations.addMessage(m)
+    mutations.addMessage({
+      id: uuid(), from: 'me', fromName: store.meName,
+      to, kind: 'text', content, createdAt: Date.now(),
+    })
     return true
   },
   sendClipboard(to: string, content: string): boolean {
     return relayActions.sendText(to, content)
   },
   broadcastText(content: string): boolean {
+    // 消息由 core 回显（chat_broadcast, peer_id='me'）统一入列，避免重复
     invoke('broadcast_text', { text: content })
-    mutations.addMessage({
-      id: uuid(), from: 'me', fromName: store.meName, to: 'broadcast',
-      kind: 'text', content, createdAt: Date.now(),
-    })
     return true
   },
-  /** 文件/文件夹发送：paths 由 Tauri 对话框/拖拽给出 */
+  /** 文件/文件夹发送：paths 由 Tauri 对话框/拖拽/粘贴落盘给出 */
   sendPaths(kind: 'phone' | 'pc', peerId: string | null, paths: string[]): boolean {
     if (kind === 'phone' && !store.phoneConnected) {
       toast.error('手机未配对，请先扫码')
@@ -233,21 +253,28 @@ let started = false
 export async function startRelay() {
   if (started) return
   started = true
+  const isTauri = '__TAURI_INTERNALS__' in window
+
   const settings = await invoke<any>('get_settings').catch(() => ({}))
   if (settings.device_name) store.meName = settings.device_name
 
-  const snap = await invoke<any>('get_state')
-  mutations.setServerAddr(snap.addr)
-  mutations.setServerError(snap.error)
-  mutations.setQrUrl(snap.qr_url)
-  if (snap.fingerprints) store.fingerprints = snap.fingerprints
-  mutations.setPairPending(snap.pending)
-  if (snap.connected) mutations.setPhoneConnected(snap.connected)
-  if (snap.peers) {
-    mutations.setDevices(snap.peers.map((p: any) => ({ id: p.id, name: p.name, ip: p.ip, online: p.connected })))
+  const snap = await invoke<any>('get_state').catch(() => null)
+  if (snap) {
+    mutations.setServerAddr(snap.addr || '')
+    mutations.setServerError(snap.error)
+    mutations.setQrUrl(snap.qr_url)
+    if (snap.fingerprints) store.fingerprints = snap.fingerprints
+    mutations.setPairPending(snap.pending)
+    if (snap.connected) mutations.setPhoneConnected(snap.connected)
+    if (snap.peers) applyPeers(snap.peers)
+    for (const t of snap.transfers || []) upsertFromInfo(t)
   }
-  for (const t of snap.transfers || []) upsertFromInfo(t)
+  if (!snap) {
+    // 非 Tauri 环境（纯浏览器预览）：假装已连接，便于查看界面
+    mutations.setConnection('connected')
+  }
 
+  if (!isTauri) return
   await listen('core-event', (e: any) => { void apply(e.payload) })
   await listen('tauri://drag-drop', (e: any) => {
     const p = e.payload || {}
@@ -260,9 +287,4 @@ export async function startRelay() {
       window.dispatchEvent(new CustomEvent('yunshu-drop', { detail: p.paths as string[] }))
     }
   })
-}
-
-/* ---------- 旧导出兼容（下载地址在桌面端为本地路径，不再需要） ---------- */
-export function markTransferDownloadedLocal(id: string) {
-  mutations.markTransferDownloaded(id)
 }

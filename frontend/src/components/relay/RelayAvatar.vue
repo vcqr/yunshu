@@ -12,7 +12,7 @@ const props = withDefaults(
 )
 
 const sizeCls =
-  props.size === 'sm' ? 'size-8 text-xs' : props.size === 'lg' ? 'size-12 text-base' : 'size-10 text-sm'
+  props.size === 'sm' ? 'size-7 text-[10px]' : props.size === 'lg' ? 'size-12 text-base' : 'size-10 text-sm'
 </script>
 
 <template>

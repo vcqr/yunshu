@@ -1,56 +1,127 @@
 @import "tailwindcss";
 
-/* 云书主题（移植自参考实现的 emerald 配色，浅色） */
+@custom-variant dark (&:is(.dark *));
+
+/* 云书主题变量（移植自 demo/ui globals.css，emerald 主色，浅/深双主题） */
 @theme {
-  --color-background: #ffffff;
-  --color-foreground: #232d3c;
-  --color-card: #ffffff;
-  --color-card-foreground: #232d3c;
-  --color-popover: #ffffff;
-  --color-popover-foreground: #232d3c;
-  --color-primary: #10b981;
-  --color-primary-foreground: #f0fdf9;
-  --color-secondary: #f1f5f9;
-  --color-secondary-foreground: #232d3c;
-  --color-muted: #f1f5f9;
-  --color-muted-foreground: #64748b;
-  --color-accent: #f1f5f9;
-  --color-accent-foreground: #232d3c;
-  --color-destructive: #ef4444;
-  --color-border: #e2e8f0;
-  --color-input: #e2e8f0;
-  --color-ring: #34d399;
-  --color-sidebar: #f8fafc;
-  --color-air-bg: #f4f7f6;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
 }
 
-html, body, #app { height: 100%; }
-body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
-
-.custom-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
-.custom-scroll::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
-.custom-scroll::-webkit-scrollbar-track { background: transparent; }
-
-.transfer-stripes {
-  background-image: linear-gradient(
-    45deg,
-    rgba(255, 255, 255, 0.25) 25%,
-    transparent 25%,
-    transparent 50%,
-    rgba(255, 255, 255, 0.25) 50%,
-    rgba(255, 255, 255, 0.25) 75%,
-    transparent 75%,
-    transparent
-  );
-  background-size: 18px 18px;
-  animation: stripes-move 1s linear infinite;
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.596 0.145 163.225);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.696 0.14 163.225);
 }
-@keyframes stripes-move {
-  from { background-position: 0 0; }
-  to { background-position: 18px 0; }
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.696 0.14 163.225);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.596 0.145 163.225);
 }
 
 @layer base {
-  * { border-color: var(--color-border); }
-  body { background: var(--color-background); color: var(--color-foreground); }
+  * { border-color: var(--color-border); outline-color: color-mix(in oklab, var(--color-ring) 50%, transparent); }
+  html, body, #app { height: 100%; }
+  body {
+    background: var(--color-background);
+    color: var(--color-foreground);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  button, a, [role="button"] { -webkit-tap-highlight-color: transparent; }
 }
+
+/* 页面背景：极淡 emerald 渐变 */
+html:not(.dark) .airpigeon-bg {
+  background-color: oklch(0.985 0.004 160);
+  background-image:
+    radial-gradient(ellipse 70% 50% at 15% -10%, oklch(0.878 0.096 168 / 0.22), transparent),
+    radial-gradient(ellipse 55% 45% at 95% 0%, oklch(0.9 0.06 165 / 0.16), transparent),
+    linear-gradient(to bottom, transparent 60%, oklch(0.975 0.01 160 / 0.6));
+}
+.dark .airpigeon-bg {
+  background-color: oklch(0.16 0.012 165);
+  background-image:
+    radial-gradient(ellipse 70% 50% at 15% -10%, oklch(0.3 0.04 165 / 0.5), transparent),
+    radial-gradient(ellipse 55% 45% at 95% 0%, oklch(0.26 0.035 160 / 0.4), transparent);
+}
+
+/* 细窄圆角滚动条 */
+.custom-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+.custom-scroll::-webkit-scrollbar-track { background: transparent; }
+.custom-scroll::-webkit-scrollbar-thumb { background: oklch(0.556 0 0 / 0.28); border-radius: 9999px; }
+.custom-scroll::-webkit-scrollbar-thumb:hover { background: oklch(0.556 0 0 / 0.45); }
+.dark .custom-scroll::-webkit-scrollbar-thumb { background: oklch(0.985 0 0 / 0.18); }
+.dark .custom-scroll::-webkit-scrollbar-thumb:hover { background: oklch(0.985 0 0 / 0.32); }
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: oklch(0.556 0 0 / 0.3) transparent;
+}
+
+/* 传输进度条纹动画 */
+.transfer-stripes {
+  background-color: oklch(0.596 0.145 163.225);
+  background-image: linear-gradient(
+    45deg,
+    rgba(255, 255, 255, 0.28) 25%,
+    transparent 25%,
+    transparent 50%,
+    rgba(255, 255, 255, 0.28) 50%,
+    rgba(255, 255, 255, 0.28) 75%,
+    transparent 75%,
+    transparent
+  );
+  background-size: 1rem 1rem;
+  animation: transfer-stripes-move 0.75s linear infinite;
+}
+@keyframes transfer-stripes-move {
+  to { background-position: 1rem 0; }
+}
+.dark .transfer-stripes { background-color: oklch(0.696 0.14 163.225); }

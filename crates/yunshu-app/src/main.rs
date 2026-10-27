@@ -150,6 +150,26 @@ fn open_folder(path: String) {
     let _ = std::process::Command::new("explorer").arg(format!("/select,{path}")).spawn();
 }
 
+/// 粘贴的文件在浏览器侧拿不到路径：把 blob 落到临时目录，返回路径供 send_paths 使用
+#[tauri::command]
+fn stage_blob(name: String, bytes: Vec<u8>) -> Result<String, String> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join("yunshu_paste");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_ascii_control() || c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|' { '_' } else { c })
+        .collect();
+    let path = dir.join(format!("{stamp}-{seq}-{safe}"));
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn get_settings() -> serde_json::Value {
     serde_json::to_value(yunshu_core::settings::Settings::load_or_default()).unwrap_or_default()
@@ -260,6 +280,7 @@ fn main() {
             pigeon_disconnect,
             set_save_dir,
             open_folder,
+            stage_blob,
             get_settings,
             save_settings
         ])

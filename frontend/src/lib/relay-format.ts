@@ -2,7 +2,7 @@
  * 云书 — 格式化与展示工具（移植自 demo relay-format，图标用 @lucide/vue）
  */
 import {
-  File, FileText, FileImage, FileVideo, FileAudio, FileArchive, FileType, FileCode2, Folder,
+  File, FileText, FileImage, FileVideoCamera, FileMusic, FileArchive, FileType, FileCode, Folder,
 } from '@lucide/vue'
 import type { Component } from 'vue'
 import type { FileCategory } from './relay-types'
@@ -33,11 +33,11 @@ function pad2(n: number): string {
   return n.toString().padStart(2, '0')
 }
 
-/** HH:mm；昨天显示「昨天 HH:mm」；更早显示「M月D日 HH:mm」 */
+/** HH:mm:ss；昨天显示「昨天 HH:mm:ss」；更早显示「M月D日 HH:mm:ss」（跨年带年份） */
 export function formatTime(timestamp: number): string {
   const date = new Date(timestamp)
   const now = new Date()
-  const timePart = `${pad2(date.getHours())}:${pad2(date.getMinutes())}`
+  const timePart = `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
   const sameDay =
     date.getFullYear() === now.getFullYear() &&
     date.getMonth() === now.getMonth() &&
@@ -81,12 +81,12 @@ interface IconStyle {
 
 const CATEGORY_STYLE: Record<FileCategory, IconStyle> = {
   image: { icon: FileImage, className: 'text-sky-500 bg-sky-500/10' },
-  video: { icon: FileVideo, className: 'text-rose-500 bg-rose-500/10' },
-  audio: { icon: FileAudio, className: 'text-violet-500 bg-violet-500/10' },
+  video: { icon: FileVideoCamera, className: 'text-rose-500 bg-rose-500/10' },
+  audio: { icon: FileMusic, className: 'text-violet-500 bg-violet-500/10' },
   archive: { icon: FileArchive, className: 'text-amber-500 bg-amber-500/10' },
   pdf: { icon: FileType, className: 'text-red-500 bg-red-500/10' },
   doc: { icon: FileText, className: 'text-emerald-600 bg-emerald-500/10' },
-  code: { icon: FileCode2, className: 'text-teal-500 bg-teal-500/10' },
+  code: { icon: FileCode, className: 'text-teal-500 bg-teal-500/10' },
   other: { icon: File, className: 'text-muted-foreground bg-muted' },
 }
 
@@ -130,4 +130,14 @@ let uuidCounter = 0
 export function uuid(): string {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID()
   return `id-${Date.now().toString(36)}-${(uuidCounter++).toString(36)}`
+}
+
+/** 传输标题：单文件显示名字，多文件显示「N 个文件」 */
+export function transferTitle(kind: 'files' | 'folder', files: { name: string }[]): string {
+  if (kind === 'folder') {
+    const first = files[0]?.name?.split(/[\\/]/)[0] ?? ''
+    return first ? `${first}/（${files.length} 个文件）` : '文件夹'
+  }
+  if (files.length === 1) return files[0].name
+  return `${files.length} 个文件`
 }

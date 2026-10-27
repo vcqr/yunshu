@@ -1,14 +1,16 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+/**
+ * OfferDialog：接收方确认传输请求（队列逐个弹出）
+ * Esc / 点击遮罩视为拒绝；防止同一请求重复应答
+ */
+import { computed, ref } from 'vue'
 import { Check, FileText, Folder, X } from '@lucide/vue'
 import { fileIconStyle, folderIconStyle, formatBytes } from '../../lib/relay-format'
 import { store } from '../../stores/relay-store'
 import { relayActions } from '../../hooks/use-relay'
+import { toast } from '../../hooks/use-toast'
 import { cn } from '../../lib/utils'
 
-const emit = defineEmits<{ (e: 'handled'): void }>()
-
-const currentOfferId = computed(() => store.currentOfferId)
 const transfer = computed(() =>
   store.currentOfferId ? store.transfers[store.currentOfferId] : undefined
 )
@@ -18,25 +20,28 @@ const files = computed(() => transfer.value?.files ?? [])
 const previewFiles = computed(() => files.value.slice(0, 5))
 const moreCount = computed(() => files.value.length - previewFiles.value.length)
 
+/** 防止 Action 自动关闭触发 onOpenChange 重复应答 */
+const handledRef = ref<string | null>(null)
+
 function iconFor(name: string) {
   return transfer.value?.kind === 'folder' ? folderIconStyle() : fileIconStyle(name)
 }
 
 function handleRespond(accepted: boolean) {
-  if (!transfer.value) return
-  relayActions.respondTransfer(transfer.value.id, accepted)
-  emit('handled')
+  const t = transfer.value
+  if (!t) return
+  if (handledRef.value === t.id) return
+  handledRef.value = t.id
+  relayActions.respondTransfer(t.id, accepted)
   store.dequeueOffer()
-  if (accepted) toastOk()
-  else toastInfo()
+  if (accepted) toast.success('已接受，等待对方发送…')
+  else toast.info('已拒绝该传输')
 }
-function toastOk() { /* toast 在 use-relay 内已处理 */ }
-function toastInfo() { /* 同上 */ }
 </script>
 
 <template>
   <div v-if="open" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45" @click.self="handleRespond(false)">
-    <div class="w-full max-w-md rounded-2xl border bg-card p-5 shadow-xl">
+    <div class="bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
       <div class="mb-1 flex items-center gap-2.5">
         <span
           :class="cn(
@@ -49,14 +54,14 @@ function toastInfo() { /* 同上 */ }
             class="size-4.5"
           />
         </span>
-        <span class="font-semibold">「{{ transfer?.fromName ?? '对方' }}」想给你发送{{ transfer?.kind === 'folder' ? '文件夹' : '文件' }}</span>
+        <span class="min-w-0 font-semibold">「{{ transfer?.fromName ?? '对方' }}」想给你发送{{ transfer?.kind === 'folder' ? '文件夹' : '文件' }}</span>
       </div>
       <p class="mb-3 text-sm text-muted-foreground">
         来自 {{ transfer?.fromName }} · 共 {{ files.length }} 项 · {{ formatBytes(transfer?.totalSize ?? 0) }}
       </p>
 
-      <div class="custom-scroll max-h-56 overflow-y-auto rounded-xl border bg-muted/30 p-2">
-        <div v-for="f in previewFiles" :key="f.id" class="flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm">
+      <div class="custom-scroll max-h-56 overflow-y-auto rounded-xl border bg-muted/30 p-2" role="list" aria-label="文件列表预览">
+        <div v-for="f in previewFiles" :key="f.id" class="flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm" role="listitem">
           <span :class="cn('flex size-6 shrink-0 items-center justify-center rounded-md', iconFor(f.name).className)">
             <component :is="iconFor(f.name).icon" class="size-3.5" />
           </span>

@@ -11,10 +11,10 @@
       {
         "label": "main",
         "title": "云书 · 局域网传书",
-        "width": 1000,
-        "height": 680,
-        "minWidth": 860,
-        "minHeight": 560
+        "width": 1180,
+        "height": 760,
+        "minWidth": 960,
+        "minHeight": 600
       }
     ],
     "security": {

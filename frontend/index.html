@@ -4,38 +4,6 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>云书 · 局域网传书</title>
-  <script>
-    // 黑匣子：捕获 JS 错误 → 页面红条显示
-    window.__errors = [];
-    window.addEventListener('error', function (e) {
-      var msg = e && e.message ? 'error: ' + e.message + ' @ ' + (e.filename || '?') + ':' + (e.lineno || 0)
-                               : 'resource-error: ' + ((e.target && (e.target.src || e.target.href)) || 'unknown');
-      window.__errors.push(msg);
-      try { window.__showBanner(msg); } catch (_) {}
-    }, true);
-    window.addEventListener('unhandledrejection', function (e) {
-      window.__errors.push('rejection: ' + String(e.reason));
-      try { window.__showBanner('rejection: ' + String(e.reason)); } catch (_) {}
-    });
-    window.__mark = function (t) {
-      window.__errors.push(t);
-    };
-    window.__showBanner = function (msg) {
-      var b = document.getElementById('__errbanner');
-      if (!b) {
-        b = document.createElement('div');
-        b.id = '__errbanner';
-        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#7f1d1d;color:#fff;padding:6px 10px;font:12px/1.5 monospace;white-space:pre-wrap;max-height:50vh;overflow:auto';
-        (document.body || document.documentElement).appendChild(b);
-      }
-      b.textContent += msg + '\n';
-    };
-    window.__mark('head-ran');
-    document.addEventListener('DOMContentLoaded', function () {
-      var a = document.getElementById('app');
-      window.__mark('dom-loaded: app=' + !!a + ' children=' + (a ? a.childElementCount : -1));
-    });
-  </script>
 </head>
 <body>
   <div id="app"></div>
