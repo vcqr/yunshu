@@ -108,7 +108,7 @@ function systemMessage(content: string) {
 }
 
 function applyPeers(peers: any[]) {
-  const devices = (peers || []).map((p: any) => ({ id: p.id, name: p.name, ip: p.ip, online: p.connected }))
+  const devices = (peers || []).map((p: any) => ({ id: p.id, name: p.name, ip: p.ip, online: p.connected, machineId: p.machine_id || '' }))
   if (peersInitialized) {
     for (const d of devices) {
       if (!store.devices.some((x) => x.id === d.id)) systemMessage(`${d.name} 上线了`)
@@ -231,6 +231,41 @@ async function apply(ev: any) {
       toast.info(`「${ev.peer_name}」想发送「${ev.name}」`)
       break
     }
+    /* ---- 远程控制 ---- */
+    case 'remote_temp_password':
+      mutations.setRemoteTempPassword(ev.password)
+      break
+    case 'remote_connecting':
+      toast.info(`正在连接「${ev.name}」的远程控制…`)
+      break
+    case 'remote_view_ready':
+      // 观看窗口由 Rust 侧自动打开；这里只提示
+      toast.success(`已连上「${ev.name}」的远程控制`)
+      mutations.closeControlDialog()
+      break
+    case 'remote_connect_failed':
+      toast.error(`远程控制连接失败：${ev.reason || '未知原因'}`)
+      break
+    case 'remote_session_started':
+      if (ev.side === 'controlled') {
+        mutations.setRemoteControlled({ peer_id: ev.peer_id, name: ev.name })
+        toast.warning(`${ev.name} 正在远程控制本机`)
+        flashTaskbar()
+      }
+      break
+    case 'remote_session_ended':
+      if (ev.side === 'controlled') {
+        mutations.setRemoteControlled(null)
+        toast.info(`远程控制会话已结束（${ev.reason || '对端断开'}）`)
+      } else if (ev.side === 'controller') {
+        toast.info(`与「${ev.name}」的远程观看已结束`)
+      }
+      break
+    case 'remote_assist_request':
+      mutations.enqueueAssist({ peer_id: ev.peer_id, name: ev.name })
+      toast.info(`${ev.name} 请求远程协助控制本机`)
+      flashTaskbar()
+      break
   }
 }
 
@@ -323,6 +358,36 @@ export const relayActions = {
   disconnectPeer(peerId: string) {
     invoke('pigeon_disconnect', { peerId })
   },
+  /* ---- 远程控制 ---- */
+  /** 发起远程控制（打开密码弹窗） */
+  openControlDialog(machineId: string, name: string) {
+    if (!machineId) {
+      toast.error('对方云书版本较旧，不支持远程控制')
+      return
+    }
+    mutations.openControlDialog(machineId, name)
+  },
+  remoteConnect(machineId: string, password: string): boolean {
+    if (!password.trim()) {
+      toast.error('请输入对方机器的密码')
+      return false
+    }
+    invoke('remote_connect', { machineId, password })
+    return true
+  },
+  /** 断开当前远程控制会话（观看或被控） */
+  remoteDisconnect() {
+    invoke('remote_disconnect').catch((e) => toast.error(`断开失败：${String(e)}`))
+  },
+  /** 请求对方协助（对方同意后自动建连） */
+  assistRequest(peerId: string) {
+    invoke('remote_assist_request', { peerId })
+  },
+  /** 答复对方的协助请求 */
+  assistRespond(peerId: string, accepted: boolean) {
+    invoke('remote_assist_respond', { peerId, accepted })
+    mutations.dequeueAssist(peerId)
+  },
 }
 
 /* ---------- 生命周期：挂在应用根部 ---------- */
@@ -348,6 +413,8 @@ export async function startRelay() {
     if (snap.connected) mutations.setPhoneConnected(snap.connected)
     if (snap.peers) applyPeers(snap.peers)
     for (const t of snap.transfers || []) upsertFromInfo(t)
+    if (snap.remote_temp_password) mutations.setRemoteTempPassword(snap.remote_temp_password)
+    if (snap.remote_controlled) mutations.setRemoteControlled(snap.remote_controlled)
   }
   if (!snap) {
     // 非 Tauri 环境（纯浏览器预览）：假装已连接，便于查看界面

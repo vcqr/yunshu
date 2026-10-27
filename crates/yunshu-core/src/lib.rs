@@ -4,6 +4,7 @@ pub mod clipboard;
 pub mod pairing;
 pub mod pigeon;
 pub mod protocol;
+pub mod remote;
 pub mod server;
 pub mod settings;
 
@@ -64,12 +65,21 @@ pub struct TransferInfo {
 }
 
 impl TransferInfo {
-    pub fn file(id: String, direction: Direction, name: String, size: u64, peer: Option<String>) -> Self {
+    pub fn file(
+        id: String,
+        direction: Direction,
+        name: String,
+        size: u64,
+        peer: Option<String>,
+    ) -> Self {
         TransferInfo {
             id,
             direction,
             kind: TransferKind::File,
-            files: vec![FileEntry { name: name.clone(), size }],
+            files: vec![FileEntry {
+                name: name.clone(),
+                size,
+            }],
             name,
             size,
             transferred: 0,
@@ -80,18 +90,39 @@ impl TransferInfo {
     }
 
     /// 批次传输（多文件/文件夹）
-    pub fn batch(id: String, direction: Direction, name: String, size: u64, files: Vec<FileEntry>, peer: Option<String>) -> Self {
+    pub fn batch(
+        id: String,
+        direction: Direction,
+        name: String,
+        size: u64,
+        files: Vec<FileEntry>,
+        peer: Option<String>,
+    ) -> Self {
         TransferInfo {
-            id, direction, kind: TransferKind::File, name, size,
-            transferred: 0, status: TransferStatus::Waiting, path: None, peer,
+            id,
+            direction,
+            kind: TransferKind::File,
+            name,
+            size,
+            transferred: 0,
+            status: TransferStatus::Waiting,
+            path: None,
+            peer,
             files,
         }
     }
 
     pub fn text(id: String, direction: Direction, chars: usize, peer: Option<String>) -> Self {
         TransferInfo {
-            id, direction, kind: TransferKind::Text, name: format!("文本（{chars} 字）"), size: chars as u64,
-            transferred: chars as u64, status: TransferStatus::Done, path: None, peer,
+            id,
+            direction,
+            kind: TransferKind::Text,
+            name: format!("文本（{chars} 字）"),
+            size: chars as u64,
+            transferred: chars as u64,
+            status: TransferStatus::Done,
+            path: None,
+            peer,
             files: Vec::new(),
         }
     }
@@ -105,33 +136,69 @@ pub struct PigeonPeerInfo {
     pub ip: String,
     pub tcp_port: u16,
     pub connected: bool,
+    /// 公开机器 ID（静态密钥指纹前 8 位 hex；远程控制以此定位设备）
+    pub machine_id: String,
 }
 
 /// 核心线程 → UI 的事件
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CoreEvent {
-    ServerStarted { addr: String },
-    ServerError { reason: String },
+    ServerStarted {
+        addr: String,
+    },
+    ServerError {
+        reason: String,
+    },
     /// 新的二维码地址（每 60 秒轮换 token）
     QrUrl(String),
-    PairPending { code: String, device: String },
-    PairOk { device: String },
-    PairFailed { reason: String },
+    PairPending {
+        code: String,
+        device: String,
+    },
+    PairOk {
+        device: String,
+    },
+    PairFailed {
+        reason: String,
+    },
     PeerDisconnected,
-    TextFromPhone { text: String },
-    Toast { text: String },
-    TransferUpdate { #[serde(flatten)] t: Box<TransferInfo> },
+    TextFromPhone {
+        text: String,
+    },
+    Toast {
+        text: String,
+    },
+    TransferUpdate {
+        #[serde(flatten)]
+        t: Box<TransferInfo>,
+    },
     /// 手机开始上传，请用户选择保存目录
-    AskSaveDir { batch: String },
+    AskSaveDir {
+        batch: String,
+    },
     /// 飞鸽：电脑用户列表有变化（全量推送）
-    PigeonPeers { peers: Vec<PigeonPeerInfo> },
+    PigeonPeers {
+        peers: Vec<PigeonPeerInfo>,
+    },
     /// 飞鸽：收到另一台电脑的聊天消息
-    ChatFromPc { peer_id: String, peer_name: String, text: String },
+    ChatFromPc {
+        peer_id: String,
+        peer_name: String,
+        text: String,
+    },
     /// 飞鸽：收到广播消息（所有人会话）
-    ChatBroadcast { peer_id: String, peer_name: String, text: String },
+    ChatBroadcast {
+        peer_id: String,
+        peer_name: String,
+        text: String,
+    },
     /// 飞鸽：新设备首次连入，等待用户确认指纹
-    PigeonTrustRequest { peer_id: String, name: String, fingerprint: String },
+    PigeonTrustRequest {
+        peer_id: String,
+        name: String,
+        fingerprint: String,
+    },
     /// 飞鸽：对方发来文件，等待用户确认（批量：多文件/文件夹一次确认）
     PigeonOfferIncoming {
         peer_id: String,
@@ -142,7 +209,51 @@ pub enum CoreEvent {
         files: Vec<FileEntry>,
     },
     /// 飞鸽：新设备静态密钥已固定（TOFU 首次配对）
-    PigeonFingerprint { peer_id: String, fingerprint: String },
+    PigeonFingerprint {
+        peer_id: String,
+        fingerprint: String,
+    },
+    /// 远程控制：本机临时密码（每次启动重新生成，设置里展示）
+    RemoteTempPassword {
+        password: String,
+    },
+    /// 远程控制：正在连接对方
+    RemoteConnecting {
+        peer_id: String,
+        name: String,
+    },
+    /// 远程控制：连接成功，可打开观看窗口（token 为本地观看桥接入凭证）
+    RemoteViewReady {
+        peer_id: String,
+        name: String,
+        token: String,
+        port: u16,
+        width: u32,
+        height: u32,
+    },
+    /// 远程控制：连接失败
+    RemoteConnectFailed {
+        peer_id: String,
+        reason: String,
+    },
+    /// 远程控制：会话开始。side: "controller"（本机在看对方）| "controlled"（本机被控）
+    RemoteSessionStarted {
+        peer_id: String,
+        name: String,
+        side: String,
+    },
+    /// 远程控制：会话结束
+    RemoteSessionEnded {
+        peer_id: String,
+        name: String,
+        side: String,
+        reason: Option<String>,
+    },
+    /// 远程控制：对方请求协助控制本机（反向协助）
+    RemoteAssistRequest {
+        peer_id: String,
+        name: String,
+    },
 }
 
 /// UI → 核心线程的请求
@@ -150,28 +261,80 @@ pub enum CoreEvent {
 pub enum UiRequest {
     SendFiles(Vec<PathBuf>),
     SendText(String),
-    SetSaveDir { batch: String, dir: Option<PathBuf> },
+    SetSaveDir {
+        batch: String,
+        dir: Option<PathBuf>,
+    },
     DisconnectDevice,
     /// 后台线程直接在 UI 上弹一条提示
     Toast(String),
-    PigeonSendText { peer_id: String, text: String },
+    PigeonSendText {
+        peer_id: String,
+        text: String,
+    },
     BroadcastText(String),
-    PigeonTrust { peer_id: String, fingerprint: String },
-    PigeonRejectTrust { peer_id: String },
-    PigeonSendFiles { peer_id: String, paths: Vec<PathBuf> },
-    PigeonDisconnect { peer_id: String },
+    PigeonTrust {
+        peer_id: String,
+        fingerprint: String,
+    },
+    PigeonRejectTrust {
+        peer_id: String,
+    },
+    PigeonSendFiles {
+        peer_id: String,
+        paths: Vec<PathBuf>,
+    },
+    PigeonDisconnect {
+        peer_id: String,
+    },
     /// 用户同意接收：去对方拉取文件
-    PigeonAcceptFile { peer_id: String, offer_id: String },
+    PigeonAcceptFile {
+        peer_id: String,
+        offer_id: String,
+    },
     /// 用户拒绝接收
-    PigeonRejectFile { peer_id: String, offer_id: String },
+    PigeonRejectFile {
+        peer_id: String,
+        offer_id: String,
+    },
     /// 用户取消一次飞鸽传输（等待中或推送中，双向皆可发起）
-    PigeonCancelFile { peer_id: String, offer_id: String },
+    PigeonCancelFile {
+        peer_id: String,
+        offer_id: String,
+    },
     /// 用户暂停/恢复一次飞鸽推送（仅 PC↔PC）
-    PigeonPauseFile { peer_id: String, offer_id: String, paused: bool },
+    PigeonPauseFile {
+        peer_id: String,
+        offer_id: String,
+        paused: bool,
+    },
     /// 忘记一条传输记录（仅 UI 列表，不影响磁盘文件）
-    ForgetTransfer { id: String },
+    ForgetTransfer {
+        id: String,
+    },
     /// 切换防打扰模式（仅已信任设备可连接、广播静音）
     SetDnd(bool),
+    // ---- 远程控制 ----
+    /// 发起远程控制：machine_id 从发现表定位设备，password 为对方临时/固定/一次性密码
+    RemoteConnect {
+        machine_id: String,
+        password: String,
+    },
+    /// 断开当前远程控制会话（观看或被控，任一方）
+    RemoteDisconnect,
+    /// 通过飞鸽链路请求对方协助（对方同意后回一次性密码）
+    RemoteAssistRequest {
+        peer_id: String,
+    },
+    /// 答复对方的协助请求
+    RemoteAssistRespond {
+        peer_id: String,
+        accepted: bool,
+    },
+    /// 设置/清除远程控制固定密码（None/空 = 清除）
+    SetRemoteFixedPassword {
+        password: Option<String>,
+    },
 }
 
 /// 核心配置
@@ -186,13 +349,19 @@ pub struct CoreConfig {
 }
 
 /// 在后台线程启动 tokio runtime 与 axum 服务
-pub fn run(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver<UiRequest>) -> std::thread::JoinHandle<()> {
+pub fn run(
+    cfg: CoreConfig,
+    event_tx: Sender<CoreEvent>,
+    ui_rx: Receiver<UiRequest>,
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("yunshu-core".into())
         .spawn(move || {
             let _ = tracing_subscriber::fmt()
-                .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
                 .try_init();
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -219,18 +388,30 @@ pub mod util {
         let out = out_dir.join(format!("{name}-{stamp}.zip"));
         let file = std::fs::File::create(&out).map_err(|e| e.to_string())?;
         let mut w = zip::ZipWriter::new(file);
-        let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        w.add_directory(format!("{name}/"), opts).map_err(|e| e.to_string())?;
-        fn walk(w: &mut zip::ZipWriter<std::fs::File>, dir: &std::path::Path, rel: &str, opts: zip::write::SimpleFileOptions) -> Result<(), String> {
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        w.add_directory(format!("{name}/"), opts)
+            .map_err(|e| e.to_string())?;
+        fn walk(
+            w: &mut zip::ZipWriter<std::fs::File>,
+            dir: &std::path::Path,
+            rel: &str,
+            opts: zip::write::SimpleFileOptions,
+        ) -> Result<(), String> {
             for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
                 let path = entry.map_err(|e| e.to_string())?.path();
-                let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let fname = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
                 let child_rel = format!("{rel}/{fname}");
                 if path.is_dir() {
-                    w.add_directory(child_rel.clone(), opts).map_err(|e| e.to_string())?;
+                    w.add_directory(child_rel.clone(), opts)
+                        .map_err(|e| e.to_string())?;
                     walk(w, &path, &child_rel, opts)?;
                 } else {
-                    w.start_file(child_rel.clone(), opts).map_err(|e| e.to_string())?;
+                    w.start_file(child_rel.clone(), opts)
+                        .map_err(|e| e.to_string())?;
                     let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
                     std::io::copy(&mut f, w).map_err(|e| e.to_string())?;
                 }

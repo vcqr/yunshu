@@ -13,13 +13,23 @@ pub struct Settings {
     pub autostart: bool,
     /// 防打扰：仅已固定指纹（信任过）的设备可连接，广播消息静音
     pub dnd_mode: bool,
+    /// 远程控制固定密码（pbkdf2-sha256 加盐哈希，格式 pbkdf2-sha256$rounds$salt$hash）
+    pub remote_fixed_password_hash: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         let device_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "我的电脑".into());
         let save_dir = default_save_dir().to_string_lossy().to_string();
-        Settings { device_name, port: 34256, https_port: 34257, save_dir, autostart: false, dnd_mode: false }
+        Settings {
+            device_name,
+            port: 34256,
+            https_port: 34257,
+            save_dir,
+            autostart: false,
+            dnd_mode: false,
+            remote_fixed_password_hash: None,
+        }
     }
 }
 
@@ -35,7 +45,9 @@ impl Settings {
     }
 
     pub fn load_or_default() -> Self {
-        let Some(path) = Self::config_path() else { return Self::default() };
+        let Some(path) = Self::config_path() else {
+            return Self::default();
+        };
         match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text).unwrap_or_default(),
             Err(_) => Self::default(),
@@ -43,7 +55,9 @@ impl Settings {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let Some(path) = Self::config_path() else { return Err("无法定位配置目录".into()) };
+        let Some(path) = Self::config_path() else {
+            return Err("无法定位配置目录".into());
+        };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
@@ -76,7 +90,10 @@ impl Settings {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let hkcu = winreg::RegKey::predef(HKEY_CURRENT_USER);
         let run = hkcu
-            .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_SET_VALUE | KEY_QUERY_VALUE)
+            .open_subkey_with_flags(
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                KEY_SET_VALUE | KEY_QUERY_VALUE,
+            )
             .map_err(|e| e.to_string())?;
         if enable {
             run.set_value("yunshu", &exe.to_string_lossy().to_string())

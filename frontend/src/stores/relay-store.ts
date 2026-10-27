@@ -35,6 +35,16 @@ export interface RelayState {
   dnd: boolean
   /** 未读消息数：key 为 peer id（'broadcast' | 'phone' | 设备 id），切入会话即清零 */
   unread: Record<string, number>
+  /** 远程控制：本机临时密码（每次启动重新生成） */
+  remoteTempPassword: string | null
+  /** 远程控制：本机公开机器 ID */
+  remoteMachineId: string | null
+  /** 远程控制：本机正在被控（受控端醒目横幅） */
+  remoteControlled: { peer_id: string; name: string } | null
+  /** 远程控制：发起连接的密码输入弹窗 */
+  controlDialog: { machine_id: string; name: string } | null
+  /** 远程控制：待处理的反向协助请求队列 */
+  assistRequests: Array<{ peer_id: string; name: string }>
 }
 
 export const store = reactive<RelayState>({
@@ -59,6 +69,11 @@ export const store = reactive<RelayState>({
   chatStyle: 'bubble',
   dnd: false,
   unread: {},
+  remoteTempPassword: null,
+  remoteMachineId: null,
+  remoteControlled: null,
+  controlDialog: null,
+  assistRequests: [],
 })
 
 export const mutations = {
@@ -129,6 +144,19 @@ export const mutations = {
   },
   clearUnread(peer: string) {
     delete store.unread[peer]
+  },
+  /* ---- 远程控制 ---- */
+  setRemoteTempPassword(pw: string | null) { store.remoteTempPassword = pw },
+  setRemoteMachineId(id: string | null) { store.remoteMachineId = id },
+  setRemoteControlled(c: { peer_id: string; name: string } | null) { store.remoteControlled = c },
+  openControlDialog(machineId: string, name: string) { store.controlDialog = { machine_id: machineId, name } },
+  closeControlDialog() { store.controlDialog = null },
+  enqueueAssist(req: { peer_id: string; name: string }) {
+    if (store.assistRequests.some((r) => r.peer_id === req.peer_id)) return
+    store.assistRequests.push(req)
+  },
+  dequeueAssist(peerId: string) {
+    store.assistRequests = store.assistRequests.filter((r) => r.peer_id !== peerId)
   },
 }
 

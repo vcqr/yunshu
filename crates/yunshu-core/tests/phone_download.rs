@@ -16,8 +16,11 @@ const HTTPS_PORT: u16 = 38181;
 /// 返回 (状态码, 响应头原文, body)。
 async fn fetch(path: &str, port: u16, extra: &str) -> std::io::Result<(u16, String, Vec<u8>)> {
     let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
-    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra}Connection: close\r\n\r\n").as_bytes())
-        .await?;
+    s.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra}Connection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await?;
     let mut buf = Vec::new();
     s.read_to_end(&mut buf).await?;
     let idx = buf
@@ -36,7 +39,10 @@ async fn fetch(path: &str, port: u16, extra: &str) -> std::io::Result<(u16, Stri
 /// 等 HTTP 端口就绪（QrUrl 事件早于 axum bind 发出）
 async fn wait_port(port: u16) {
     for _ in 0..50 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -72,11 +78,7 @@ async fn phone_file_download_stream_completes() {
             .unwrap()
             .unwrap();
         if let CoreEvent::QrUrl(url) = ev {
-            break url
-                .split("?t=")
-                .nth(1)
-                .expect("QrUrl 应含 ?t=")
-                .to_string();
+            break url.split("?t=").nth(1).expect("QrUrl 应含 ?t=").to_string();
         }
     };
 
@@ -139,50 +141,81 @@ async fn phone_file_download_stream_completes() {
     assert_eq!(size, data.len() as u64);
 
     // 下载（带 session）——超时即「一直下载中」回归
-    let (status, _, body) = timeout(Duration::from_secs(15), fetch(&format!("/file/{id}?s={session}"), PORT, ""))
-        .await
-        .expect("下载超时（15 秒无完成）——复现「一直下载中」")
-        .unwrap();
+    let (status, _, body) = timeout(
+        Duration::from_secs(15),
+        fetch(&format!("/file/{id}?s={session}"), PORT, ""),
+    )
+    .await
+    .expect("下载超时（15 秒无完成）——复现「一直下载中」")
+    .unwrap();
     assert_eq!(status, 200);
     assert_eq!(body.len() as u64, size, "HTTP 下载字节数不符");
     assert_eq!(body, data, "HTTP 下载内容不符");
 
     // 下载（不带 session）——修复后文件 id 本身即凭证
-    let (status, _, body) = timeout(Duration::from_secs(15), fetch(&format!("/file/{id}"), PORT, ""))
-        .await
-        .expect("无 session 下载超时")
-        .unwrap();
+    let (status, _, body) = timeout(
+        Duration::from_secs(15),
+        fetch(&format!("/file/{id}"), PORT, ""),
+    )
+    .await
+    .expect("无 session 下载超时")
+    .unwrap();
     assert_eq!(status, 200);
     assert_eq!(body, data, "无 session 下载内容不符");
 
     // Range 探测（iOS Safari 下载器的行为）：bytes=0- 应答 206 + 正确 Content-Range
-    let (status, head, body) = timeout(Duration::from_secs(15), fetch(&format!("/file/{id}"), PORT, "Range: bytes=0-\r\n"))
-        .await
-        .expect("Range 探测超时")
-        .unwrap();
+    let (status, head, body) = timeout(
+        Duration::from_secs(15),
+        fetch(&format!("/file/{id}"), PORT, "Range: bytes=0-\r\n"),
+    )
+    .await
+    .expect("Range 探测超时")
+    .unwrap();
     assert_eq!(status, 206, "Range 请求应答 206: {head}");
-    assert!(head.contains("content-range: bytes 0-"), "Content-Range 不符: {head}");
+    assert!(
+        head.contains("content-range: bytes 0-"),
+        "Content-Range 不符: {head}"
+    );
     assert_eq!(body, data, "Range 全量段内容不符");
 
     // Range 中段：bytes=1000-1999 应答对应片段
-    let (status, head, body) = timeout(Duration::from_secs(15), fetch(&format!("/file/{id}"), PORT, "Range: bytes=1000-1999\r\n"))
-        .await
-        .expect("Range 中段超时")
-        .unwrap();
+    let (status, head, body) = timeout(
+        Duration::from_secs(15),
+        fetch(&format!("/file/{id}"), PORT, "Range: bytes=1000-1999\r\n"),
+    )
+    .await
+    .expect("Range 中段超时")
+    .unwrap();
     assert_eq!(status, 206);
-    assert!(head.contains("content-range: bytes 1000-1999/3000000"), "Content-Range 不符: {head}");
+    assert!(
+        head.contains("content-range: bytes 1000-1999/3000000"),
+        "Content-Range 不符: {head}"
+    );
     assert_eq!(body, &data[1000..2000], "Range 中段内容不符");
 
     // Accept-Ranges 声明存在
     let (_, head, _) = fetch(&format!("/file/{id}"), PORT, "").await.unwrap();
-    assert!(head.to_lowercase().contains("accept-ranges: bytes"), "缺 Accept-Ranges: {head}");
+    assert!(
+        head.to_lowercase().contains("accept-ranges: bytes"),
+        "缺 Accept-Ranges: {head}"
+    );
 
     // HTTPS（手机实际走 34257 的通道）——用系统 curl 忽略自签证书，硬断言
     let out = std::process::Command::new("curl")
-        .args(["-k", "-sS", "--max-time", "15", &format!("https://127.0.0.1:{HTTPS_PORT}/file/{id}")])
+        .args([
+            "-k",
+            "-sS",
+            "--max-time",
+            "15",
+            &format!("https://127.0.0.1:{HTTPS_PORT}/file/{id}"),
+        ])
         .output()
         .expect("curl 不可用");
-    assert!(out.status.success(), "HTTPS 下载失败: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "HTTPS 下载失败: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(out.stdout.len() as u64, size, "HTTPS 下载字节数不符");
     assert_eq!(out.stdout, data, "HTTPS 下载内容不符");
 

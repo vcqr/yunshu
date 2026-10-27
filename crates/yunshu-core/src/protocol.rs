@@ -35,9 +35,20 @@ pub enum WsOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         http_port: Option<u16>,
     },
-    PcText { text: String },
-    PcFile { id: String, name: String, size: u64 },
-    Progress { id: String, transferred: u64, size: u64, done: bool },
+    PcText {
+        text: String,
+    },
+    PcFile {
+        id: String,
+        name: String,
+        size: u64,
+    },
+    Progress {
+        id: String,
+        transferred: u64,
+        size: u64,
+        done: bool,
+    },
 }
 
 /// 飞鸽（PC↔PC）线上消息，两端共用一套。
@@ -45,7 +56,11 @@ pub enum WsOut {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PigeonWire {
-    PigeonHello { id: String, name: String, port: u16 },
+    PigeonHello {
+        id: String,
+        name: String,
+        port: u16,
+    },
     PigeonWelcome {
         ok: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,9 +68,13 @@ pub enum PigeonWire {
         #[serde(skip_serializing_if = "Option::is_none")]
         pc_name: Option<String>,
     },
-    PcText { text: String },
+    PcText {
+        text: String,
+    },
     /// 广播消息：发给所有在线电脑（各端在"所有人"会话中展示）
-    BroadcastText { text: String },
+    BroadcastText {
+        text: String,
+    },
     /// 批量文件邀请（单文件/多文件/文件夹统一为一个批次，一次确认）
     PcFileOffer {
         id: String,
@@ -64,20 +83,53 @@ pub enum PigeonWire {
         files: Vec<OfferFile>,
     },
     /// 接收方对 PcFileOffer 的答复：accepted=false 时发送方的该批次标记为已拒绝
-    FileDecision { id: String, accepted: bool },
+    FileDecision {
+        id: String,
+        accepted: bool,
+    },
     /// 批次数据推送开始（接收方据此建半成品目录并应答续传偏移）
-    FileStart { id: String },
+    FileStart {
+        id: String,
+    },
     /// 接收方对 FileStart 的应答：告知本地已续传字节偏移（0 = 全新传输）
-    FileResume { id: String, have: u64 },
+    FileResume {
+        id: String,
+        have: u64,
+    },
     /// 单个文件推送完成，携带整文件 SHA-256 供接收方校验
-    FileHash { id: String, index: u32, sha: String },
+    FileHash {
+        id: String,
+        index: u32,
+        sha: String,
+    },
     /// 任一方取消传输：接收方删除半成品，发送方停止推送
-    FileCancel { id: String },
+    FileCancel {
+        id: String,
+    },
     /// 任一方暂停/恢复传输（发送方据此控制推送节奏，接收方同步行状态）
-    FilePause { id: String, paused: bool },
+    FilePause {
+        id: String,
+        paused: bool,
+    },
     /// 批次推送结束
-    FileEnd { id: String, ok: bool },
-    Progress { id: String, transferred: u64, size: u64, done: bool },
+    FileEnd {
+        id: String,
+        ok: bool,
+    },
+    Progress {
+        id: String,
+        transferred: u64,
+        size: u64,
+        done: bool,
+    },
+    /// 远程控制反向协助：请求对方允许本机控制（走飞鸽链路，密码经此回传）
+    RemoteAssistRequest {},
+    /// 对协助请求的答复：accepted 时携带现场生成的一次性密码（受控端随即进入待连状态）
+    RemoteAssistResponse {
+        accepted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
+    },
 }
 
 /// 批次清单条目：相对路径（'/' 分隔，文件夹传输含目录前缀）

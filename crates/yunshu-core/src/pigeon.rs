@@ -11,7 +11,9 @@
 
 use crate::protocol::PigeonWire;
 use crate::server::AppState;
-use crate::{CoreEvent, Direction, FileEntry, PigeonPeerInfo, TransferInfo, TransferKind, TransferStatus};
+use crate::{
+    CoreEvent, Direction, FileEntry, PigeonPeerInfo, TransferInfo, TransferKind, TransferStatus,
+};
 use futures_util::{SinkExt, StreamExt};
 use sha2::Digest;
 use snow::TransportState;
@@ -35,19 +37,29 @@ pub struct PeerRecord {
     pub name: String,
     pub ip: IpAddr,
     pub tcp_port: u16,
+    /// 公开机器 ID（静态密钥指纹前 8 位 hex，跨重启稳定；远程控制以此定位设备）
+    pub machine_id: String,
     pub last_seen: Instant,
 }
 
 /// 出站明文消息（pump 统一加密后发送）
 pub enum PigeonOut {
     Control(PigeonWire),
-    Chunk { offer_id: [u8; 16], offset: u64, data: Vec<u8> },
+    Chunk {
+        offer_id: [u8; 16],
+        offset: u64,
+        data: Vec<u8>,
+    },
 }
 
 /// 解密后的入站消息
 pub enum PigeonIn {
     Control(PigeonWire),
-    Chunk { offer_id: [u8; 16], offset: u64, data: Vec<u8> },
+    Chunk {
+        offer_id: [u8; 16],
+        offset: u64,
+        data: Vec<u8>,
+    },
 }
 
 /// 一条已建立的加密链路（无论本端是握手发起方还是响应方）
@@ -105,7 +117,10 @@ fn save_pinned(map: &HashMap<String, String>) {
 pub fn fingerprint(remote_static: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let h = Sha256::digest(remote_static);
-    h.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+    h.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// 稳定批次 id：sha256(数量 | 每项(名称|大小|mtime毫秒)) 前 32 位 hex。
@@ -165,10 +180,19 @@ pub fn sha_hex(d: &[u8]) -> String {
 /// 从批次清单推导显示名（FileStart 只带 id，名字由清单重建）
 fn name_display(files: &[crate::server::BatchFileState]) -> String {
     if files.len() == 1 {
-        files[0].name.rsplit('/').next().unwrap_or(&files[0].name).to_string()
+        files[0]
+            .name
+            .rsplit('/')
+            .next()
+            .unwrap_or(&files[0].name)
+            .to_string()
     } else {
         let first_root = files[0].name.split('/').next().unwrap_or_default();
-        if !first_root.is_empty() && files.iter().all(|f| f.name.split('/').next() == Some(first_root)) {
+        if !first_root.is_empty()
+            && files
+                .iter()
+                .all(|f| f.name.split('/').next() == Some(first_root))
+        {
             format!("{first_root}/")
         } else {
             format!("{} 项", files.len())
@@ -180,10 +204,19 @@ fn name_display(files: &[crate::server::BatchFileState]) -> String {
 #[cfg(windows)]
 pub fn free_space(path: &std::path::Path) -> Option<u64> {
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-    let wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut free: u64 = 0;
     let ok = unsafe {
-        GetDiskFreeSpaceExW(wide.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), &mut free)
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut free,
+        )
     };
     (ok != 0).then_some(free)
 }
@@ -194,7 +227,7 @@ pub fn free_space(_path: &std::path::Path) -> Option<u64> {
 }
 
 /// 密钥指纹是否已被用户确认固定。
-/// 按指纹键控（而非 peer_id）：peer_id 每次进程重启都重新生成，密钥指纹才是稳定的设备身份；
+/// 按指纹键控（而非 peer_id）：peer_id 是发现层会话标识，密钥指纹才是稳定的设备身份；
 /// 同机多实例共享机器密钥时，一次信任对所有实例生效。
 pub fn is_pinned(remote_static: &[u8]) -> bool {
     let map = load_pinned();
@@ -231,7 +264,11 @@ pub fn seal_msg(noise: &Mutex<TransportState>, msg: &PigeonOut) -> Result<Vec<u8
             plain.push(b'C');
             serde_json::to_writer(&mut plain, w).map_err(|e| e.to_string())?;
         }
-        PigeonOut::Chunk { offer_id, offset, data } => {
+        PigeonOut::Chunk {
+            offer_id,
+            offset,
+            data,
+        } => {
             plain.push(b'F');
             plain.extend_from_slice(offer_id);
             plain.extend_from_slice(&offset.to_le_bytes());
@@ -239,21 +276,35 @@ pub fn seal_msg(noise: &Mutex<TransportState>, msg: &PigeonOut) -> Result<Vec<u8
         }
     }
     let mut buf = vec![0u8; plain.len() + 64];
-    let n = noise.lock().unwrap().write_message(&plain, &mut buf).map_err(|e| e.to_string())?;
+    let n = noise
+        .lock()
+        .unwrap()
+        .write_message(&plain, &mut buf)
+        .map_err(|e| e.to_string())?;
     buf.truncate(n);
     Ok(buf)
 }
 
 pub fn open_msg(noise: &Mutex<TransportState>, cipher: &[u8]) -> Result<PigeonIn, String> {
     let mut buf = vec![0u8; cipher.len()];
-    let n = noise.lock().unwrap().read_message(cipher, &mut buf).map_err(|e| e.to_string())?;
+    let n = noise
+        .lock()
+        .unwrap()
+        .read_message(cipher, &mut buf)
+        .map_err(|e| e.to_string())?;
     match buf.first() {
-        Some(b'C') => Ok(PigeonIn::Control(serde_json::from_slice(&buf[1..n]).map_err(|e| e.to_string())?)),
+        Some(b'C') => Ok(PigeonIn::Control(
+            serde_json::from_slice(&buf[1..n]).map_err(|e| e.to_string())?,
+        )),
         Some(b'F') if n >= 25 => {
             let mut id = [0u8; 16];
             id.copy_from_slice(&buf[1..17]);
             let offset = u64::from_le_bytes(buf[17..25].try_into().unwrap());
-            Ok(PigeonIn::Chunk { offer_id: id, offset, data: buf[25..n].to_vec() })
+            Ok(PigeonIn::Chunk {
+                offer_id: id,
+                offset,
+                data: buf[25..n].to_vec(),
+            })
         }
         _ => Err("未知消息前缀".into()),
     }
@@ -282,7 +333,9 @@ pub fn make_udp_socket() -> Option<StdUdpSocket> {
 
 /// 同步上下文非阻塞投递控制消息（UI 线程用；队列满或断开则丢弃并返回 false）
 pub fn try_push(st: &AppState, peer_id: &str, wire: PigeonWire) -> bool {
-    let Ok(conns) = st.pigeon_conns.lock() else { return false };
+    let Ok(conns) = st.pigeon_conns.lock() else {
+        return false;
+    };
     match conns.get(peer_id) {
         Some(link) => link.out.try_send(PigeonOut::Control(wire)).is_ok(),
         None => false,
@@ -291,7 +344,12 @@ pub fn try_push(st: &AppState, peer_id: &str, wire: PigeonWire) -> bool {
 
 /// 异步上下文投递控制消息
 pub async fn push_control(st: &AppState, peer_id: &str, wire: PigeonWire) -> bool {
-    let link = st.pigeon_conns.lock().unwrap().get(peer_id).map(|l| l.out.clone());
+    let link = st
+        .pigeon_conns
+        .lock()
+        .unwrap()
+        .get(peer_id)
+        .map(|l| l.out.clone());
     match link {
         Some(out) => out.send(PigeonOut::Control(wire)).await.is_ok(),
         None => false,
@@ -310,6 +368,7 @@ pub fn peers_event(st: &AppState) -> CoreEvent {
                 ip: p.ip.to_string(),
                 tcp_port: p.tcp_port,
                 connected: conns.contains_key(id),
+                machine_id: p.machine_id.clone(),
             })
             .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
@@ -325,8 +384,13 @@ pub fn emit_peers(st: &AppState) {
 /// 发现主循环：广播 + 收包 + 过期清扫
 pub async fn run_discovery(st: Arc<AppState>) {
     let Some(std_sock) = make_udp_socket() else {
-        tracing::warn!("UDP {} 绑定失败，本实例禁用飞鸽发现（PC↔PC），手机传输不受影响", PIGEON_UDP_PORT);
-        st.emit(CoreEvent::Toast { text: format!("UDP {PIGEON_UDP_PORT} 被占用，飞鸽发现已禁用（可能已有云书实例在运行）") });
+        tracing::warn!(
+            "UDP {} 绑定失败，本实例禁用飞鸽发现（PC↔PC），手机传输不受影响",
+            PIGEON_UDP_PORT
+        );
+        st.emit(CoreEvent::Toast {
+            text: format!("UDP {PIGEON_UDP_PORT} 被占用，飞鸽发现已禁用（可能已有云书实例在运行）"),
+        });
         return;
     };
     let sock = Arc::new(tokio::net::UdpSocket::from_std(std_sock).expect("UDP socket 转换失败"));
@@ -338,6 +402,7 @@ pub async fn run_discovery(st: Arc<AppState>) {
         id: st.self_id.clone(),
         name: st.cfg.pc_name.clone(),
         port: st.cfg.port,
+        mid: crate::remote::machine_id(),
     })
     .unwrap_or_default();
 
@@ -353,7 +418,10 @@ pub async fn run_discovery(st: Arc<AppState>) {
                         let ip = u32::from_be_bytes(v4.ip.octets());
                         std::net::Ipv4Addr::from(ip | !mask)
                     });
-                    v.push(SocketAddr::from((std::net::Ipv4Addr::from(u32::from(bc)), PIGEON_UDP_PORT)));
+                    v.push(SocketAddr::from((
+                        std::net::Ipv4Addr::from(u32::from(bc)),
+                        PIGEON_UDP_PORT,
+                    )));
                 }
             }
         }
@@ -366,7 +434,11 @@ pub async fn run_discovery(st: Arc<AppState>) {
         let _ = sock.send_to(&announce, bc).await;
     }
 
-    tracing::info!("飞鸽发现已启动（UDP {}，本机 id {}）", PIGEON_UDP_PORT, &st.self_id[..8]);
+    tracing::info!(
+        "飞鸽发现已启动（UDP {}，本机 id {}）",
+        PIGEON_UDP_PORT,
+        &st.self_id[..8]
+    );
     let mut tick = tokio::time::interval(Duration::from_secs(10));
     let mut n = 0u32;
     let mut buf = [0u8; 2048];
@@ -400,17 +472,28 @@ struct Announce {
     id: String,
     name: String,
     port: u16,
+    /// 公开机器 ID（静态密钥指纹前 8 位 hex；旧版本无此字段，远程控制对旧版不可用）
+    #[serde(default)]
+    mid: String,
 }
 
 async fn handle_packet(st: &Arc<AppState>, data: &[u8], from: SocketAddr) {
-    let Ok(p) = serde_json::from_slice::<Announce>(data) else { return };
+    let Ok(p) = serde_json::from_slice::<Announce>(data) else {
+        return;
+    };
     if p.id != st.self_id && !p.id.is_empty() && p.kind == "entry" {
         let is_new = {
             let mut known = st.pigeon_peers.lock().unwrap();
             let is_new = !known.contains_key(&p.id);
             known.insert(
                 p.id.clone(),
-                PeerRecord { name: p.name.clone(), ip: from.ip(), tcp_port: p.port, last_seen: Instant::now() },
+                PeerRecord {
+                    name: p.name.clone(),
+                    ip: from.ip(),
+                    tcp_port: p.port,
+                    machine_id: p.mid,
+                    last_seen: Instant::now(),
+                },
             );
             is_new
         };
@@ -420,11 +503,10 @@ async fn handle_packet(st: &Arc<AppState>, data: &[u8], from: SocketAddr) {
         }
         // 只要没有链路就尝试连接（覆盖：首次发现 / 链路断开后重连）。
         // 双方同时外连会互相拆链路：约定只有 id 更大的一方主动发起，另一侧等待连入。
-        let should_connect = p.id > st.self_id
-            && {
-                let mut connecting = st.pigeon_connecting.lock().unwrap();
-                !st.pigeon_conns.lock().unwrap().contains_key(&p.id) && connecting.insert(p.id.clone())
-            };
+        let should_connect = p.id > st.self_id && {
+            let mut connecting = st.pigeon_connecting.lock().unwrap();
+            !st.pigeon_conns.lock().unwrap().contains_key(&p.id) && connecting.insert(p.id.clone())
+        };
         if should_connect {
             let st2 = st.clone();
             let id = p.id.clone();
@@ -459,14 +541,24 @@ pub async fn pigeon_connect(st: Arc<AppState>, peer_id: String, ip: IpAddr, port
     }
 }
 
-async fn pigeon_connect_inner(st: &Arc<AppState>, peer_id: &str, ip: IpAddr, port: u16) -> Result<(), String> {
+async fn pigeon_connect_inner(
+    st: &Arc<AppState>,
+    peer_id: &str,
+    ip: IpAddr,
+    port: u16,
+) -> Result<(), String> {
     if st.pigeon_conns.lock().unwrap().contains_key(peer_id) {
         return Ok(());
     }
     let addr_key = format!("{ip}:{port}");
     // 防打扰：近期握手后判为未信任的地址，10 分钟内不再反复握手
     if st.dnd.load(Ordering::Relaxed)
-        && st.dnd_skipped.lock().unwrap().get(&addr_key).is_some_and(|t| t.elapsed() < Duration::from_secs(600))
+        && st
+            .dnd_skipped
+            .lock()
+            .unwrap()
+            .get(&addr_key)
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(600))
     {
         return Err("防打扰：跳过未信任设备".into());
     }
@@ -491,9 +583,11 @@ async fn pigeon_connect_inner(st: &Arc<AppState>, peer_id: &str, ip: IpAddr, por
     let mut hs = new_handshake(true)?;
     let mut buf = vec![0u8; 65535];
     let n = hs.write_message(&[], &mut buf).map_err(|e| e.to_string())?;
-    sink.send(tokio_tungstenite::tungstenite::Message::binary(buf[..n].to_vec()))
-        .await
-        .map_err(|e| e.to_string())?;
+    sink.send(tokio_tungstenite::tungstenite::Message::binary(
+        buf[..n].to_vec(),
+    ))
+    .await
+    .map_err(|e| e.to_string())?;
     let m2 = tokio::time::timeout(Duration::from_secs(10), stream.next())
         .await
         .map_err(|_| "握手超时".to_string())?
@@ -505,12 +599,19 @@ async fn pigeon_connect_inner(st: &Arc<AppState>, peer_id: &str, ip: IpAddr, por
     };
     hs.read_message(&m2, &mut buf).map_err(|e| e.to_string())?;
     let n = hs.write_message(&[], &mut buf).map_err(|e| e.to_string())?;
-    sink.send(tokio_tungstenite::tungstenite::Message::binary(buf[..n].to_vec()))
-        .await
-        .map_err(|e| e.to_string())?;
+    sink.send(tokio_tungstenite::tungstenite::Message::binary(
+        buf[..n].to_vec(),
+    ))
+    .await
+    .map_err(|e| e.to_string())?;
     let noise = hs.into_transport_mode().map_err(|e| e.to_string())?;
     let noise = Arc::new(Mutex::new(noise));
-    let remote_static = noise.lock().unwrap().get_remote_static().map(|s| s.to_vec()).unwrap_or_default();
+    let remote_static = noise
+        .lock()
+        .unwrap()
+        .get_remote_static()
+        .map(|s| s.to_vec())
+        .unwrap_or_default();
 
     // 防打扰：未信任设备在 hello 前静默断开（对方不会收到连接确认，也不弹任何窗）
     if st.dnd.load(Ordering::Relaxed) && !is_pinned(&remote_static) {
@@ -543,23 +644,24 @@ async fn pigeon_connect_inner(st: &Arc<AppState>, peer_id: &str, ip: IpAddr, por
         _ => return Err("welcome 格式错误".into()),
     };
     if let PigeonIn::Control(PigeonWire::PigeonWelcome { ok, reason, .. }) = unwrapped
-        && !ok {
-            let r = reason.unwrap_or_else(|| "对方拒绝连接".into());
-            // 对方在等待其用户确认本机：本地同步弹确认（指纹来自本次握手）
-            if r.contains("待确认") {
-                let fp = fingerprint(&remote_static);
-                st.emit(crate::CoreEvent::PigeonTrustRequest {
-                    peer_id: peer_id.to_string(),
-                    name: name.clone(),
-                    fingerprint: fp.clone(),
-                });
-                st.pending_trusts
-                    .lock()
-                    .unwrap()
-                    .insert(peer_id.to_string(), (name, fp));
-            }
-            return Err(r);
+        && !ok
+    {
+        let r = reason.unwrap_or_else(|| "对方拒绝连接".into());
+        // 对方在等待其用户确认本机：本地同步弹确认（指纹来自本次握手）
+        if r.contains("待确认") {
+            let fp = fingerprint(&remote_static);
+            st.emit(crate::CoreEvent::PigeonTrustRequest {
+                peer_id: peer_id.to_string(),
+                name: name.clone(),
+                fingerprint: fp.clone(),
+            });
+            st.pending_trusts
+                .lock()
+                .unwrap()
+                .insert(peer_id.to_string(), (name, fp));
         }
+        return Err(r);
+    }
     // 身份即密钥：指纹已固定 = 密钥与首次信任时完全一致（SHA-256 派生），无需再比对
     if st.pigeon_conns.lock().unwrap().contains_key(peer_id) {
         return Ok(()); // 对方已抢先建立，放弃本连接
@@ -569,7 +671,11 @@ async fn pigeon_connect_inner(st: &Arc<AppState>, peer_id: &str, ip: IpAddr, por
     let (plain_out_tx, plain_out_rx) = tokio::sync::mpsc::channel::<PigeonOut>(64);
     st.pigeon_conns.lock().unwrap().insert(
         peer_id.to_string(),
-        PigeonLink { name: name.clone(), out: plain_out_tx.clone(), closed: Arc::new(AtomicBool::new(false)) },
+        PigeonLink {
+            name: name.clone(),
+            out: plain_out_tx.clone(),
+            closed: Arc::new(AtomicBool::new(false)),
+        },
     );
     tracing::info!("已与「{name}」建立加密飞鸽链路（Noise XX）");
     emit_peers(st);
@@ -587,7 +693,11 @@ async fn pigeon_connect_inner(st: &Arc<AppState>, peer_id: &str, ip: IpAddr, por
     ));
     let writer = tokio::spawn(async move {
         while let Some(frame) = cipher_rx.recv().await {
-            if sink.send(tokio_tungstenite::tungstenite::Message::binary(frame)).await.is_err() {
+            if sink
+                .send(tokio_tungstenite::tungstenite::Message::binary(frame))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -690,7 +800,11 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
         PigeonIn::Control(PigeonWire::PcText { text }) => {
             let peer_name = link_name(st, peer_id);
             tracing::info!("收到「{peer_name}」的聊天消息：{text}");
-            st.emit(CoreEvent::ChatFromPc { peer_id: peer_id.to_string(), peer_name, text });
+            st.emit(CoreEvent::ChatFromPc {
+                peer_id: peer_id.to_string(),
+                peer_name,
+                text,
+            });
         }
         PigeonIn::Control(PigeonWire::BroadcastText { text }) => {
             // 防打扰：广播消息整体静音（能连上的都是已信任设备，按用户要求一并静音）
@@ -700,31 +814,68 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
             }
             let peer_name = link_name(st, peer_id);
             tracing::info!("收到「{peer_name}」的广播消息：{text}");
-            st.emit(CoreEvent::ChatBroadcast { peer_id: peer_id.to_string(), peer_name, text });
+            st.emit(CoreEvent::ChatBroadcast {
+                peer_id: peer_id.to_string(),
+                peer_name,
+                text,
+            });
         }
-        PigeonIn::Control(PigeonWire::PcFileOffer { id, name, total_size, files }) => {
+        PigeonIn::Control(PigeonWire::PcFileOffer {
+            id,
+            name,
+            total_size,
+            files,
+        }) => {
             let peer_name = link_name(st, peer_id);
-            tracing::info!("「{peer_name}」请求发送「{name}」（{} 项，{total_size} 字节）", files.len());
+            tracing::info!(
+                "「{peer_name}」请求发送「{name}」（{} 项，{total_size} 字节）",
+                files.len()
+            );
             let states: Vec<crate::server::BatchFileState> = files
                 .iter()
-                .map(|f| crate::server::BatchFileState { name: f.name.clone(), size: f.size, written: 0, sha: None })
+                .map(|f| crate::server::BatchFileState {
+                    name: f.name.clone(),
+                    size: f.size,
+                    written: 0,
+                    sha: None,
+                })
                 .collect();
-            st.pigeon_incoming.lock().unwrap().insert(id.clone(), (peer_id.to_string(), states));
+            st.pigeon_incoming
+                .lock()
+                .unwrap()
+                .insert(id.clone(), (peer_id.to_string(), states));
             if std::env::var("YUNSHU_AUTO_ACCEPT").is_ok() {
                 // 自动接受：磁盘空间不足时直接拒绝
                 if let Some(free) = free_space(&st.cfg.save_dir)
                     && free < total_size
                 {
-                    tracing::warn!("磁盘空间不足（需 {total_size}，剩 {free}），自动拒绝「{name}」");
-                    st.emit(CoreEvent::Toast { text: format!("磁盘空间不足，已拒绝「{name}」") });
-                    push_control(st, peer_id, PigeonWire::FileDecision { id, accepted: false }).await;
+                    tracing::warn!(
+                        "磁盘空间不足（需 {total_size}，剩 {free}），自动拒绝「{name}」"
+                    );
+                    st.emit(CoreEvent::Toast {
+                        text: format!("磁盘空间不足，已拒绝「{name}」"),
+                    });
+                    push_control(
+                        st,
+                        peer_id,
+                        PigeonWire::FileDecision {
+                            id,
+                            accepted: false,
+                        },
+                    )
+                    .await;
                     return;
                 }
                 tracing::info!("AUTO_ACCEPT：自动接受「{name}」");
                 push_control(st, peer_id, PigeonWire::FileDecision { id, accepted: true }).await;
             } else {
-                let entries: Vec<FileEntry> =
-                    files.iter().map(|f| FileEntry { name: f.name.clone(), size: f.size }).collect();
+                let entries: Vec<FileEntry> = files
+                    .iter()
+                    .map(|f| FileEntry {
+                        name: f.name.clone(),
+                        size: f.size,
+                    })
+                    .collect();
                 st.emit(CoreEvent::PigeonOfferIncoming {
                     peer_id: peer_id.to_string(),
                     peer_name,
@@ -750,7 +901,9 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
                 }
             } else {
                 st.update_transfer(&id, 0, None, TransferStatus::Refused, None);
-                st.emit(CoreEvent::Toast { text: "对方拒绝了文件接收".into() });
+                st.emit(CoreEvent::Toast {
+                    text: "对方拒绝了文件接收".into(),
+                });
             }
         }
         PigeonIn::Control(PigeonWire::FileStart { id }) => {
@@ -770,7 +923,10 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
             if let Ok(txt) = tokio::fs::read_to_string(dir.join("manifest.json")).await
                 && let Ok(saved) = serde_json::from_str::<Vec<crate::server::BatchFileState>>(&txt)
                 && saved.len() == files.len()
-                && saved.iter().zip(files.iter()).all(|(s, f)| s.name == f.name && s.size == f.size)
+                && saved
+                    .iter()
+                    .zip(files.iter())
+                    .all(|(s, f)| s.name == f.name && s.size == f.size)
             {
                 files = saved;
             }
@@ -795,8 +951,13 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
             {
                 tracing::warn!("磁盘空间不足（尚需 {}，仅剩 {free}）", total - have);
                 let row_id = uuid::Uuid::new_v4().simple().to_string();
-                let entries: Vec<FileEntry> =
-                    files.iter().map(|f| FileEntry { name: f.name.clone(), size: f.size }).collect();
+                let entries: Vec<FileEntry> = files
+                    .iter()
+                    .map(|f| FileEntry {
+                        name: f.name.clone(),
+                        size: f.size,
+                    })
+                    .collect();
                 st.new_transfer(TransferInfo::batch(
                     row_id.clone(),
                     Direction::FromPhone,
@@ -813,7 +974,13 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
                 return;
             }
             let row_id = uuid::Uuid::new_v4().simple().to_string();
-            let entries: Vec<FileEntry> = files.iter().map(|f| FileEntry { name: f.name.clone(), size: f.size }).collect();
+            let entries: Vec<FileEntry> = files
+                .iter()
+                .map(|f| FileEntry {
+                    name: f.name.clone(),
+                    size: f.size,
+                })
+                .collect();
             st.new_transfer(TransferInfo::batch(
                 row_id.clone(),
                 Direction::FromPhone,
@@ -870,7 +1037,11 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
                     crate::server::save_manifest(&s.dir, &s.files);
                     None
                 } else {
-                    tracing::error!("「{}」第 {} 项哈希校验失败", s.files[s.index].name, s.index + 1);
+                    tracing::error!(
+                        "「{}」第 {} 项哈希校验失败",
+                        s.files[s.index].name,
+                        s.index + 1
+                    );
                     Some((s.row_id.clone(), s.peer_id.clone()))
                 }
             };
@@ -881,30 +1052,54 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
                     let _ = std::fs::remove_dir_all(&s.dir);
                 }
                 st.update_transfer(&row_id, 0, None, TransferStatus::Failed, None);
-                st.emit(CoreEvent::Toast { text: "文件校验失败，传输已中止（数据可能损坏）".into() });
+                st.emit(CoreEvent::Toast {
+                    text: "文件校验失败，传输已中止（数据可能损坏）".into(),
+                });
                 let _ = push_control(st, &peer, PigeonWire::FileCancel { id }).await;
             }
         }
         PigeonIn::Control(PigeonWire::FilePause { id, paused }) => {
-            let status = if paused { TransferStatus::Paused } else { TransferStatus::Active };
+            let status = if paused {
+                TransferStatus::Paused
+            } else {
+                TransferStatus::Active
+            };
             // 发送方收到：控制推送节奏
             if let Some(flag) = st.pigeon_push_paused.lock().unwrap().get(&id) {
                 flag.store(paused, Ordering::Relaxed);
-                let cur = st.transfers.lock().unwrap().iter().find(|t| t.id == id).map(|t| (t.transferred, t.size));
+                let cur = st
+                    .transfers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| (t.transferred, t.size));
                 if let Some((transferred, size)) = cur {
                     st.update_transfer(&id, transferred, Some(size), status, None);
                 }
-                tracing::info!("批次推送{}（应接收方请求）", if paused { "已暂停" } else { "已恢复" });
+                tracing::info!(
+                    "批次推送{}（应接收方请求）",
+                    if paused { "已暂停" } else { "已恢复" }
+                );
                 return;
             }
             // 接收方收到：同步行状态
             let info = {
                 let states = st.recv_files.lock().await;
-                states.get(&id).map(|s| (s.row_id.clone(), s.have, s.files.iter().map(|f| f.size).sum::<u64>()))
+                states.get(&id).map(|s| {
+                    (
+                        s.row_id.clone(),
+                        s.have,
+                        s.files.iter().map(|f| f.size).sum::<u64>(),
+                    )
+                })
             };
             if let Some((row_id, have, total)) = info {
                 st.update_transfer(&row_id, have, Some(total), status, None);
-                tracing::info!("批次接收{}（应发送方请求）", if paused { "已暂停" } else { "已恢复" });
+                tracing::info!(
+                    "批次接收{}（应发送方请求）",
+                    if paused { "已暂停" } else { "已恢复" }
+                );
             }
         }
         PigeonIn::Control(PigeonWire::FileCancel { id }) => {
@@ -921,10 +1116,22 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
                 s.file = None;
                 let _ = std::fs::remove_dir_all(&s.dir);
                 st.update_transfer(&s.row_id, s.have, None, TransferStatus::Cancelled, None);
-                st.emit(CoreEvent::Toast { text: format!("「{}」的传输已取消", s.name) });
-            } else if let Some(t) = st.transfers.lock().unwrap().iter().find(|t| t.id == id).map(|t| (t.transferred, t.size, t.status)) {
+                st.emit(CoreEvent::Toast {
+                    text: format!("「{}」的传输已取消", s.name),
+                });
+            } else if let Some(t) = st
+                .transfers
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| (t.transferred, t.size, t.status))
+            {
                 // 本端是发送方：批次被对方取消/撤回
-                if !matches!(t.2, TransferStatus::Done | TransferStatus::Cancelled | TransferStatus::Refused) {
+                if !matches!(
+                    t.2,
+                    TransferStatus::Done | TransferStatus::Cancelled | TransferStatus::Refused
+                ) {
                     st.update_transfer(&id, t.0, Some(t.1), TransferStatus::Cancelled, None);
                 }
                 tracing::info!("批次 {} 已被对方取消", &id[..8.min(id.len())]);
@@ -956,13 +1163,19 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
                 // 发送方异常中断：保留半成品与 manifest，对方重发同一批次时自动续传
                 crate::server::save_manifest(&s.dir, &s.files);
                 st.update_transfer(&s.row_id, s.have, None, TransferStatus::Failed, None);
-                tracing::info!("批次「{}」推送中断，已保留 {} 字节半成品待续传", s.name, s.have);
+                tracing::info!(
+                    "批次「{}」推送中断，已保留 {} 字节半成品待续传",
+                    s.name,
+                    s.have
+                );
                 return;
             }
             // 完整性：全部文件已写满且通过哈希校验
             if s.index != s.files.len()
                 || s.hash_pending
-                || s.files.iter().any(|f| f.sha.is_none() || f.written != f.size)
+                || s.files
+                    .iter()
+                    .any(|f| f.sha.is_none() || f.written != f.size)
             {
                 crate::server::save_manifest(&s.dir, &s.files);
                 st.update_transfer(&s.row_id, s.have, None, TransferStatus::Failed, None);
@@ -984,7 +1197,10 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
                 }
                 let final_path = crate::server::unique_path(
                     dest.parent().unwrap_or(&st.cfg.save_dir),
-                    &dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                    &dest
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
                 );
                 let part = part_path(&s.dir, i);
                 if !part.exists() {
@@ -1006,28 +1222,65 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
                 return;
             }
             let _ = tokio::fs::remove_dir_all(&s.dir).await;
-            tracing::info!("批次「{}」落盘完成（{} 项）→ 保存目录 {:?}", s.name, s.files.len(), st.cfg.save_dir);
+            tracing::info!(
+                "批次「{}」落盘完成（{} 项）→ 保存目录 {:?}",
+                s.name,
+                s.files.len(),
+                st.cfg.save_dir
+            );
             // 打开所在文件夹的定位：全部同根 → 根目录；否则保存目录
             let first_root = s.files[0].name.split('/').next().unwrap_or_default();
             let path = if !first_root.is_empty()
-                && s.files.iter().all(|f| f.name.split('/').next() == Some(first_root))
+                && s.files
+                    .iter()
+                    .all(|f| f.name.split('/').next() == Some(first_root))
             {
                 st.cfg.save_dir.join(first_root)
             } else {
                 st.cfg.save_dir.clone()
             };
-            st.update_transfer(&s.row_id, s.have, Some(s.have), TransferStatus::Done, Some(path));
-            st.emit(CoreEvent::Toast { text: format!("收到「{}」（{} 项）", s.name, s.files.len()) });
+            st.update_transfer(
+                &s.row_id,
+                s.have,
+                Some(s.have),
+                TransferStatus::Done,
+                Some(path),
+            );
+            st.emit(CoreEvent::Toast {
+                text: format!("收到「{}」（{} 项）", s.name, s.files.len()),
+            });
+        }
+        PigeonIn::Control(PigeonWire::RemoteAssistRequest {}) => {
+            let peer_name = link_name(st, peer_id);
+            tracing::info!("「{peer_name}」请求远程协助控制本机");
+            crate::remote::on_assist_request(st, peer_id, &peer_name);
+        }
+        PigeonIn::Control(PigeonWire::RemoteAssistResponse { accepted, password }) => {
+            tracing::info!(
+                "「{}」对协助请求的答复：{}",
+                link_name(st, peer_id),
+                if accepted { "同意" } else { "拒绝" }
+            );
+            crate::remote::on_assist_response(st, peer_id, accepted, password);
         }
         PigeonIn::Control(_) => {}
-        PigeonIn::Chunk { offer_id, offset, data } => {
+        PigeonIn::Chunk {
+            offer_id,
+            offset,
+            data,
+        } => {
             let key = uuid::Uuid::from_bytes(offer_id).simple().to_string();
             let failure: Option<(String, u64, String)> = 'blk: {
                 let mut states = st.recv_files.lock().await;
-                let Some(s) = states.get_mut(&key) else { break 'blk None };
+                let Some(s) = states.get_mut(&key) else {
+                    break 'blk None;
+                };
                 // 数据块自带流偏移，自校验：越位忽略，落后则整批回退重写
                 if offset > s.have {
-                    tracing::warn!("收到越位数据块（offset {offset} > 流偏移 {}），忽略", s.have);
+                    tracing::warn!(
+                        "收到越位数据块（offset {offset} > 流偏移 {}），忽略",
+                        s.have
+                    );
                     break 'blk None;
                 }
                 if offset < s.have {
@@ -1110,11 +1363,22 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
 }
 
 /// 发送方：对方接受后，把批次文件按清单顺序切块推送（虚拟字节流，支持断点续传/取消/逐文件校验）
-pub(crate) async fn push_batch(st: Arc<AppState>, peer_id: String, offer_id: String, src: crate::server::BatchSource) {
+pub(crate) async fn push_batch(
+    st: Arc<AppState>,
+    peer_id: String,
+    offer_id: String,
+    src: crate::server::BatchSource,
+) {
     let cancel = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
-    st.pigeon_push_cancel.lock().unwrap().insert(offer_id.clone(), cancel.clone());
-    st.pigeon_push_paused.lock().unwrap().insert(offer_id.clone(), paused.clone());
+    st.pigeon_push_cancel
+        .lock()
+        .unwrap()
+        .insert(offer_id.clone(), cancel.clone());
+    st.pigeon_push_paused
+        .lock()
+        .unwrap()
+        .insert(offer_id.clone(), paused.clone());
     push_batch_impl(&st, &peer_id, &offer_id, &src, &cancel, &paused).await;
     st.pigeon_push_cancel.lock().unwrap().remove(&offer_id);
     st.pigeon_push_paused.lock().unwrap().remove(&offer_id);
@@ -1129,19 +1393,33 @@ async fn push_batch_impl(
     cancel: &AtomicBool,
     paused: &AtomicBool,
 ) {
-    let out = st.pigeon_conns.lock().unwrap().get(peer_id).map(|l| l.out.clone());
+    let out = st
+        .pigeon_conns
+        .lock()
+        .unwrap()
+        .get(peer_id)
+        .map(|l| l.out.clone());
     let Some(out) = out else {
         st.update_transfer(offer_id, 0, None, TransferStatus::Failed, None);
         return;
     };
-    let Ok(uuid) = uuid::Uuid::parse_str(offer_id) else { return };
+    let Ok(uuid) = uuid::Uuid::parse_str(offer_id) else {
+        return;
+    };
     let id16 = *uuid.as_bytes();
     let sizes: Vec<u64> = src.files.iter().map(|f| f.2).collect();
 
     // FileStart → 等接收方应答流偏移（旧版本对端不回复，超时按 0 全量推）
-    let _ = out.send(PigeonOut::Control(PigeonWire::FileStart { id: offer_id.to_string() })).await;
+    let _ = out
+        .send(PigeonOut::Control(PigeonWire::FileStart {
+            id: offer_id.to_string(),
+        }))
+        .await;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    st.pigeon_push_resume.lock().unwrap().insert(offer_id.to_string(), tx);
+    st.pigeon_push_resume
+        .lock()
+        .unwrap()
+        .insert(offer_id.to_string(), tx);
     let mut sent = tokio::select! {
         r = tokio::time::timeout(Duration::from_secs(10), rx) => match r {
             Ok(Ok(have)) => have.min(src.total_size),
@@ -1158,12 +1436,24 @@ async fn push_batch_impl(
     if sent > 0 && sent < src.total_size {
         tracing::info!("批次「{}」从流偏移 {} 字节处续传", src.name, sent);
     }
-    st.update_transfer(offer_id, sent, Some(src.total_size), TransferStatus::Active, None);
+    st.update_transfer(
+        offer_id,
+        sent,
+        Some(src.total_size),
+        TransferStatus::Active,
+        None,
+    );
 
     for (file_idx, (path, _rel, _size)) in src.files.iter().enumerate().skip(start_idx) {
         let in_off = if file_idx == start_idx { start_off } else { 0 };
         let Ok(mut f) = tokio::fs::File::open(path).await else {
-            st.update_transfer(offer_id, sent, Some(src.total_size), TransferStatus::Failed, None);
+            st.update_transfer(
+                offer_id,
+                sent,
+                Some(src.total_size),
+                TransferStatus::Failed,
+                None,
+            );
             return;
         };
         let mut hasher = sha2::Sha256::new();
@@ -1179,7 +1469,13 @@ async fn push_batch_impl(
                         take -= n as u64;
                     }
                     _ => {
-                        st.update_transfer(offer_id, sent, Some(src.total_size), TransferStatus::Failed, None);
+                        st.update_transfer(
+                            offer_id,
+                            sent,
+                            Some(src.total_size),
+                            TransferStatus::Failed,
+                            None,
+                        );
                         return;
                     }
                 }
@@ -1188,8 +1484,18 @@ async fn push_batch_impl(
         let mut buf = vec![0u8; CHUNK_SIZE];
         loop {
             if cancel.load(Ordering::Relaxed) {
-                let _ = out.send(PigeonOut::Control(PigeonWire::FileCancel { id: offer_id.to_string() })).await;
-                st.update_transfer(offer_id, sent, Some(src.total_size), TransferStatus::Cancelled, None);
+                let _ = out
+                    .send(PigeonOut::Control(PigeonWire::FileCancel {
+                        id: offer_id.to_string(),
+                    }))
+                    .await;
+                st.update_transfer(
+                    offer_id,
+                    sent,
+                    Some(src.total_size),
+                    TransferStatus::Cancelled,
+                    None,
+                );
                 tracing::info!("批次「{}」的推送已被用户取消", src.name);
                 return;
             }
@@ -1207,8 +1513,22 @@ async fn push_batch_impl(
             match f.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    if out.send(PigeonOut::Chunk { offer_id: id16, offset: sent, data: buf[..n].to_vec() }).await.is_err() {
-                        st.update_transfer(offer_id, sent, Some(src.total_size), TransferStatus::Failed, None);
+                    if out
+                        .send(PigeonOut::Chunk {
+                            offer_id: id16,
+                            offset: sent,
+                            data: buf[..n].to_vec(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        st.update_transfer(
+                            offer_id,
+                            sent,
+                            Some(src.total_size),
+                            TransferStatus::Failed,
+                            None,
+                        );
                         return;
                     }
                     hasher.update(&buf[..n]);
@@ -1216,7 +1536,13 @@ async fn push_batch_impl(
                     st.progress_throttled(offer_id, sent, false);
                 }
                 Err(_) => {
-                    st.update_transfer(offer_id, sent, Some(src.total_size), TransferStatus::Failed, None);
+                    st.update_transfer(
+                        offer_id,
+                        sent,
+                        Some(src.total_size),
+                        TransferStatus::Failed,
+                        None,
+                    );
                     return;
                 }
             }
@@ -1224,23 +1550,49 @@ async fn push_batch_impl(
         // 单文件推送完：报哈希（接收方校验通过后继续下一文件）
         let sha = sha_hex(&hasher.finalize());
         if out
-            .send(PigeonOut::Control(PigeonWire::FileHash { id: offer_id.to_string(), index: file_idx as u32, sha }))
+            .send(PigeonOut::Control(PigeonWire::FileHash {
+                id: offer_id.to_string(),
+                index: file_idx as u32,
+                sha,
+            }))
             .await
             .is_err()
         {
-            st.update_transfer(offer_id, sent, Some(src.total_size), TransferStatus::Failed, None);
+            st.update_transfer(
+                offer_id,
+                sent,
+                Some(src.total_size),
+                TransferStatus::Failed,
+                None,
+            );
             return;
         }
     }
-    let _ = out.send(PigeonOut::Control(PigeonWire::FileEnd { id: offer_id.to_string(), ok: true })).await;
+    let _ = out
+        .send(PigeonOut::Control(PigeonWire::FileEnd {
+            id: offer_id.to_string(),
+            ok: true,
+        }))
+        .await;
     let path = src
         .files
         .first()
         .map(|f| f.0.parent().unwrap_or(std::path::Path::new(".")))
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
-    st.update_transfer(offer_id, sent, Some(src.total_size), TransferStatus::Done, Some(path));
-    tracing::info!("批次「{}」已加密推送完成（{} 项，{} 字节）", src.name, src.files.len(), sent);
+    st.update_transfer(
+        offer_id,
+        sent,
+        Some(src.total_size),
+        TransferStatus::Done,
+        Some(path),
+    );
+    tracing::info!(
+        "批次「{}」已加密推送完成（{} 项，{} 字节）",
+        src.name,
+        src.files.len(),
+        sent
+    );
 }
 
 /// 轮询取消标记（推送协程与取消指令分属不同任务）
@@ -1286,7 +1638,10 @@ pub async fn drop_link(st: Arc<AppState>, peer_id: String) {
         tracing::info!("链路断开，「{}」已保留 {} 字节半成品待续传", s.name, s.have);
     }
     // 未开始推送的邀请清单一并清理
-    st.pigeon_incoming.lock().unwrap().retain(|_, (peer, _)| peer != &peer_id);
+    st.pigeon_incoming
+        .lock()
+        .unwrap()
+        .retain(|_, (peer, _)| peer != &peer_id);
 }
 
 #[cfg(test)]
@@ -1295,16 +1650,28 @@ mod tests {
 
     #[test]
     fn batch_id_stable_and_sensitive() {
-        let a = vec![("docs/a.txt".into(), 10u64, 100u128), ("docs/b.txt".into(), 20, 200)];
+        let a = vec![
+            ("docs/a.txt".into(), 10u64, 100u128),
+            ("docs/b.txt".into(), 20, 200),
+        ];
         // 顺序敏感：同序同内容 id 一致（build_batch_source 负责先排序）
         assert_eq!(batch_id(&a), batch_id(&a.clone()));
-        let b2 = vec![("docs/a.txt".to_string(), 10u64, 100u128), ("docs/b.txt".to_string(), 20u64, 200u128)];
+        let b2 = vec![
+            ("docs/a.txt".to_string(), 10u64, 100u128),
+            ("docs/b.txt".to_string(), 20u64, 200u128),
+        ];
         assert_eq!(batch_id(&a), batch_id(&b2));
         // 大小变化 → id 变化
-        let c = vec![("docs/a.txt".into(), 11u64, 100u128), ("docs/b.txt".into(), 20, 200)];
+        let c = vec![
+            ("docs/a.txt".into(), 11u64, 100u128),
+            ("docs/b.txt".into(), 20, 200),
+        ];
         assert_ne!(batch_id(&a), batch_id(&c));
         // mtime 变化 → id 变化
-        let d = vec![("docs/a.txt".into(), 10u64, 101u128), ("docs/b.txt".into(), 20, 200)];
+        let d = vec![
+            ("docs/a.txt".into(), 10u64, 101u128),
+            ("docs/b.txt".into(), 20, 200),
+        ];
         assert_ne!(batch_id(&a), batch_id(&d));
         // 32 位 hex
         assert_eq!(batch_id(&a).len(), 32);
@@ -1327,12 +1694,21 @@ mod tests {
     fn resume_have_boundary_granularity() {
         let sizes = [100u64, 50, 30];
         // 全部完成且校验 → 全量偏移
-        assert_eq!(resume_have(&sizes, &[100, 50, 30], &[true, true, true]), 180);
+        assert_eq!(
+            resume_have(&sizes, &[100, 50, 30], &[true, true, true]),
+            180
+        );
         // 当前文件写了一半（未校验）→ 只累计其前缀之前的完成文件，
         // 该文件从头重收（保证哈希覆盖完整文件）
-        assert_eq!(resume_have(&sizes, &[100, 20, 0], &[true, false, false]), 100);
+        assert_eq!(
+            resume_have(&sizes, &[100, 20, 0], &[true, false, false]),
+            100
+        );
         // 写满但哈希未到 → 不计入，从头重收该文件
-        assert_eq!(resume_have(&sizes, &[100, 50, 30], &[true, false, false]), 100);
+        assert_eq!(
+            resume_have(&sizes, &[100, 50, 30], &[true, false, false]),
+            100
+        );
         // 首个文件未完成 → 从 0 开始
         assert_eq!(resume_have(&sizes, &[40, 0, 0], &[false, false, false]), 0);
         // 空清单

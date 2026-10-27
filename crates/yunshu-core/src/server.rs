@@ -3,12 +3,13 @@
 use crate::pairing::Pairing;
 use crate::protocol::{WsIn, WsOut};
 use crate::{
-    CoreConfig, CoreEvent, Direction, FileEntry, TransferInfo, TransferKind, TransferStatus, UiRequest,
+    CoreConfig, CoreEvent, Direction, FileEntry, TransferInfo, TransferKind, TransferStatus,
+    UiRequest,
 };
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -81,6 +82,8 @@ pub struct AppState {
     pub(crate) pending_trusts: Mutex<HashMap<String, (String, String)>>,
     /// 本会话内被用户拒绝的设备（不再重复弹确认）
     pub(crate) trust_rejected: Mutex<std::collections::HashSet<String>>,
+    // ---- 远程控制（PC↔PC 屏幕共享 + 键鼠注入）----
+    pub(crate) remote: Mutex<crate::remote::RemoteState>,
 }
 
 /// 正在接收的加密推送批次：offer_id -> 组装状态（半成品在 .yunshu-parts/{id}/，manifest 支持续传）
@@ -134,9 +137,10 @@ impl AppState {
 
     pub(crate) fn push_ws(&self, out: &WsOut) {
         if let Ok(json) = serde_json::to_string(out)
-            && let Some(conn) = self.conn.lock().unwrap().as_ref() {
-                let _ = conn.out.send(json);
-            }
+            && let Some(conn) = self.conn.lock().unwrap().as_ref()
+        {
+            let _ = conn.out.send(json);
+        }
     }
 
     pub(crate) fn new_transfer(&self, t: TransferInfo) {
@@ -144,7 +148,14 @@ impl AppState {
         self.emit(CoreEvent::TransferUpdate { t: Box::new(t) });
     }
 
-    pub(crate) fn update_transfer(&self, id: &str, transferred: u64, size: Option<u64>, status: TransferStatus, path: Option<PathBuf>) {
+    pub(crate) fn update_transfer(
+        &self,
+        id: &str,
+        transferred: u64,
+        size: Option<u64>,
+        status: TransferStatus,
+        path: Option<PathBuf>,
+    ) {
         let mut list = self.transfers.lock().unwrap();
         if let Some(t) = list.iter_mut().find(|t| t.id == id) {
             t.transferred = transferred;
@@ -157,7 +168,9 @@ impl AppState {
             if let Some(p) = path {
                 t.path = Some(p);
             }
-            self.emit(CoreEvent::TransferUpdate { t: Box::new(t.clone()) });
+            self.emit(CoreEvent::TransferUpdate {
+                t: Box::new(t.clone()),
+            });
         }
     }
 
@@ -200,7 +213,9 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
     let ip = lan_ip().unwrap_or_else(|| "127.0.0.1".parse().unwrap());
     let addr = format!("{}:{}", ip, cfg.port);
 
-    let data_dir = dirs::config_dir().map(|d| d.join("yunshu")).unwrap_or_else(std::env::temp_dir);
+    let data_dir = dirs::config_dir()
+        .map(|d| d.join("yunshu"))
+        .unwrap_or_else(std::env::temp_dir);
     let state = Arc::new(AppState {
         cfg: cfg.clone(),
         self_id: uuid::Uuid::new_v4().simple().to_string(),
@@ -226,9 +241,22 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
         pigeon_push_resume: Mutex::new(HashMap::new()),
         pending_trusts: Mutex::new(HashMap::new()),
         trust_rejected: Mutex::new(std::collections::HashSet::new()),
+        remote: Mutex::new(crate::remote::RemoteState::new(
+            crate::settings::Settings::load_or_default().remote_fixed_password_hash,
+        )),
     });
 
     state.emit(CoreEvent::ServerStarted { addr: addr.clone() });
+    // 远程控制临时密码（每次启动重新生成）
+    state.emit(CoreEvent::RemoteTempPassword {
+        password: state
+            .remote
+            .lock()
+            .unwrap()
+            .auth
+            .temp_password()
+            .to_string(),
+    });
 
     // 飞鸽发现（PC↔PC）
     {
@@ -256,269 +284,422 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
     // UI 请求处理（阻塞读 std channel）
     {
         let st = state.clone();
-        std::thread::spawn(move || loop {
-            match ui_rx.recv() {
-                Ok(UiRequest::SendFiles(files)) => {
-                    if !st.pairing.lock().unwrap().has_session() {
-                        st.emit(CoreEvent::PairFailed { reason: "没有已连接的手机，请先扫码配对".into() });
-                        continue;
-                    }
-                    for f in files {
-                        offer_file(&st, f);
-                    }
-                }
-                Ok(UiRequest::SendText(text)) => {
-                    if !st.pairing.lock().unwrap().has_session() {
-                        st.emit(CoreEvent::PairFailed { reason: "没有已连接的手机，请先扫码配对".into() });
-                        continue;
-                    }
-                    let chars = text.chars().count();
-                    st.push_ws(&WsOut::PcText { text: text.clone() });
-                    st.new_transfer(TransferInfo::text(uuid::Uuid::new_v4().simple().to_string(), Direction::ToPhone, chars, Some("phone".into())));
-                }
-                Ok(UiRequest::SetSaveDir { batch, dir }) => {
-                    if let Some(b) = st.batches.lock().unwrap().get(&batch) {
-                        *b.dir.blocking_lock() = dir;
-                        b.notify.notify_waiters();
-                    }
-                }
-                Ok(UiRequest::DisconnectDevice) => {
-                    st.pairing.lock().unwrap().reset();
-                    if let Some(conn) = st.conn.lock().unwrap().as_ref() {
-                        conn.closed.store(true, Ordering::Relaxed);
-                        conn.kick.notify_waiters();
-                    }
-                }
-                Ok(UiRequest::Toast(text)) => {
-                    st.emit(CoreEvent::Toast { text });
-                }
-                Ok(UiRequest::PigeonSendText { peer_id, text }) => {
-                    let name = st
-                        .pigeon_conns
-                        .lock()
-                        .unwrap()
-                        .get(&peer_id)
-                        .map(|l| l.name.clone())
-                        .unwrap_or_default();
-                    let chars = text.chars().count();
-                    let sent = crate::pigeon::try_push(&st, &peer_id, crate::protocol::PigeonWire::PcText { text });
-                    if sent {
-                        st.new_transfer(TransferInfo::text(uuid::Uuid::new_v4().simple().to_string(), Direction::ToPhone, chars, Some(peer_id.to_string())));
-                    } else {
-                        st.emit(CoreEvent::Toast { text: format!("「{name}」已断开，无法发送") });
-                    }
-                }
-                Ok(UiRequest::PigeonSendFiles { peer_id, paths }) => {
-                    let connected = st.pigeon_conns.lock().unwrap().contains_key(&peer_id);
-                    if !connected {
-                        st.emit(CoreEvent::Toast { text: "对方已断开，无法发送".into() });
-                        continue;
-                    }
-                    // 多文件/文件夹合并为一个批次，对方一次确认
-                    match build_batch_source(&paths) {
-                        Ok((id, src)) => {
-                            let entries: Vec<FileEntry> = src.files.iter().map(|(_, rel, size)| FileEntry { name: rel.clone(), size: *size }).collect();
-                            st.pigeon_offers.lock().unwrap().insert(id.clone(), src.clone());
-                            st.new_transfer(TransferInfo::batch(
-                                id.clone(),
-                                Direction::ToPhone,
-                                src.name.clone(),
-                                src.total_size,
-                                entries,
-                                Some(peer_id.to_string()),
-                            ));
-                            crate::pigeon::try_push(
-                                &st,
-                                &peer_id,
-                                crate::protocol::PigeonWire::PcFileOffer {
-                                    id,
-                                    name: src.name.clone(),
-                                    total_size: src.total_size,
-                                    files: src.files.iter().map(|(_, rel, size)| crate::protocol::OfferFile { name: rel.clone(), size: *size }).collect(),
-                                },
-                            );
+        std::thread::spawn(move || {
+            loop {
+                match ui_rx.recv() {
+                    Ok(UiRequest::SendFiles(files)) => {
+                        if !st.pairing.lock().unwrap().has_session() {
+                            st.emit(CoreEvent::PairFailed {
+                                reason: "没有已连接的手机，请先扫码配对".into(),
+                            });
+                            continue;
                         }
-                        Err(e) => st.emit(CoreEvent::Toast { text: format!("发送失败：{e}") }),
-                    }
-                }
-                Ok(UiRequest::PigeonDisconnect { peer_id }) => {
-                    if let Some(link) = st.pigeon_conns.lock().unwrap().get(&peer_id) {
-                        link.closed.store(true, Ordering::Relaxed);
-                    }
-                    let st2 = st.clone();
-                    st.rt_handle.spawn(crate::pigeon::drop_link(st2, peer_id));
-                }
-                Ok(UiRequest::BroadcastText(text)) => {
-                    let n = {
-                        let conns = st.pigeon_conns.lock().unwrap();
-                        let mut sent = 0;
-                        for link in conns.values() {
-                            if link
-                                .out
-                                .try_send(crate::pigeon::PigeonOut::Control(crate::protocol::PigeonWire::BroadcastText { text: text.clone() }))
-                                .is_ok()
-                            {
-                                sent += 1;
-                            }
+                        for f in files {
+                            offer_file(&st, f);
                         }
-                        sent
-                    };
-                    if n > 0 {
+                    }
+                    Ok(UiRequest::SendText(text)) => {
+                        if !st.pairing.lock().unwrap().has_session() {
+                            st.emit(CoreEvent::PairFailed {
+                                reason: "没有已连接的手机，请先扫码配对".into(),
+                            });
+                            continue;
+                        }
+                        let chars = text.chars().count();
+                        st.push_ws(&WsOut::PcText { text: text.clone() });
                         st.new_transfer(TransferInfo::text(
                             uuid::Uuid::new_v4().simple().to_string(),
                             Direction::ToPhone,
-                            text.chars().count(),
-                            Some("broadcast".into()),
+                            chars,
+                            Some("phone".into()),
                         ));
-                        st.emit(CoreEvent::ChatBroadcast {
-                            peer_id: "me".into(),
-                            peer_name: st.cfg.pc_name.clone(),
-                            text,
-                        });
-                    } else {
-                        st.emit(CoreEvent::Toast { text: "没有在线电脑可广播".into() });
                     }
-                }
-                Ok(UiRequest::PigeonTrust { peer_id, fingerprint }) => {
-                    let mut pending = st.pending_trusts.lock().unwrap();
-                    match pending.get(&peer_id) {
-                        Some((_, fp)) if fp == &fingerprint => {
-                            pending.remove(&peer_id);
-                            st.trust_rejected.lock().unwrap().remove(&peer_id);
-                            crate::pigeon::pin_fingerprint(&fingerprint);
+                    Ok(UiRequest::SetSaveDir { batch, dir }) => {
+                        if let Some(b) = st.batches.lock().unwrap().get(&batch) {
+                            *b.dir.blocking_lock() = dir;
+                            b.notify.notify_waiters();
+                        }
+                    }
+                    Ok(UiRequest::DisconnectDevice) => {
+                        st.pairing.lock().unwrap().reset();
+                        if let Some(conn) = st.conn.lock().unwrap().as_ref() {
+                            conn.closed.store(true, Ordering::Relaxed);
+                            conn.kick.notify_waiters();
+                        }
+                    }
+                    Ok(UiRequest::Toast(text)) => {
+                        st.emit(CoreEvent::Toast { text });
+                    }
+                    Ok(UiRequest::PigeonSendText { peer_id, text }) => {
+                        let name = st
+                            .pigeon_conns
+                            .lock()
+                            .unwrap()
+                            .get(&peer_id)
+                            .map(|l| l.name.clone())
+                            .unwrap_or_default();
+                        let chars = text.chars().count();
+                        let sent = crate::pigeon::try_push(
+                            &st,
+                            &peer_id,
+                            crate::protocol::PigeonWire::PcText { text },
+                        );
+                        if sent {
+                            st.new_transfer(TransferInfo::text(
+                                uuid::Uuid::new_v4().simple().to_string(),
+                                Direction::ToPhone,
+                                chars,
+                                Some(peer_id.to_string()),
+                            ));
+                        } else {
                             st.emit(CoreEvent::Toast {
-                                text: format!("已信任设备（指纹 {}…）", &fingerprint[..16.min(fingerprint.len())]),
+                                text: format!("「{name}」已断开，无法发送"),
                             });
                         }
-                        _ => st.emit(CoreEvent::Toast { text: "确认已过期，请等待对方重新连接".into() }),
                     }
-                }
-                Ok(UiRequest::PigeonRejectTrust { peer_id }) => {
-                    st.pending_trusts.lock().unwrap().remove(&peer_id);
-                    st.trust_rejected.lock().unwrap().insert(peer_id);
-                }
-                Ok(UiRequest::PigeonAcceptFile { peer_id, offer_id }) => {
-                    // 磁盘空间预检：剩余空间容不下批次就直接拒绝
-                    let total = st
-                        .pigeon_incoming
-                        .lock()
-                        .unwrap()
-                        .get(&offer_id)
-                        .map(|(_, files)| files.iter().map(|f| f.size).sum::<u64>());
-                    if let Some(total) = total
-                        && let Some(free) = crate::pigeon::free_space(&st.cfg.save_dir)
-                        && free < total
-                    {
-                        crate::pigeon::try_push(&st, &peer_id, crate::protocol::PigeonWire::FileDecision { id: offer_id.clone(), accepted: false });
-                        st.pigeon_incoming.lock().unwrap().remove(&offer_id);
-                        st.emit(CoreEvent::Toast {
-                            text: format!("磁盘空间不足（需要 {} 字节），已拒绝接收", total),
-                        });
-                        continue;
-                    }
-                    // 接受后由对方在加密通道内推送文件，这里只需答复
-                    crate::pigeon::try_push(&st, &peer_id, crate::protocol::PigeonWire::FileDecision { id: offer_id, accepted: true });
-                }
-                Ok(UiRequest::PigeonRejectFile { peer_id, offer_id }) => {
-                    st.pigeon_incoming.lock().unwrap().remove(&offer_id);
-                    crate::pigeon::try_push(&st, &peer_id, crate::protocol::PigeonWire::FileDecision { id: offer_id, accepted: false });
-                }
-                Ok(UiRequest::PigeonCancelFile { peer_id, offer_id }) => {
-                    let mut cancelled_locally = false;
-                    // 发送方向：推送中 → 登记取消标记，推送协程停止并回发 FileCancel
-                    if let Some(flag) = st.pigeon_push_cancel.lock().unwrap().get(&offer_id) {
-                        flag.store(true, Ordering::Relaxed);
-                        cancelled_locally = true;
-                    }
-                    // 接收方向：停止写入并删除半成品目录（文件句柄在异步侧，投递回 runtime 清理）
-                    if st.recv_files.blocking_lock().contains_key(&offer_id) {
-                        let st2 = st.clone();
-                        let id = offer_id.clone();
-                        st.rt_handle.spawn(async move {
-                            if let Some(mut s) = st2.recv_files.lock().await.remove(&id) {
-                                if let Some(f) = s.file.as_mut() {
-                                    let _ = f.flush().await;
-                                }
-                                s.file = None;
-                                let _ = tokio::fs::remove_dir_all(&s.dir).await;
-                                st2.update_transfer(&s.row_id, s.have, None, TransferStatus::Cancelled, None);
+                    Ok(UiRequest::PigeonSendFiles { peer_id, paths }) => {
+                        let connected = st.pigeon_conns.lock().unwrap().contains_key(&peer_id);
+                        if !connected {
+                            st.emit(CoreEvent::Toast {
+                                text: "对方已断开，无法发送".into(),
+                            });
+                            continue;
+                        }
+                        // 多文件/文件夹合并为一个批次，对方一次确认
+                        match build_batch_source(&paths) {
+                            Ok((id, src)) => {
+                                let entries: Vec<FileEntry> = src
+                                    .files
+                                    .iter()
+                                    .map(|(_, rel, size)| FileEntry {
+                                        name: rel.clone(),
+                                        size: *size,
+                                    })
+                                    .collect();
+                                st.pigeon_offers
+                                    .lock()
+                                    .unwrap()
+                                    .insert(id.clone(), src.clone());
+                                st.new_transfer(TransferInfo::batch(
+                                    id.clone(),
+                                    Direction::ToPhone,
+                                    src.name.clone(),
+                                    src.total_size,
+                                    entries,
+                                    Some(peer_id.to_string()),
+                                ));
+                                crate::pigeon::try_push(
+                                    &st,
+                                    &peer_id,
+                                    crate::protocol::PigeonWire::PcFileOffer {
+                                        id,
+                                        name: src.name.clone(),
+                                        total_size: src.total_size,
+                                        files: src
+                                            .files
+                                            .iter()
+                                            .map(|(_, rel, size)| crate::protocol::OfferFile {
+                                                name: rel.clone(),
+                                                size: *size,
+                                            })
+                                            .collect(),
+                                    },
+                                );
                             }
-                        });
-                        cancelled_locally = true;
-                    }
-                    if !cancelled_locally {
-                        // 等待对方接受阶段：直接通知对方撤回/取消
-                        crate::pigeon::try_push(&st, &peer_id, crate::protocol::PigeonWire::FileCancel { id: offer_id.clone() });
-                    }
-                    let has_row = st.transfers.lock().unwrap().iter().any(|t| t.id == offer_id);
-                    if !cancelled_locally && has_row {
-                        // 本机发送等待中：行标取消（保留已有进度显示）
-                        let cur = st.transfers.lock().unwrap().iter().find(|t| t.id == offer_id).map(|t| (t.transferred, t.size));
-                        if let Some((transferred, size)) = cur {
-                            st.update_transfer(&offer_id, transferred, Some(size), TransferStatus::Cancelled, None);
+                            Err(e) => st.emit(CoreEvent::Toast {
+                                text: format!("发送失败：{e}"),
+                            }),
                         }
-                    } else if !cancelled_locally && !has_row {
-                        // 本机挂着待确认弹窗：推一条取消状态让 UI 关闭并收尾
-                        let info = TransferInfo {
-                            id: offer_id.clone(),
-                            direction: Direction::FromPhone,
-                            kind: TransferKind::File,
-                            name: String::new(),
-                            size: 0,
-                            transferred: 0,
-                            status: TransferStatus::Cancelled,
-                            path: None,
-                            peer: Some(peer_id.clone()),
-                            files: Vec::new(),
+                    }
+                    Ok(UiRequest::PigeonDisconnect { peer_id }) => {
+                        if let Some(link) = st.pigeon_conns.lock().unwrap().get(&peer_id) {
+                            link.closed.store(true, Ordering::Relaxed);
+                        }
+                        let st2 = st.clone();
+                        st.rt_handle.spawn(crate::pigeon::drop_link(st2, peer_id));
+                    }
+                    Ok(UiRequest::BroadcastText(text)) => {
+                        let n = {
+                            let conns = st.pigeon_conns.lock().unwrap();
+                            let mut sent = 0;
+                            for link in conns.values() {
+                                if link
+                                    .out
+                                    .try_send(crate::pigeon::PigeonOut::Control(
+                                        crate::protocol::PigeonWire::BroadcastText {
+                                            text: text.clone(),
+                                        },
+                                    ))
+                                    .is_ok()
+                                {
+                                    sent += 1;
+                                }
+                            }
+                            sent
                         };
-                        st.emit(CoreEvent::TransferUpdate { t: Box::new(info) });
-                    }
-                }
-                Ok(UiRequest::PigeonPauseFile { peer_id, offer_id, paused }) => {
-                    let mut acted = false;
-                    // 发送方向：设置暂停标记，推送协程在块间挂起，并同步本端行状态
-                    if let Some(flag) = st.pigeon_push_paused.lock().unwrap().get(&offer_id) {
-                        flag.store(paused, Ordering::Relaxed);
-                        acted = true;
-                        let cur = st.transfers.lock().unwrap().iter().find(|t| t.id == offer_id).map(|t| (t.transferred, t.size));
-                        if let Some((transferred, size)) = cur {
-                            let status = if paused { TransferStatus::Paused } else { TransferStatus::Active };
-                            st.update_transfer(&offer_id, transferred, Some(size), status, None);
-                        }
-                    }
-                    // 接收方向：本地行状态同步（数据是否真停取决于发送方是否配合）
-                    {
-                        let info = {
-                            let states = st.recv_files.blocking_lock();
-                            states.get(&offer_id).map(|s| (s.row_id.clone(), s.have, s.files.iter().map(|f| f.size).sum::<u64>()))
-                        };
-                        if let Some((row_id, have, total)) = info {
-                            let status = if paused { TransferStatus::Paused } else { TransferStatus::Active };
-                            st.update_transfer(&row_id, have, Some(total), status, None);
-                            acted = true;
-                        }
-                    }
-                    // 通知对方同步（发送方收到后控制推送节奏，接收方收到后同步行状态）
-                    crate::pigeon::try_push(&st, &peer_id, crate::protocol::PigeonWire::FilePause { id: offer_id, paused });
-                    let _ = acted;
-                }
-                Ok(UiRequest::ForgetTransfer { id }) => {
-                    st.transfers.lock().unwrap().retain(|t| t.id != *id);
-                }
-                Ok(UiRequest::SetDnd(enabled)) => {
-                    st.dnd.store(enabled, Ordering::Relaxed);
-                    if !enabled {
-                        st.dnd_skipped.lock().unwrap().clear();
-                    }
-                    st.emit(CoreEvent::Toast {
-                        text: if enabled {
-                            "防打扰已开启：仅已信任设备可连接，广播消息已静音".into()
+                        if n > 0 {
+                            st.new_transfer(TransferInfo::text(
+                                uuid::Uuid::new_v4().simple().to_string(),
+                                Direction::ToPhone,
+                                text.chars().count(),
+                                Some("broadcast".into()),
+                            ));
+                            st.emit(CoreEvent::ChatBroadcast {
+                                peer_id: "me".into(),
+                                peer_name: st.cfg.pc_name.clone(),
+                                text,
+                            });
                         } else {
-                            "防打扰已关闭".into()
-                        },
-                    });
+                            st.emit(CoreEvent::Toast {
+                                text: "没有在线电脑可广播".into(),
+                            });
+                        }
+                    }
+                    Ok(UiRequest::PigeonTrust {
+                        peer_id,
+                        fingerprint,
+                    }) => {
+                        let mut pending = st.pending_trusts.lock().unwrap();
+                        match pending.get(&peer_id) {
+                            Some((_, fp)) if fp == &fingerprint => {
+                                pending.remove(&peer_id);
+                                st.trust_rejected.lock().unwrap().remove(&peer_id);
+                                crate::pigeon::pin_fingerprint(&fingerprint);
+                                st.emit(CoreEvent::Toast {
+                                    text: format!(
+                                        "已信任设备（指纹 {}…）",
+                                        &fingerprint[..16.min(fingerprint.len())]
+                                    ),
+                                });
+                            }
+                            _ => st.emit(CoreEvent::Toast {
+                                text: "确认已过期，请等待对方重新连接".into(),
+                            }),
+                        }
+                    }
+                    Ok(UiRequest::PigeonRejectTrust { peer_id }) => {
+                        st.pending_trusts.lock().unwrap().remove(&peer_id);
+                        st.trust_rejected.lock().unwrap().insert(peer_id);
+                    }
+                    Ok(UiRequest::PigeonAcceptFile { peer_id, offer_id }) => {
+                        // 磁盘空间预检：剩余空间容不下批次就直接拒绝
+                        let total = st
+                            .pigeon_incoming
+                            .lock()
+                            .unwrap()
+                            .get(&offer_id)
+                            .map(|(_, files)| files.iter().map(|f| f.size).sum::<u64>());
+                        if let Some(total) = total
+                            && let Some(free) = crate::pigeon::free_space(&st.cfg.save_dir)
+                            && free < total
+                        {
+                            crate::pigeon::try_push(
+                                &st,
+                                &peer_id,
+                                crate::protocol::PigeonWire::FileDecision {
+                                    id: offer_id.clone(),
+                                    accepted: false,
+                                },
+                            );
+                            st.pigeon_incoming.lock().unwrap().remove(&offer_id);
+                            st.emit(CoreEvent::Toast {
+                                text: format!("磁盘空间不足（需要 {} 字节），已拒绝接收", total),
+                            });
+                            continue;
+                        }
+                        // 接受后由对方在加密通道内推送文件，这里只需答复
+                        crate::pigeon::try_push(
+                            &st,
+                            &peer_id,
+                            crate::protocol::PigeonWire::FileDecision {
+                                id: offer_id,
+                                accepted: true,
+                            },
+                        );
+                    }
+                    Ok(UiRequest::PigeonRejectFile { peer_id, offer_id }) => {
+                        st.pigeon_incoming.lock().unwrap().remove(&offer_id);
+                        crate::pigeon::try_push(
+                            &st,
+                            &peer_id,
+                            crate::protocol::PigeonWire::FileDecision {
+                                id: offer_id,
+                                accepted: false,
+                            },
+                        );
+                    }
+                    Ok(UiRequest::PigeonCancelFile { peer_id, offer_id }) => {
+                        let mut cancelled_locally = false;
+                        // 发送方向：推送中 → 登记取消标记，推送协程停止并回发 FileCancel
+                        if let Some(flag) = st.pigeon_push_cancel.lock().unwrap().get(&offer_id) {
+                            flag.store(true, Ordering::Relaxed);
+                            cancelled_locally = true;
+                        }
+                        // 接收方向：停止写入并删除半成品目录（文件句柄在异步侧，投递回 runtime 清理）
+                        if st.recv_files.blocking_lock().contains_key(&offer_id) {
+                            let st2 = st.clone();
+                            let id = offer_id.clone();
+                            st.rt_handle.spawn(async move {
+                                if let Some(mut s) = st2.recv_files.lock().await.remove(&id) {
+                                    if let Some(f) = s.file.as_mut() {
+                                        let _ = f.flush().await;
+                                    }
+                                    s.file = None;
+                                    let _ = tokio::fs::remove_dir_all(&s.dir).await;
+                                    st2.update_transfer(
+                                        &s.row_id,
+                                        s.have,
+                                        None,
+                                        TransferStatus::Cancelled,
+                                        None,
+                                    );
+                                }
+                            });
+                            cancelled_locally = true;
+                        }
+                        if !cancelled_locally {
+                            // 等待对方接受阶段：直接通知对方撤回/取消
+                            crate::pigeon::try_push(
+                                &st,
+                                &peer_id,
+                                crate::protocol::PigeonWire::FileCancel {
+                                    id: offer_id.clone(),
+                                },
+                            );
+                        }
+                        let has_row = st
+                            .transfers
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|t| t.id == offer_id);
+                        if !cancelled_locally && has_row {
+                            // 本机发送等待中：行标取消（保留已有进度显示）
+                            let cur = st
+                                .transfers
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .find(|t| t.id == offer_id)
+                                .map(|t| (t.transferred, t.size));
+                            if let Some((transferred, size)) = cur {
+                                st.update_transfer(
+                                    &offer_id,
+                                    transferred,
+                                    Some(size),
+                                    TransferStatus::Cancelled,
+                                    None,
+                                );
+                            }
+                        } else if !cancelled_locally && !has_row {
+                            // 本机挂着待确认弹窗：推一条取消状态让 UI 关闭并收尾
+                            let info = TransferInfo {
+                                id: offer_id.clone(),
+                                direction: Direction::FromPhone,
+                                kind: TransferKind::File,
+                                name: String::new(),
+                                size: 0,
+                                transferred: 0,
+                                status: TransferStatus::Cancelled,
+                                path: None,
+                                peer: Some(peer_id.clone()),
+                                files: Vec::new(),
+                            };
+                            st.emit(CoreEvent::TransferUpdate { t: Box::new(info) });
+                        }
+                    }
+                    Ok(UiRequest::PigeonPauseFile {
+                        peer_id,
+                        offer_id,
+                        paused,
+                    }) => {
+                        let mut acted = false;
+                        // 发送方向：设置暂停标记，推送协程在块间挂起，并同步本端行状态
+                        if let Some(flag) = st.pigeon_push_paused.lock().unwrap().get(&offer_id) {
+                            flag.store(paused, Ordering::Relaxed);
+                            acted = true;
+                            let cur = st
+                                .transfers
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .find(|t| t.id == offer_id)
+                                .map(|t| (t.transferred, t.size));
+                            if let Some((transferred, size)) = cur {
+                                let status = if paused {
+                                    TransferStatus::Paused
+                                } else {
+                                    TransferStatus::Active
+                                };
+                                st.update_transfer(
+                                    &offer_id,
+                                    transferred,
+                                    Some(size),
+                                    status,
+                                    None,
+                                );
+                            }
+                        }
+                        // 接收方向：本地行状态同步（数据是否真停取决于发送方是否配合）
+                        {
+                            let info = {
+                                let states = st.recv_files.blocking_lock();
+                                states.get(&offer_id).map(|s| {
+                                    (
+                                        s.row_id.clone(),
+                                        s.have,
+                                        s.files.iter().map(|f| f.size).sum::<u64>(),
+                                    )
+                                })
+                            };
+                            if let Some((row_id, have, total)) = info {
+                                let status = if paused {
+                                    TransferStatus::Paused
+                                } else {
+                                    TransferStatus::Active
+                                };
+                                st.update_transfer(&row_id, have, Some(total), status, None);
+                                acted = true;
+                            }
+                        }
+                        // 通知对方同步（发送方收到后控制推送节奏，接收方收到后同步行状态）
+                        crate::pigeon::try_push(
+                            &st,
+                            &peer_id,
+                            crate::protocol::PigeonWire::FilePause {
+                                id: offer_id,
+                                paused,
+                            },
+                        );
+                        let _ = acted;
+                    }
+                    Ok(UiRequest::ForgetTransfer { id }) => {
+                        st.transfers.lock().unwrap().retain(|t| t.id != *id);
+                    }
+                    Ok(UiRequest::SetDnd(enabled)) => {
+                        st.dnd.store(enabled, Ordering::Relaxed);
+                        if !enabled {
+                            st.dnd_skipped.lock().unwrap().clear();
+                        }
+                        st.emit(CoreEvent::Toast {
+                            text: if enabled {
+                                "防打扰已开启：仅已信任设备可连接，广播消息已静音".into()
+                            } else {
+                                "防打扰已关闭".into()
+                            },
+                        });
+                    }
+                    Ok(
+                        req @ (UiRequest::RemoteConnect { .. }
+                        | UiRequest::RemoteDisconnect
+                        | UiRequest::RemoteAssistRequest { .. }
+                        | UiRequest::RemoteAssistRespond { .. }
+                        | UiRequest::SetRemoteFixedPassword { .. }),
+                    ) => {
+                        crate::remote::handle_ui_request(&st, req);
+                    }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
         });
     }
@@ -528,6 +709,8 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
         .route("/pair", get(serve_page))
         .route("/ws", get(ws_handler))
         .route("/pigeon-ws", get(pigeon_ws_handler))
+        .route(crate::remote::REMOTE_WS_PATH, get(remote_ws_handler))
+        .route(crate::remote::VIEW_WS_PATH, get(remote_view_ws_handler))
         .route("/file/{id}", get(download))
         .route("/upload", post(upload))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024))
@@ -540,7 +723,10 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
             let r = router.clone();
             tokio::spawn(async move {
                 let server = axum_server::bind_rustls(https_addr, tls);
-                tracing::info!("HTTPS 已启动: https://0.0.0.0:{}（手机首次访问需信任自签证书）", https_addr.port());
+                tracing::info!(
+                    "HTTPS 已启动: https://0.0.0.0:{}（手机首次访问需信任自签证书）",
+                    https_addr.port()
+                );
                 if let Err(e) = server.serve(r.into_make_service()).await {
                     tracing::error!("HTTPS 服务异常: {e}");
                 }
@@ -552,20 +738,32 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
     match tokio::net::TcpListener::bind(("0.0.0.0", cfg.port)).await {
         Ok(listener) => {
             tracing::info!("云书服务已启动: http://{addr}");
-            if let Err(e) = axum::serve(listener, router).await {
+            // ConnectInfo：远程控制按来源 IP 做防爆破锁定
+            if let Err(e) = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            {
                 tracing::error!("服务异常退出: {e}");
-                state.emit(CoreEvent::ServerError { reason: format!("服务异常退出：{e}") });
+                state.emit(CoreEvent::ServerError {
+                    reason: format!("服务异常退出：{e}"),
+                });
             }
         }
         Err(e) => {
             tracing::error!("端口 {} 绑定失败: {e}", cfg.port);
-            state.emit(CoreEvent::ServerError { reason: format!("端口 {} 被占用：{e}", cfg.port) });
+            state.emit(CoreEvent::ServerError {
+                reason: format!("端口 {} 被占用：{e}", cfg.port),
+            });
         }
     }
 }
 
 /// 自签证书：首次生成并持久化（含所有本机 IPv4 SAN + localhost）
-async fn https_config(data_dir: &std::path::Path) -> Result<axum_server::tls_rustls::RustlsConfig, String> {
+async fn https_config(
+    data_dir: &std::path::Path,
+) -> Result<axum_server::tls_rustls::RustlsConfig, String> {
     use rcgen::{CertificateParams, KeyPair, SanType};
     let _ = std::fs::create_dir_all(data_dir);
     let cert_p = data_dir.join("https_cert.pem");
@@ -583,11 +781,17 @@ async fn https_config(data_dir: &std::path::Path) -> Result<axum_server::tls_rus
         let mut params = CertificateParams::new(subjects.clone()).map_err(|e| e.to_string())?;
         params.subject_alt_names = subjects
             .iter()
-            .filter_map(|s| if let Ok(ip) = s.parse::<IpAddr>() { Some(SanType::IpAddress(ip)) } else { None })
+            .filter_map(|s| {
+                if let Ok(ip) = s.parse::<IpAddr>() {
+                    Some(SanType::IpAddress(ip))
+                } else {
+                    None
+                }
+            })
             .collect();
-        params
-            .subject_alt_names
-            .push(SanType::DnsName("yunshu.local".try_into().map_err(|e| format!("{e}"))?));
+        params.subject_alt_names.push(SanType::DnsName(
+            "yunshu.local".try_into().map_err(|e| format!("{e}"))?,
+        ));
         let key = KeyPair::generate().map_err(|e| e.to_string())?;
         let cert = params.self_signed(&key).map_err(|e| e.to_string())?;
         std::fs::write(&cert_p, cert.pem()).map_err(|e| e.to_string())?;
@@ -614,6 +818,25 @@ async fn ws_handler(State(st): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Re
 
 async fn pigeon_ws_handler(State(st): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| handle_pigeon_socket(st, socket))
+}
+
+/// 远程控制受控端入口（独立 Noise 会话，认证通过即进入会话循环）
+async fn remote_ws_handler(
+    State(st): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.on_upgrade(move |socket| crate::remote::handle_remote_socket(st, addr.ip(), socket))
+}
+
+/// 本地观看桥：控制端会话建立后，观看窗口凭 token 接入收帧发输入
+async fn remote_view_ws_handler(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let token = q.get("token").cloned();
+    ws.on_upgrade(move |socket| crate::remote::handle_view_socket(st, token, socket))
 }
 
 /// 飞鸽服务器侧：对方听到我的广播后连进来
@@ -647,7 +870,11 @@ async fn handle_pigeon_socket(st: Arc<AppState>, socket: WebSocket) {
         Ok(n) => n,
         Err(_) => return,
     };
-    if sink.send(Message::Binary(m2[..n2].to_vec().into())).await.is_err() {
+    if sink
+        .send(Message::Binary(m2[..n2].to_vec().into()))
+        .await
+        .is_err()
+    {
         return;
     }
     // <- msg3
@@ -662,7 +889,10 @@ async fn handle_pigeon_socket(st: Arc<AppState>, socket: WebSocket) {
         Ok(t) => t,
         Err(_) => return,
     };
-    let remote_static = noise.get_remote_static().map(|s| s.to_vec()).unwrap_or_default();
+    let remote_static = noise
+        .get_remote_static()
+        .map(|s| s.to_vec())
+        .unwrap_or_default();
     let noise = Arc::new(Mutex::new(noise));
 
     // ---- 加密通道内：hello（id 必须在发现表里）----
@@ -671,7 +901,9 @@ async fn handle_pigeon_socket(st: Arc<AppState>, socket: WebSocket) {
         _ => return,
     };
     let hello = match crate::pigeon::open_msg(&noise, &first) {
-        Ok(crate::pigeon::PigeonIn::Control(PigeonWire::PigeonHello { id, name, .. })) => (id, name),
+        Ok(crate::pigeon::PigeonIn::Control(PigeonWire::PigeonHello { id, name, .. })) => {
+            (id, name)
+        }
         _ => return,
     };
     let (peer_id, peer_name) = hello;
@@ -683,25 +915,48 @@ async fn handle_pigeon_socket(st: Arc<AppState>, socket: WebSocket) {
         .map(|p| p.last_seen.elapsed() < crate::pigeon::PEER_TTL + Duration::from_secs(60))
         .unwrap_or(false);
     let welcome = if !known_ok {
-        PigeonWire::PigeonWelcome { ok: false, reason: Some("不在线上发现列表中".into()), pc_name: None }
+        PigeonWire::PigeonWelcome {
+            ok: false,
+            reason: Some("不在线上发现列表中".into()),
+            pc_name: None,
+        }
     } else if st.trust_rejected.lock().unwrap().contains(&peer_id) {
-        PigeonWire::PigeonWelcome { ok: false, reason: Some("你已被拒绝接入".into()), pc_name: None }
+        PigeonWire::PigeonWelcome {
+            ok: false,
+            reason: Some("你已被拒绝接入".into()),
+            pc_name: None,
+        }
     } else if st.dnd.load(Ordering::Relaxed) && !crate::pigeon::is_pinned(&remote_static) {
         // 防打扰：未信任设备直接拒绝，不弹信任确认
         tracing::info!("防打扰：已拒绝未信任设备「{peer_name}」的连入");
-        PigeonWire::PigeonWelcome { ok: false, reason: Some("对方开启了防打扰".into()), pc_name: None }
+        PigeonWire::PigeonWelcome {
+            ok: false,
+            reason: Some("对方开启了防打扰".into()),
+            pc_name: None,
+        }
     } else if !crate::pigeon::is_pinned(&remote_static) {
         let fp = crate::pigeon::fingerprint(&remote_static);
-        st.pending_trusts.lock().unwrap().insert(peer_id.clone(), (peer_name.clone(), fp.clone()));
+        st.pending_trusts
+            .lock()
+            .unwrap()
+            .insert(peer_id.clone(), (peer_name.clone(), fp.clone()));
         tracing::info!("新设备「{peer_name}」待确认（指纹 {fp}）");
         st.emit(CoreEvent::PigeonTrustRequest {
             peer_id: peer_id.clone(),
             name: peer_name.clone(),
             fingerprint: fp,
         });
-        PigeonWire::PigeonWelcome { ok: false, reason: Some("新设备待确认".into()), pc_name: None }
+        PigeonWire::PigeonWelcome {
+            ok: false,
+            reason: Some("新设备待确认".into()),
+            pc_name: None,
+        }
     } else {
-        PigeonWire::PigeonWelcome { ok: true, reason: None, pc_name: Some(st.cfg.pc_name.clone()) }
+        PigeonWire::PigeonWelcome {
+            ok: true,
+            reason: None,
+            pc_name: Some(st.cfg.pc_name.clone()),
+        }
     };
     let frame = match crate::pigeon::seal_msg(&noise, &crate::pigeon::PigeonOut::Control(welcome)) {
         Ok(f) => f,
@@ -723,7 +978,11 @@ async fn handle_pigeon_socket(st: Arc<AppState>, socket: WebSocket) {
     let (plain_out_tx, plain_out_rx) = tokio::sync::mpsc::channel::<crate::pigeon::PigeonOut>(64);
     st.pigeon_conns.lock().unwrap().insert(
         peer_id.clone(),
-        crate::pigeon::PigeonLink { name: peer_name.clone(), out: plain_out_tx.clone(), closed: Arc::new(AtomicBool::new(false)) },
+        crate::pigeon::PigeonLink {
+            name: peer_name.clone(),
+            out: plain_out_tx.clone(),
+            closed: Arc::new(AtomicBool::new(false)),
+        },
     );
     tracing::info!("「{peer_name}」连入加密飞鸽链路（Noise XX，静态密钥已校验/固定）");
     crate::pigeon::emit_peers(&st);
@@ -793,7 +1052,9 @@ pub(crate) fn build_batch_source(paths: &[PathBuf]) -> Result<(String, BatchSour
         files: &mut Vec<(PathBuf, String, u64)>,
         items: &mut Vec<(String, u64, u128)>,
     ) -> Result<(), String> {
-        for entry in std::fs::read_dir(dir).map_err(|e| format!("无法读取目录 {}: {e}", dir.display()))? {
+        for entry in
+            std::fs::read_dir(dir).map_err(|e| format!("无法读取目录 {}: {e}", dir.display()))?
+        {
             let entry = entry.map_err(|e| e.to_string())?;
             let p = entry.path();
             let fname = entry.file_name().to_string_lossy().to_string();
@@ -825,8 +1086,13 @@ pub(crate) fn build_batch_source(paths: &[PathBuf]) -> Result<(String, BatchSour
                 .unwrap_or_else(|| "文件夹".into());
             walk(p, &root, &mut files, &mut items)?;
         } else if p.is_file() {
-            let meta = std::fs::metadata(p).map_err(|e| format!("无法读取文件 {}: {e}", p.display()))?;
-            let rel = sanitize_name(&p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+            let meta =
+                std::fs::metadata(p).map_err(|e| format!("无法读取文件 {}: {e}", p.display()))?;
+            let rel = sanitize_name(
+                &p.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            );
             let mtime = meta
                 .modified()
                 .ok()
@@ -847,17 +1113,31 @@ pub(crate) fn build_batch_source(paths: &[PathBuf]) -> Result<(String, BatchSour
     let id = crate::pigeon::batch_id(&items);
     let total_size = items.iter().map(|i| i.1).sum();
     let name = if files.len() == 1 {
-        files[0].1.rsplit('/').next().unwrap_or(&files[0].1).to_string()
+        files[0]
+            .1
+            .rsplit('/')
+            .next()
+            .unwrap_or(&files[0].1)
+            .to_string()
     } else {
         let first_root = files[0].1.split('/').next().unwrap_or_default();
-        let all_same_root = files.iter().all(|f| f.1.split('/').next() == Some(first_root));
+        let all_same_root = files
+            .iter()
+            .all(|f| f.1.split('/').next() == Some(first_root));
         if all_same_root && !first_root.is_empty() {
             format!("{first_root}/")
         } else {
             format!("{} 项", files.len())
         }
     };
-    Ok((id, BatchSource { files, name, total_size }))
+    Ok((
+        id,
+        BatchSource {
+            files,
+            name,
+            total_size,
+        },
+    ))
 }
 
 /// 相对路径安全拼接：逐段 sanitize，拒绝空段与穿越（..）
@@ -888,9 +1168,11 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
     // 同一时间只允许一台手机
     if st.conn.lock().unwrap().is_some() {
         if let Ok(json) = serde_json::to_string(&WsOut::PairResult {
-            ok: false, session: None,
+            ok: false,
+            session: None,
             reason: Some("电脑上已有其他设备连接".into()),
-            pc_name: None, http_port: None,
+            pc_name: None,
+            http_port: None,
         }) {
             let _ = socket.send(Message::text(json)).await;
         }
@@ -946,32 +1228,53 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
             continue;
         };
         match input {
-            WsIn::Hello { token, device, session } => {
+            WsIn::Hello {
+                token,
+                device,
+                session,
+            } => {
                 let mut p = st.pairing.lock().unwrap();
                 // 断线恢复：手机锁屏/切后台会断 WS，重连时带着原会话回来免重新扫码
                 if let Some(s) = session.as_deref().map(str::trim).filter(|s| !s.is_empty())
                     && p.session_valid(s)
                 {
                     paired = true;
-                    let _ = out_tx2.send(serde_json::to_string(&WsOut::PairResult {
-                        ok: true, session: Some(s.to_string()), reason: None,
-                        pc_name: Some(st.cfg.pc_name.clone()), http_port: Some(st.cfg.port),
-                    }).unwrap());
+                    let _ = out_tx2.send(
+                        serde_json::to_string(&WsOut::PairResult {
+                            ok: true,
+                            session: Some(s.to_string()),
+                            reason: None,
+                            pc_name: Some(st.cfg.pc_name.clone()),
+                            http_port: Some(st.cfg.port),
+                        })
+                        .unwrap(),
+                    );
                     tracing::info!("手机「{}」恢复会话", device.trim());
-                    st.emit(CoreEvent::PairOk { device: device.trim().to_string() });
+                    st.emit(CoreEvent::PairOk {
+                        device: device.trim().to_string(),
+                    });
                     continue;
                 }
                 if !p.token_valid(&token) {
-                    let _ = out_tx2.send(serde_json::to_string(&WsOut::PairResult {
-                        ok: false, session: None,
-                        reason: Some("二维码已过期，请在电脑上刷新后重新扫码".into()),
-                        pc_name: None, http_port: None,
-                    }).unwrap());
+                    let _ = out_tx2.send(
+                        serde_json::to_string(&WsOut::PairResult {
+                            ok: false,
+                            session: None,
+                            reason: Some("二维码已过期，请在电脑上刷新后重新扫码".into()),
+                            pc_name: None,
+                            http_port: None,
+                        })
+                        .unwrap(),
+                    );
                     break;
                 }
                 // 注：不再以 has_session 拒绝——WS 入口已保证同一时间仅一条连接，
                 // 会话跨连接保留后，新配对直接覆盖旧会话（旧设备恢复会失败并回到扫码流程）
-                let device = if device.trim().is_empty() { "手机".into() } else { device.trim().to_string() };
+                let device = if device.trim().is_empty() {
+                    "手机".into()
+                } else {
+                    device.trim().to_string()
+                };
                 let code = p.begin_pending(device.clone());
                 drop(p);
                 tracing::info!("手机「{device}」发起配对，配对码 {code}");
@@ -982,18 +1285,33 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
                     paired = true;
                     let pc_name = st.cfg.pc_name.clone();
                     tracing::info!("「{device}」配对成功");
-                    let _ = out_tx2.send(serde_json::to_string(&WsOut::PairResult {
-                        ok: true, session: Some(session), reason: None, pc_name: Some(pc_name),
-                        http_port: Some(st.cfg.port),
-                    }).unwrap());
+                    let _ = out_tx2.send(
+                        serde_json::to_string(&WsOut::PairResult {
+                            ok: true,
+                            session: Some(session),
+                            reason: None,
+                            pc_name: Some(pc_name),
+                            http_port: Some(st.cfg.port),
+                        })
+                        .unwrap(),
+                    );
                     st.emit(CoreEvent::PairOk { device });
                 }
                 Err(reason) => {
                     tracing::info!("配对失败：{reason}");
-                    let _ = out_tx2.send(serde_json::to_string(&WsOut::PairResult {
-                        ok: false, session: None, reason: Some(reason.into()), pc_name: None, http_port: None,
-                    }).unwrap());
-                    st.emit(CoreEvent::PairFailed { reason: reason.into() });
+                    let _ = out_tx2.send(
+                        serde_json::to_string(&WsOut::PairResult {
+                            ok: false,
+                            session: None,
+                            reason: Some(reason.into()),
+                            pc_name: None,
+                            http_port: None,
+                        })
+                        .unwrap(),
+                    );
+                    st.emit(CoreEvent::PairFailed {
+                        reason: reason.into(),
+                    });
                 }
             },
             WsIn::SendText { text } if paired => {
@@ -1003,13 +1321,25 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
                 }
                 crate::clipboard::copy_text(&text);
                 let chars = text.chars().count();
-                st.new_transfer(TransferInfo::text(uuid::Uuid::new_v4().simple().to_string(), Direction::FromPhone, chars, Some("phone".into())));
+                st.new_transfer(TransferInfo::text(
+                    uuid::Uuid::new_v4().simple().to_string(),
+                    Direction::FromPhone,
+                    chars,
+                    Some("phone".into()),
+                ));
                 st.emit(CoreEvent::TextFromPhone { text });
             }
             WsIn::SendText { .. } => {
-                let _ = out_tx2.send(serde_json::to_string(&WsOut::PairResult {
-                    ok: false, session: None, reason: Some("尚未完成配对".into()), pc_name: None, http_port: None,
-                }).unwrap());
+                let _ = out_tx2.send(
+                    serde_json::to_string(&WsOut::PairResult {
+                        ok: false,
+                        session: None,
+                        reason: Some("尚未完成配对".into()),
+                        pc_name: None,
+                        http_port: None,
+                    })
+                    .unwrap(),
+                );
             }
         }
     }
@@ -1023,7 +1353,9 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
 
 fn offer_file(st: &Arc<AppState>, path: PathBuf) {
     let Ok(meta) = std::fs::metadata(&path) else {
-        st.emit(CoreEvent::ServerError { reason: format!("无法读取文件：{}", path.display()) });
+        st.emit(CoreEvent::ServerError {
+            reason: format!("无法读取文件：{}", path.display()),
+        });
         return;
     };
     let name = path
@@ -1032,8 +1364,17 @@ fn offer_file(st: &Arc<AppState>, path: PathBuf) {
         .unwrap_or_else(|| "未命名文件".into());
     let id = uuid::Uuid::new_v4().simple().to_string();
     let size = meta.len();
-    st.offers.lock().unwrap().insert(id.clone(), (path, name.clone(), size));
-    st.new_transfer(TransferInfo::file(id.clone(), Direction::ToPhone, name.clone(), size, Some("phone".into())));
+    st.offers
+        .lock()
+        .unwrap()
+        .insert(id.clone(), (path, name.clone(), size));
+    st.new_transfer(TransferInfo::file(
+        id.clone(),
+        Direction::ToPhone,
+        name.clone(),
+        size,
+        Some("phone".into()),
+    ));
     st.push_ws(&WsOut::PcFile { id, name, size });
 }
 
@@ -1048,7 +1389,10 @@ async fn download(
     let Some((path, name, size)) = st.offers.lock().unwrap().get(&id).cloned() else {
         return err_page(StatusCode::NOT_FOUND, "文件不存在或已被清理");
     };
-    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok()).map(String::from);
+    let range_header = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
     tracing::info!("手机下载请求: id={id} name={name} size={size} range={range_header:?}");
     let Ok(mut file) = tokio::fs::File::open(&path).await else {
         return err_page(StatusCode::NOT_FOUND, "文件读取失败");
@@ -1058,7 +1402,10 @@ async fn download(
     // 仅支持单段 bytes=start-end / bytes=start-；size==0 直接 200 空体。
     let (status, start, expect_len) = if size == 0 {
         (StatusCode::OK, 0u64, 0u64)
-    } else if let Some(r) = range_header.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
+    } else if let Some(r) = range_header
+        .as_deref()
+        .and_then(|r| r.strip_prefix("bytes="))
+    {
         let mut it = r.splitn(2, '-');
         let s: u64 = it.next().unwrap_or("").parse().unwrap_or(0);
         let e: Option<u64> = it.next().and_then(|x| x.parse().ok());
@@ -1101,7 +1448,11 @@ async fn download(
         .chars()
         .filter(|c| c.is_ascii() && !c.is_control() && *c != '"' && *c != '\\')
         .collect();
-    let ascii_name = if ascii_name.trim().is_empty() { "download".to_string() } else { ascii_name };
+    let ascii_name = if ascii_name.trim().is_empty() {
+        "download".to_string()
+    } else {
+        ascii_name
+    };
     let mut resp_headers = vec![
         (header::CONTENT_TYPE, "application/octet-stream".to_string()),
         (header::CONTENT_LENGTH, expect_len.to_string()),
@@ -1120,8 +1471,10 @@ async fn download(
     }
     let mut resp = (status, Body::from_stream(stream)).into_response();
     for (k, v) in resp_headers {
-        resp.headers_mut()
-            .insert(k, axum::http::HeaderValue::from_str(&v).expect("响应头值非法"));
+        resp.headers_mut().insert(
+            k,
+            axum::http::HeaderValue::from_str(&v).expect("响应头值非法"),
+        );
     }
     resp
 }
@@ -1129,10 +1482,20 @@ async fn download(
 pub(crate) fn sanitize_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .map(|c| if c.is_control() || c == '/' || c == '\\' || c == ':' { '_' } else { c })
+        .map(|c| {
+            if c.is_control() || c == '/' || c == '\\' || c == ':' {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     let cleaned = cleaned.trim().to_string();
-    if cleaned.is_empty() { "未命名文件".into() } else { cleaned }
+    if cleaned.is_empty() {
+        "未命名文件".into()
+    } else {
+        cleaned
+    }
 }
 
 pub(crate) fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
@@ -1141,15 +1504,24 @@ pub(crate) fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
         return p;
     }
     let stem = dir.join(name);
-    let ext = stem.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    let base = stem.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let ext = stem
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let base = stem
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
     for i in 1..1000u32 {
         let candidate = dir.join(format!("{base} ({i}){ext}"));
         if !candidate.exists() {
             return candidate;
         }
     }
-    dir.join(format!("{base}-{uuid}{ext}", uuid = uuid::Uuid::new_v4().simple()))
+    dir.join(format!(
+        "{base}-{uuid}{ext}",
+        uuid = uuid::Uuid::new_v4().simple()
+    ))
 }
 
 async fn upload(
@@ -1171,7 +1543,11 @@ async fn upload(
         if let Some(b) = batches.values().next() {
             (b.dir.clone(), b.notify.clone())
         } else {
-            let b = Batch { dir: Arc::new(tokio::sync::Mutex::new(None)), notify: Arc::new(Notify::new()), created: Instant::now() };
+            let b = Batch {
+                dir: Arc::new(tokio::sync::Mutex::new(None)),
+                notify: Arc::new(Notify::new()),
+                created: Instant::now(),
+            };
             let batch_id = uuid::Uuid::new_v4().simple().to_string();
             let (dir_slot, notify) = (b.dir.clone(), b.notify.clone());
             batches.insert(batch_id.clone(), b);
@@ -1206,9 +1582,18 @@ async fn upload(
         let name = sanitize_name(field.file_name().unwrap_or("未命名文件"));
         let id = uuid::Uuid::new_v4().simple().to_string();
         let dest = unique_path(&dir, &name);
-        let display_name = dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| name.clone());
+        let display_name = dest
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| name.clone());
 
-        st.new_transfer(TransferInfo::file(id.clone(), Direction::FromPhone, display_name.clone(), 0, Some("phone".into())));
+        st.new_transfer(TransferInfo::file(
+            id.clone(),
+            Direction::FromPhone,
+            display_name.clone(),
+            0,
+            Some("phone".into()),
+        ));
         st.update_transfer(&id, 0, None, TransferStatus::Active, None);
 
         let mut file = match tokio::fs::File::create(&dest).await {
@@ -1223,7 +1608,10 @@ async fn upload(
         let mut failed = false;
         while let Some(chunk) = match field.chunk().await {
             Ok(c) => c,
-            Err(_) => { failed = true; None }
+            Err(_) => {
+                failed = true;
+                None
+            }
         } {
             if let Err(e) = file.write_all(&chunk).await {
                 tracing::error!("写入文件失败: {e}");
@@ -1240,11 +1628,21 @@ async fn upload(
             let _ = tokio::fs::remove_file(&dest).await;
             continue;
         }
-        st.update_transfer(&id, written, Some(written), TransferStatus::Done, Some(dest.clone()));
+        st.update_transfer(
+            &id,
+            written,
+            Some(written),
+            TransferStatus::Done,
+            Some(dest.clone()),
+        );
         saved.push(serde_json::json!({"name": display_name, "size": written}));
     }
 
-    (StatusCode::OK, Json(serde_json::json!({"ok": true, "files": saved}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "files": saved})),
+    )
+        .into_response()
 }
 
 fn err_page(code: StatusCode, msg: &str) -> Response {
@@ -1252,7 +1650,11 @@ fn err_page(code: StatusCode, msg: &str) -> Response {
 }
 
 fn json_err(msg: &str) -> Response {
-    (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"ok": false, "error": msg}))).into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({"ok": false, "error": msg})),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -1284,7 +1686,8 @@ mod tests {
 
     #[test]
     fn unique_path_avoids_collision() {
-        let dir = std::env::temp_dir().join(format!("yunshu-test-{}", uuid::Uuid::new_v4().simple()));
+        let dir =
+            std::env::temp_dir().join(format!("yunshu-test-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let first = unique_path(&dir, "a.txt");
         std::fs::write(&first, b"x").unwrap();
@@ -1296,7 +1699,8 @@ mod tests {
 
     #[test]
     fn build_batch_source_mixed_and_stable() {
-        let base = std::env::temp_dir().join(format!("yunshu-test-{}", uuid::Uuid::new_v4().simple()));
+        let base =
+            std::env::temp_dir().join(format!("yunshu-test-{}", uuid::Uuid::new_v4().simple()));
         let folder = base.join("资料包");
         std::fs::create_dir_all(folder.join("子目录")).unwrap();
         std::fs::write(folder.join("b.txt"), b"bb").unwrap();
@@ -1310,7 +1714,11 @@ mod tests {
         // 名称排序后 a top.bin 在前
         assert_eq!(src.files[0].1, "a top.bin");
         assert!(src.files.iter().any(|(_, rel, _)| rel == "资料包/b.txt"));
-        assert!(src.files.iter().any(|(_, rel, _)| rel == "资料包/子目录/c.bin"));
+        assert!(
+            src.files
+                .iter()
+                .any(|(_, rel, _)| rel == "资料包/子目录/c.bin")
+        );
         assert_eq!(id.len(), 32);
         // 同内容重建 id 稳定
         let (id2, _) = build_batch_source(&[base.join("a top.bin"), folder]).unwrap();

@@ -7,6 +7,8 @@ export interface Device {
   name: string
   ip: string
   online: boolean
+  /** 公开机器 ID（静态密钥指纹前 8 位 hex）；远程控制以此定位设备，旧版本为空 */
+  machineId?: string
 }
 
 export type MessageKind = 'text' | 'clipboard' | 'system'

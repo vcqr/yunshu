@@ -40,12 +40,18 @@ impl Pairing {
     /// 不应导致用户正在输入的配对码失效。
     pub fn begin_pending(&mut self, device: String) -> String {
         if let Some(p) = self.pending.as_mut()
-            && p.created_at.elapsed() <= PENDING_TTL {
-                p.device = device;
-                return p.code.clone();
-            }
+            && p.created_at.elapsed() <= PENDING_TTL
+        {
+            p.device = device;
+            return p.code.clone();
+        }
         let code = format!("{:06}", rand::random::<u32>() % 900_000 + 100_000);
-        self.pending = Some(Pending { device, code: code.clone(), created_at: Instant::now(), attempts: 0 });
+        self.pending = Some(Pending {
+            device,
+            code: code.clone(),
+            created_at: Instant::now(),
+            attempts: 0,
+        });
         code
     }
 

@@ -30,29 +30,61 @@ struct OfferFile {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Wire {
-    PigeonHello { id: String, name: String, port: u16 },
-    PigeonWelcome { ok: bool, #[serde(default)] pc_name: Option<String> },
-    PcText { text: String },
+    PigeonHello {
+        id: String,
+        name: String,
+        port: u16,
+    },
+    PigeonWelcome {
+        ok: bool,
+        #[serde(default)]
+        pc_name: Option<String>,
+    },
+    PcText {
+        text: String,
+    },
     /// 广播聊天（app 会向所有链路广播，bot 需认识该变体避免解析告警）
-    BroadcastText { text: String },
+    BroadcastText {
+        text: String,
+    },
     PcFileOffer {
         id: String,
         name: String,
         total_size: u64,
         files: Vec<OfferFile>,
     },
-    FileDecision { id: String, accepted: bool },
-    FileStart { id: String },
+    FileDecision {
+        id: String,
+        accepted: bool,
+    },
+    FileStart {
+        id: String,
+    },
     /// 接收方应答：本地已有 have 字节，发送方从断点续推
-    FileResume { id: String, have: u64 },
+    FileResume {
+        id: String,
+        have: u64,
+    },
     /// 单文件推送完成，携带整文件 SHA-256
-    FileHash { id: String, index: u32, sha: String },
+    FileHash {
+        id: String,
+        index: u32,
+        sha: String,
+    },
     /// 任一方取消传输：接收方删半成品，发送方停止推送
-    FileCancel { id: String },
+    FileCancel {
+        id: String,
+    },
     /// 任一方暂停/恢复传输
-    FilePause { id: String, paused: bool },
+    FilePause {
+        id: String,
+        paused: bool,
+    },
     /// 批次推送结束
-    FileEnd { id: String, ok: bool },
+    FileEnd {
+        id: String,
+        ok: bool,
+    },
 }
 
 /// 推送任务等待的两个回执（由主循环分发转发）
@@ -63,7 +95,11 @@ enum PushEvent {
 
 fn seal(noise: &Mutex<TransportState>, plain: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; plain.len() + 64];
-    let n = noise.lock().unwrap().write_message(plain, &mut buf).expect("write");
+    let n = noise
+        .lock()
+        .unwrap()
+        .write_message(plain, &mut buf)
+        .expect("write");
     buf.truncate(n);
     buf
 }
@@ -95,7 +131,9 @@ fn keypair() -> Vec<u8> {
     {
         return k;
     }
-    let kp = snow::Builder::new(PATTERN.parse().unwrap()).generate_keypair().unwrap();
+    let kp = snow::Builder::new(PATTERN.parse().unwrap())
+        .generate_keypair()
+        .unwrap();
     let _ = std::fs::write(&path, &kp.private);
     kp.private
 }
@@ -160,7 +198,12 @@ impl Incoming {
         if self.part_file.is_none() {
             // 惰性打开当前文件（从文件头重写）
             let part = self.dir.join(format!("{}.part", self.index));
-            let Ok(f) = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&part) else {
+            let Ok(f) = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&part)
+            else {
                 eprintln!("[bot] ✗ 打开半成品失败 {part:?}，中止");
                 std::process::exit(1);
             };
@@ -186,10 +229,19 @@ impl Incoming {
         }
     }
 
-    fn file_hash(&mut self, index: u32, sha: &str, out_tx: &tokio::sync::mpsc::Sender<Vec<u8>>, noise: &Arc<Mutex<TransportState>>) {
+    fn file_hash(
+        &mut self,
+        index: u32,
+        sha: &str,
+        out_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+        noise: &Arc<Mutex<TransportState>>,
+    ) {
         self.last_activity = Instant::now();
         if index as usize != self.index {
-            println!("[bot] ⚠ FileHash 序号不符（#{index} vs 当前 #{}），忽略", self.index);
+            println!(
+                "[bot] ⚠ FileHash 序号不符（#{index} vs 当前 #{}），忽略",
+                self.index
+            );
             return;
         }
         let actual = match self.running_hash.take() {
@@ -208,7 +260,12 @@ impl Incoming {
         } else {
             let name = self.files[self.index].name.clone();
             println!("[bot] ✗ 「{name}」哈希校验失败（{actual}），中止");
-            let _ = out_tx.try_send(control_msg(noise, &Wire::FileCancel { id: self.id.clone() }));
+            let _ = out_tx.try_send(control_msg(
+                noise,
+                &Wire::FileCancel {
+                    id: self.id.clone(),
+                },
+            ));
             std::process::exit(1);
         }
     }
@@ -216,7 +273,11 @@ impl Incoming {
     /// FileEnd(ok=true)：镜像 core——清单未齐保留半成品，齐了按相对路径落盘
     fn finish(&mut self) -> bool {
         if self.index != self.files.len() || self.hash_pending {
-            println!("[bot] ⚠ FileEnd 时清单未完成（{}/{} 项），保留半成品", self.index, self.files.len());
+            println!(
+                "[bot] ⚠ FileEnd 时清单未完成（{}/{} 项），保留半成品",
+                self.index,
+                self.files.len()
+            );
             return false;
         }
         let out = self.dir.join("out");
@@ -242,7 +303,13 @@ impl Incoming {
             }
         }
         let total: u64 = self.files.iter().map(|f| f.size).sum();
-        println!("[bot] ✓ 批次「{}」收全 {} 项（{} 字节）→ {}", self.name, self.files.len(), total, out.display());
+        println!(
+            "[bot] ✓ 批次「{}」收全 {} 项（{} 字节）→ {}",
+            self.name,
+            self.files.len(),
+            total,
+            out.display()
+        );
         println!("E2E-BOT-RECV-DONE {} {}", total, self.id);
         true
     }
@@ -250,18 +317,32 @@ impl Incoming {
 
 #[tokio::main]
 async fn main() {
-    let size: usize = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(1024 * 1024);
+    let size: usize = std::env::args()
+        .nth(1)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(1024 * 1024);
     // 推送完成后继续等待来件的窗口（秒）；测 app→bot 方向（拖拽/右键发送）时靠它保持在线
-    let stay_secs: u64 = std::env::args().nth(2).and_then(|a| a.parse().ok()).unwrap_or(30);
+    let stay_secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(30);
     let bot_id: String = {
         let k = keypair();
         k.iter().map(|b| format!("{b:02x}")).collect::<String>()[..32].to_string()
     };
-    println!("[bot] 启动 id={} port={BOT_PORT} 推送={size}B 等待来件={stay_secs}s", &bot_id[..8]);
+    println!(
+        "[bot] 启动 id={} port={BOT_PORT} 推送={size}B 等待来件={stay_secs}s",
+        &bot_id[..8]
+    );
 
     // UDP 广播
     std::thread::spawn(move || {
-        let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP)).unwrap();
+        let sock = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
         let _ = sock.set_reuse_address(true);
         let _ = sock.set_nonblocking(true);
         let addr: SocketAddr = ([0, 0, 0, 0], 0).into();
@@ -284,7 +365,9 @@ async fn main() {
     let listener = TcpListener::bind(("0.0.0.0", BOT_PORT)).await.unwrap();
     let (tcp, _addr) = listener.accept().await.unwrap();
     println!("[bot] 实例已连入，进行 Noise XX 握手（responder）…");
-    let ws = tokio_tungstenite::accept_async(tcp).await.expect("ws 升级失败");
+    let ws = tokio_tungstenite::accept_async(tcp)
+        .await
+        .expect("ws 升级失败");
     let (mut sink, mut stream) = ws.split();
 
     // Noise 握手
@@ -307,8 +390,16 @@ async fn main() {
     };
     hs.read_message(&m3, &mut buf).unwrap();
     let noise = Arc::new(Mutex::new(hs.into_transport_mode().unwrap()));
-    let remote = noise.lock().unwrap().get_remote_static().map(|s| s.to_vec()).unwrap();
-    println!("[bot] ✓ Noise 握手完成，对方静态密钥 {}…", &hex(&remote)[..16]);
+    let remote = noise
+        .lock()
+        .unwrap()
+        .get_remote_static()
+        .map(|s| s.to_vec())
+        .unwrap();
+    println!(
+        "[bot] ✓ Noise 握手完成，对方静态密钥 {}…",
+        &hex(&remote)[..16]
+    );
 
     // 出站统一走 writer 任务：推送任务与主循环都通过 out_tx 发帧
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -334,7 +425,13 @@ async fn main() {
     };
     println!("[bot] ✓ 加密 hello：{peer_name}（{}…）", &peer_id[..8]);
     let _ = out_tx
-        .send(control_msg(&noise, &Wire::PigeonWelcome { ok: true, pc_name: Some("e2e测试节点".into()) }))
+        .send(control_msg(
+            &noise,
+            &Wire::PigeonWelcome {
+                ok: true,
+                pc_name: Some("e2e测试节点".into()),
+            },
+        ))
         .await;
 
     // 推送批次（bot → app）：原 e2e 流程；FileDecision/FileResume 回执经 push_tx 转发
@@ -347,9 +444,21 @@ async fn main() {
         pattern: u64,
     }
     let specs = [
-        FileSpec { name: "pigeon-a.bin", size: 1_048_576, pattern: 251 },
-        FileSpec { name: "pigeon-b.bin", size: size as u64, pattern: 7 },
-        FileSpec { name: "pigeon-c.bin", size: 0, pattern: 1 },
+        FileSpec {
+            name: "pigeon-a.bin",
+            size: 1_048_576,
+            pattern: 251,
+        },
+        FileSpec {
+            name: "pigeon-b.bin",
+            size: size as u64,
+            pattern: 7,
+        },
+        FileSpec {
+            name: "pigeon-c.bin",
+            size: 0,
+            pattern: 1,
+        },
     ];
     let total_size: u64 = specs.iter().map(|s| s.size).sum();
     let mut idh = sha2::Sha256::new();
@@ -368,14 +477,25 @@ async fn main() {
         // 发聊天
         let text = format!(
             "来自 pigeonbot 的加密问候 {}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
         );
-        let _ = push_out.send(control_msg(&push_noise, &Wire::PcText { text: text.clone() })).await;
+        let _ = push_out
+            .send(control_msg(
+                &push_noise,
+                &Wire::PcText { text: text.clone() },
+            ))
+            .await;
         println!("[bot] → 已发加密聊天");
 
         let offer_files: Vec<OfferFile> = specs
             .iter()
-            .map(|s| OfferFile { name: s.name.to_string(), size: s.size })
+            .map(|s| OfferFile {
+                name: s.name.to_string(),
+                size: s.size,
+            })
             .collect();
         let _ = push_out
             .send(control_msg(
@@ -388,7 +508,11 @@ async fn main() {
                 },
             ))
             .await;
-        println!("[bot] → 已发批次邀请（{} 项，{} 字节），等待决策…", specs.len(), total_size);
+        println!(
+            "[bot] → 已发批次邀请（{} 项，{} 字节），等待决策…",
+            specs.len(),
+            total_size
+        );
 
         // 等决策
         match tokio::time::timeout(Duration::from_secs(120), push_rx.recv()).await {
@@ -414,14 +538,22 @@ async fn main() {
         }
 
         // FileStart → 等接收方应答 FileResume（支持断点续传的接收方会带流偏移）
-        let _ = push_out.send(control_msg(&push_noise, &Wire::FileStart { id: file_id.clone() })).await;
-        let resume_from: u64 = match tokio::time::timeout(Duration::from_secs(10), push_rx.recv()).await {
-            Ok(Some(PushEvent::Resume(have))) => have,
-            _ => {
-                println!("[bot] ✗ 等待 FileResume 超时");
-                std::process::exit(1);
-            }
-        };
+        let _ = push_out
+            .send(control_msg(
+                &push_noise,
+                &Wire::FileStart {
+                    id: file_id.clone(),
+                },
+            ))
+            .await;
+        let resume_from: u64 =
+            match tokio::time::timeout(Duration::from_secs(10), push_rx.recv()).await {
+                Ok(Some(PushEvent::Resume(have))) => have,
+                _ => {
+                    println!("[bot] ✗ 等待 FileResume 超时");
+                    std::process::exit(1);
+                }
+            };
         if resume_from > 0 {
             println!("[bot] ✓ 接收方已有 {resume_from} 字节，从断点续传");
         }
@@ -444,20 +576,36 @@ async fn main() {
             }
             loc -= sz;
         }
-        let total_blocks: usize = sizes.iter().map(|s| s.div_ceil(CHUNK as u64)).sum::<u64>() as usize;
-        let start_block: usize =
-            (sizes[..idx].iter().map(|s| s.div_ceil(CHUNK as u64)).sum::<u64>() + in_off.div_ceil(CHUNK as u64)) as usize;
+        let total_blocks: usize =
+            sizes.iter().map(|s| s.div_ceil(CHUNK as u64)).sum::<u64>() as usize;
+        let start_block: usize = (sizes[..idx]
+            .iter()
+            .map(|s| s.div_ceil(CHUNK as u64))
+            .sum::<u64>()
+            + in_off.div_ceil(CHUNK as u64)) as usize;
         let mut pushed_blocks = 0usize;
         for (fi, spec) in specs.iter().enumerate().skip(idx) {
             // 进入大文件前演示暂停/恢复：验证接收方 FilePause 处理路径
             if fi == 1 && in_off == 0 {
                 let _ = push_out
-                    .send(control_msg(&push_noise, &Wire::FilePause { id: file_id.clone(), paused: true }))
+                    .send(control_msg(
+                        &push_noise,
+                        &Wire::FilePause {
+                            id: file_id.clone(),
+                            paused: true,
+                        },
+                    ))
                     .await;
                 println!("[bot] → 已请求接收方暂停 3 秒");
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 let _ = push_out
-                    .send(control_msg(&push_noise, &Wire::FilePause { id: file_id.clone(), paused: false }))
+                    .send(control_msg(
+                        &push_noise,
+                        &Wire::FilePause {
+                            id: file_id.clone(),
+                            paused: false,
+                        },
+                    ))
                     .await;
                 println!("[bot] → 已请求恢复");
             }
@@ -474,24 +622,49 @@ async fn main() {
             while off < spec.size {
                 let end = (off + CHUNK as u64).min(spec.size);
                 let chunk: Vec<u8> = (off..end).map(|i| (i % spec.pattern) as u8).collect();
-                let _ = push_out.send(chunk_msg(&push_noise, &id16, sent, &chunk)).await;
+                let _ = push_out
+                    .send(chunk_msg(&push_noise, &id16, sent, &chunk))
+                    .await;
                 hasher.update(&chunk);
                 sent += chunk.len() as u64;
                 off = end;
                 pushed_blocks += 1;
                 if pushed_blocks.is_multiple_of(64) {
-                    println!("[bot] 推送进度 {}/{} 块", start_block + pushed_blocks, total_blocks);
+                    println!(
+                        "[bot] 推送进度 {}/{} 块",
+                        start_block + pushed_blocks,
+                        total_blocks
+                    );
                 }
             }
             let digest = hasher.finalize();
             let sha: String = digest.iter().map(|x| format!("{x:02x}")).collect();
             let _ = push_out
-                .send(control_msg(&push_noise, &Wire::FileHash { id: file_id.clone(), index: fi as u32, sha }))
+                .send(control_msg(
+                    &push_noise,
+                    &Wire::FileHash {
+                        id: file_id.clone(),
+                        index: fi as u32,
+                        sha,
+                    },
+                ))
                 .await;
             println!("[bot] ✓ 「{}」推送完成（{} 字节）", spec.name, spec.size);
         }
-        let _ = push_out.send(control_msg(&push_noise, &Wire::FileEnd { id: file_id.clone(), ok: true })).await;
-        println!("[bot] ✓ 批次加密推送完成（{} 项，{} 字节）", specs.len(), sent);
+        let _ = push_out
+            .send(control_msg(
+                &push_noise,
+                &Wire::FileEnd {
+                    id: file_id.clone(),
+                    ok: true,
+                },
+            ))
+            .await;
+        println!(
+            "[bot] ✓ 批次加密推送完成（{} 项，{} 字节）",
+            specs.len(),
+            sent
+        );
         println!("E2E-BOT-DONE {} {}", total_size, file_id);
     });
 
@@ -577,15 +750,37 @@ async fn handle_control(
         }
         Wire::PcText { text } => println!("[bot] ← 聊天：{text}"),
         Wire::BroadcastText { text } => println!("[bot] ← 广播：{text}"),
-        Wire::PcFileOffer { id, name, total_size, files } => {
+        Wire::PcFileOffer {
+            id,
+            name,
+            total_size,
+            files,
+        } => {
             if incoming.is_some() {
                 println!("[bot] ⚠ 正在接收批次，拒绝新邀请「{name}」");
-                let _ = out_tx.send(control_msg(noise, &Wire::FileDecision { id, accepted: false })).await;
+                let _ = out_tx
+                    .send(control_msg(
+                        noise,
+                        &Wire::FileDecision {
+                            id,
+                            accepted: false,
+                        },
+                    ))
+                    .await;
                 return;
             }
-            println!("[bot] ← 批次邀请「{name}」（{} 项，{total_size} 字节），自动接受", files.len());
+            println!(
+                "[bot] ← 批次邀请「{name}」（{} 项，{total_size} 字节），自动接受",
+                files.len()
+            );
             let _ = out_tx
-                .send(control_msg(noise, &Wire::FileDecision { id: id.clone(), accepted: true }))
+                .send(control_msg(
+                    noise,
+                    &Wire::FileDecision {
+                        id: id.clone(),
+                        accepted: true,
+                    },
+                ))
                 .await;
             *incoming = Some(Incoming::new(id, name, files));
         }
@@ -599,7 +794,9 @@ async fn handle_control(
                 std::process::exit(1);
             }
             println!("[bot] ✓ 批次开始接收，回 FileResume(have=0)");
-            let _ = out_tx.send(control_msg(noise, &Wire::FileResume { id, have: 0 })).await;
+            let _ = out_tx
+                .send(control_msg(noise, &Wire::FileResume { id, have: 0 }))
+                .await;
         }
         Wire::FileHash { id, index, sha } => {
             let Some(inc) = incoming.as_mut() else { return };

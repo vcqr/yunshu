@@ -11,13 +11,27 @@ use yunshu_core::{CoreEvent, UiRequest};
 struct AppState {
     ui_tx: std::sync::mpsc::Sender<UiRequest>,
     cache: Arc<Mutex<serde_json::Value>>,
+    /// 控制端观看会话信息（观看窗口页经 get_view_info 读取）
+    remote_view: Mutex<Option<RemoteViewInfo>>,
+}
+
+#[derive(Clone)]
+struct RemoteViewInfo {
+    token: String,
+    port: u16,
+    name: String,
+    peer_id: String,
+    width: u32,
+    height: u32,
 }
 
 fn state_snapshot() -> serde_json::Value {
     json!({
         "addr": null, "error": null, "qr_url": null,
         "pending": null, "connected": null,
-        "peers": [], "transfers": [], "toasts": []
+        "peers": [], "transfers": [], "toasts": [],
+        "remote_temp_password": null, "remote_controlled": null,
+        "remote_machine_id": null,
     })
 }
 
@@ -25,16 +39,51 @@ fn apply_to_cache(cache: &Mutex<serde_json::Value>, ev: &CoreEvent) {
     let mut c = cache.lock().unwrap();
     let obj = c.as_object_mut().unwrap();
     match ev {
-        CoreEvent::ServerStarted { addr } => { obj.insert("addr".into(), json!(addr)); }
-        CoreEvent::ServerError { reason } => { obj.insert("error".into(), json!(reason)); }
-        CoreEvent::QrUrl(url) => { obj.insert("qr_url".into(), json!(url)); }
-        CoreEvent::PairPending { code, device } => { obj.insert("pending".into(), json!({ "code": code, "device": device })); }
+        CoreEvent::ServerStarted { addr } => {
+            obj.insert("addr".into(), json!(addr));
+        }
+        CoreEvent::ServerError { reason } => {
+            obj.insert("error".into(), json!(reason));
+        }
+        CoreEvent::QrUrl(url) => {
+            obj.insert("qr_url".into(), json!(url));
+        }
+        CoreEvent::PairPending { code, device } => {
+            obj.insert("pending".into(), json!({ "code": code, "device": device }));
+        }
         CoreEvent::PairOk { device } => {
             obj.insert("pending".into(), json!(null));
             obj.insert("connected".into(), json!(device));
         }
-        CoreEvent::PeerDisconnected => { obj.insert("connected".into(), json!(null)); }
-        CoreEvent::PigeonPeers { peers } => { obj.insert("peers".into(), serde_json::to_value(peers).unwrap_or_default()); }
+        CoreEvent::PeerDisconnected => {
+            obj.insert("connected".into(), json!(null));
+        }
+        CoreEvent::PigeonPeers { peers } => {
+            obj.insert(
+                "peers".into(),
+                serde_json::to_value(peers).unwrap_or_default(),
+            );
+        }
+        CoreEvent::RemoteTempPassword { password } => {
+            obj.insert("remote_temp_password".into(), json!(password));
+        }
+        CoreEvent::RemoteSessionStarted {
+            peer_id,
+            name,
+            side,
+        } => {
+            if side == "controlled" {
+                obj.insert(
+                    "remote_controlled".into(),
+                    json!({ "peer_id": peer_id, "name": name }),
+                );
+            }
+        }
+        CoreEvent::RemoteSessionEnded { side, .. } => {
+            if side == "controlled" {
+                obj.insert("remote_controlled".into(), json!(null));
+            }
+        }
         CoreEvent::TransferUpdate { t } => {
             let list = obj.entry("transfers").or_insert(json!([]));
             let arr = list.as_array_mut().unwrap();
@@ -51,10 +100,20 @@ fn apply_to_cache(cache: &Mutex<serde_json::Value>, ev: &CoreEvent) {
 #[tauri::command]
 fn write_diag(text: String) {
     let path = std::env::temp_dir().join("yunshu_webview_diag.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         use std::io::Write;
-        let _ = f.write_all(format!("{}
-", text).as_bytes());
+        let _ = f.write_all(
+            format!(
+                "{}
+",
+                text
+            )
+            .as_bytes(),
+        );
     }
 }
 
@@ -64,7 +123,12 @@ fn get_state(state: tauri::State<AppState>) -> serde_json::Value {
 }
 
 #[tauri::command]
-fn send_paths(state: tauri::State<AppState>, kind: String, peer_id: Option<String>, paths: Vec<String>) {
+fn send_paths(
+    state: tauri::State<AppState>,
+    kind: String,
+    peer_id: Option<String>,
+    paths: Vec<String>,
+) {
     let paths: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
     let _ = match kind.as_str() {
         // 手机：文件夹打包 zip 后按单文件发送（手机端是浏览器下载）
@@ -75,8 +139,13 @@ fn send_paths(state: tauri::State<AppState>, kind: String, peer_id: Option<Strin
                     match yunshu_core::util::zip_folder(&path) {
                         Ok(z) => files.push(z),
                         Err(e) => {
-                            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                            let _ = state.ui_tx.send(UiRequest::Toast(format!("打包「{name}」失败：{e}")));
+                            let name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let _ = state
+                                .ui_tx
+                                .send(UiRequest::Toast(format!("打包「{name}」失败：{e}")));
                         }
                     }
                 } else {
@@ -91,7 +160,9 @@ fn send_paths(state: tauri::State<AppState>, kind: String, peer_id: Option<Strin
         // 电脑：文件夹原生直传（core 递归展开为批次，一次确认）
         "pc" => {
             if let Some(peer_id) = peer_id {
-                state.ui_tx.send(UiRequest::PigeonSendFiles { peer_id, paths })
+                state
+                    .ui_tx
+                    .send(UiRequest::PigeonSendFiles { peer_id, paths })
             } else {
                 Ok(())
             }
@@ -107,7 +178,9 @@ fn send_text(state: tauri::State<AppState>, text: String) {
 
 #[tauri::command]
 fn pigeon_send_text(state: tauri::State<AppState>, peer_id: String, text: String) {
-    let _ = state.ui_tx.send(UiRequest::PigeonSendText { peer_id, text });
+    let _ = state
+        .ui_tx
+        .send(UiRequest::PigeonSendText { peer_id, text });
 }
 
 #[tauri::command]
@@ -117,7 +190,10 @@ fn broadcast_text(state: tauri::State<AppState>, text: String) {
 
 #[tauri::command]
 fn pigeon_trust(state: tauri::State<AppState>, peer_id: String, fingerprint: String) {
-    let _ = state.ui_tx.send(UiRequest::PigeonTrust { peer_id, fingerprint });
+    let _ = state.ui_tx.send(UiRequest::PigeonTrust {
+        peer_id,
+        fingerprint,
+    });
 }
 
 #[tauri::command]
@@ -127,23 +203,33 @@ fn pigeon_reject_trust(state: tauri::State<AppState>, peer_id: String) {
 
 #[tauri::command]
 fn pigeon_accept(state: tauri::State<AppState>, peer_id: String, offer_id: String) {
-    let _ = state.ui_tx.send(UiRequest::PigeonAcceptFile { peer_id, offer_id });
+    let _ = state
+        .ui_tx
+        .send(UiRequest::PigeonAcceptFile { peer_id, offer_id });
 }
 
 #[tauri::command]
 fn pigeon_reject(state: tauri::State<AppState>, peer_id: String, offer_id: String) {
-    let _ = state.ui_tx.send(UiRequest::PigeonRejectFile { peer_id, offer_id });
+    let _ = state
+        .ui_tx
+        .send(UiRequest::PigeonRejectFile { peer_id, offer_id });
 }
 
 #[tauri::command]
 fn pigeon_cancel(state: tauri::State<AppState>, peer_id: String, offer_id: String) {
-    let _ = state.ui_tx.send(UiRequest::PigeonCancelFile { peer_id, offer_id });
+    let _ = state
+        .ui_tx
+        .send(UiRequest::PigeonCancelFile { peer_id, offer_id });
 }
 
 /// 忘记一条传输记录（仅 UI 列表；已收文件用 delete_received_file 删）
 #[tauri::command]
 fn pigeon_pause(state: tauri::State<AppState>, peer_id: String, offer_id: String, paused: bool) {
-    let _ = state.ui_tx.send(UiRequest::PigeonPauseFile { peer_id, offer_id, paused });
+    let _ = state.ui_tx.send(UiRequest::PigeonPauseFile {
+        peer_id,
+        offer_id,
+        paused,
+    });
 }
 
 #[tauri::command]
@@ -156,7 +242,10 @@ fn forget_transfer(state: tauri::State<AppState>, id: String) {
 fn delete_received_file(path: String) -> Result<(), String> {
     let p = std::path::PathBuf::from(&path);
     let save_dir = yunshu_core::settings::Settings::load_or_default().save_dir_path();
-    let in_save_dir = match (p.parent().and_then(|d| d.canonicalize().ok()), save_dir.canonicalize().ok()) {
+    let in_save_dir = match (
+        p.parent().and_then(|d| d.canonicalize().ok()),
+        save_dir.canonicalize().ok(),
+    ) {
         (Some(parent), Some(dir)) => parent == dir,
         _ => false,
     };
@@ -225,7 +314,23 @@ fn stage_blob(name: String, bytes: Vec<u8>) -> Result<String, String> {
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let safe: String = name
         .chars()
-        .map(|c| if c.is_ascii_control() || c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|' { '_' } else { c })
+        .map(|c| {
+            if c.is_ascii_control()
+                || c == '\\'
+                || c == '/'
+                || c == ':'
+                || c == '*'
+                || c == '?'
+                || c == '"'
+                || c == '<'
+                || c == '>'
+                || c == '|'
+            {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     let path = dir.join(format!("{stamp}-{seq}-{safe}"));
     std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
@@ -234,7 +339,17 @@ fn stage_blob(name: String, bytes: Vec<u8>) -> Result<String, String> {
 
 #[tauri::command]
 fn get_settings() -> serde_json::Value {
-    serde_json::to_value(yunshu_core::settings::Settings::load_or_default()).unwrap_or_default()
+    let mut v = serde_json::to_value(yunshu_core::settings::Settings::load_or_default())
+        .unwrap_or_default();
+    if let Some(obj) = v.as_object_mut() {
+        // 固定密码哈希不给前端（单向哈希无意义，且避免日志泄漏格式）
+        obj.remove("remote_fixed_password_hash");
+        obj.insert(
+            "machine_id".into(),
+            json!(yunshu_core::remote::machine_id()),
+        );
+    }
+    v
 }
 
 #[tauri::command]
@@ -245,6 +360,7 @@ fn save_settings(
     save_dir: String,
     autostart: bool,
     dnd_mode: bool,
+    remote_fixed_password: Option<String>,
 ) -> Result<(), String> {
     let mut s = yunshu_core::settings::Settings::load_or_default();
     s.device_name = device_name;
@@ -258,7 +374,14 @@ fn save_settings(
         let _ = state.ui_tx.send(UiRequest::SetDnd(dnd_mode));
         s.dnd_mode = dnd_mode;
     }
-    s.save()
+    s.save()?;
+    // 固定密码走 core 通道：哈希 + 落盘 + 热更新校验器（None = 未改动）
+    if let Some(pw) = remote_fixed_password {
+        let _ = state.ui_tx.send(UiRequest::SetRemoteFixedPassword {
+            password: (!pw.is_empty()).then_some(pw),
+        });
+    }
+    Ok(())
 }
 
 /// 防打扰开关（头部铃铛）：立即生效并持久化
@@ -269,6 +392,129 @@ fn set_dnd(state: tauri::State<AppState>, enabled: bool) -> Result<(), String> {
     s.dnd_mode = enabled;
     s.save()
 }
+
+// ---- 远程控制 ----
+
+#[tauri::command]
+fn remote_connect(state: tauri::State<AppState>, machine_id: String, password: String) {
+    let _ = state.ui_tx.send(UiRequest::RemoteConnect {
+        machine_id,
+        password,
+    });
+}
+
+#[tauri::command]
+fn remote_disconnect(state: tauri::State<AppState>) {
+    let _ = state.ui_tx.send(UiRequest::RemoteDisconnect);
+}
+
+#[tauri::command]
+fn remote_assist_request(state: tauri::State<AppState>, peer_id: String) {
+    let _ = state.ui_tx.send(UiRequest::RemoteAssistRequest { peer_id });
+}
+
+#[tauri::command]
+fn remote_assist_respond(state: tauri::State<AppState>, peer_id: String, accepted: bool) {
+    let _ = state
+        .ui_tx
+        .send(UiRequest::RemoteAssistRespond { peer_id, accepted });
+}
+
+/// 观看窗口页获取本机会话信息（token/端口），避免往 URL 里塞凭证
+#[tauri::command]
+fn get_view_info(state: tauri::State<AppState>) -> Result<serde_json::Value, String> {
+    let remote = state.remote_view.lock().unwrap();
+    match remote.as_ref() {
+        Some(v) => Ok(json!({
+            "token": v.token, "port": v.port,
+            "name": v.name, "peer_id": v.peer_id,
+            "width": v.width, "height": v.height,
+        })),
+        None => Err("当前没有远程观看会话".into()),
+    }
+}
+
+/// 打开远程观看窗口（观看页凭 get_view_info 拿接入凭证，凭证不进 URL）
+fn open_viewer_window(app: &tauri::AppHandle, info: &RemoteViewInfo) {
+    use tauri::WebviewUrl;
+    if let Some(w) = app.get_webview_window("remote-viewer") {
+        let _ = w.set_title(format!("远程控制 · {}", info.name).as_str());
+        let _ = w.show();
+        let _ = w.set_focus();
+        return;
+    }
+    let title = format!("远程控制 · {}（{}×{}）", info.name, info.width, info.height);
+    if let Err(e) = tauri::WebviewWindowBuilder::new(
+        app,
+        "remote-viewer",
+        WebviewUrl::App("viewer.html".into()),
+    )
+    .title(title)
+    .inner_size(1024.0, 640.0)
+    .min_inner_size(560.0, 360.0)
+    .build()
+    {
+        eprintln!("观看窗口创建失败: {e}");
+    }
+}
+
+/// 被控指示：托盘图标变红 + 提示语（安全要求：被控状态必须醒目可感知）
+fn set_tray_controlled(app: &tauri::AppHandle, controlled: bool, who: &str) {
+    let Some(tray) = app.try_state::<TrayHandle>() else {
+        return;
+    };
+    let tray = tray.0.lock().unwrap();
+    let Some(tray) = tray.as_ref() else { return };
+    if controlled {
+        tray.set_icon(Some(red_tray_icon())).ok();
+        tray.set_tooltip(Some(format!("云书 · 正在被 {who} 远程控制")))
+            .ok();
+    } else {
+        if let Some(icon) = DEFAULT_ICON.get() {
+            tray.set_icon(Some(icon.clone())).ok();
+        }
+        tray.set_tooltip(Some("云书 · 局域网传书")).ok();
+    }
+    // 菜单项随会话状态启用/禁用
+    use tauri::menu::{Menu, MenuItem};
+    let open = MenuItem::with_id(app, "open", "打开云书", true, None::<&str>);
+    let disconnect = MenuItem::with_id(
+        app,
+        "remote-disconnect",
+        "断开远程控制",
+        controlled,
+        None::<&str>,
+    );
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>);
+    if let (Ok(open), Ok(disconnect), Ok(quit)) = (open, disconnect, quit)
+        && let Ok(menu) = Menu::with_items(app, &[&open, &disconnect, &quit])
+    {
+        tray.set_menu(Some(menu)).ok();
+    }
+}
+
+fn red_tray_icon() -> tauri::image::Image<'static> {
+    const S: usize = 32;
+    let mut rgba = vec![0u8; S * S * 4];
+    let c = (S as f32 - 1.0) / 2.0;
+    for y in 0..S {
+        for x in 0..S {
+            let dx = x as f32 - c;
+            let dy = y as f32 - c;
+            if dx * dx + dy * dy <= c * c {
+                let o = (y * S + x) * 4;
+                rgba[o] = 225;
+                rgba[o + 1] = 45;
+                rgba[o + 2] = 60;
+                rgba[o + 3] = 255;
+            }
+        }
+    }
+    tauri::image::Image::new_owned(rgba, S as u32, S as u32)
+}
+
+static DEFAULT_ICON: std::sync::OnceLock<tauri::image::Image<'static>> = std::sync::OnceLock::new();
+struct TrayHandle(Mutex<Option<tauri::tray::TrayIcon>>);
 
 fn main() {
     // CLI 覆盖（单机双实例测试用）：yunshu.exe --port 8001 --name testa
@@ -298,15 +544,56 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
-        .manage(AppState { ui_tx, cache: Arc::new(Mutex::new(state_snapshot())) })
+        .manage(AppState {
+            ui_tx,
+            cache: Arc::new(Mutex::new(state_snapshot())),
+            remote_view: Mutex::new(None),
+        })
         .setup(move |app| {
             let handle = app.handle().clone();
             let cache = app.state::<AppState>().cache.clone();
             // 核心事件 → 前端（同时维护初始状态快照）
             std::thread::spawn(move || {
-                let mut done_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut done_seen: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 while let Ok(ev) = event_rx.recv() {
                     apply_to_cache(&cache, &ev);
+                    match &ev {
+                        // 连接成功：登记观看信息并自动打开观看窗口
+                        CoreEvent::RemoteViewReady {
+                            peer_id,
+                            name,
+                            token,
+                            port,
+                            width,
+                            height,
+                        } => {
+                            let info = RemoteViewInfo {
+                                token: token.clone(),
+                                port: *port,
+                                name: name.clone(),
+                                peer_id: peer_id.clone(),
+                                width: *width,
+                                height: *height,
+                            };
+                            *handle.state::<AppState>().remote_view.lock().unwrap() =
+                                Some(info.clone());
+                            open_viewer_window(&handle, &info);
+                        }
+                        CoreEvent::RemoteSessionEnded { side, .. } if side == "controller" => {
+                            *handle.state::<AppState>().remote_view.lock().unwrap() = None;
+                        }
+                        // 被控端醒目指示（托盘变红 + 一键断开）
+                        CoreEvent::RemoteSessionStarted { name, side, .. }
+                            if side == "controlled" =>
+                        {
+                            set_tray_controlled(&handle, true, name);
+                        }
+                        CoreEvent::RemoteSessionEnded { side, .. } if side == "controlled" => {
+                            set_tray_controlled(&handle, false, "");
+                        }
+                        _ => {}
+                    }
                     // 传输完成且窗口隐藏时弹系统通知
                     if let CoreEvent::TransferUpdate { t } = &ev
                         && t.status == yunshu_core::TransferStatus::Done
@@ -331,9 +618,25 @@ fn main() {
             // 托盘
             use tauri::menu::{Menu, MenuItem};
             let open = MenuItem::with_id(app, "open", "打开云书", true, None::<&str>)?;
+            let disconnect = MenuItem::with_id(
+                app,
+                "remote-disconnect",
+                "断开远程控制",
+                false,
+                None::<&str>,
+            )?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &quit])?;
-            tauri::tray::TrayIconBuilder::new()
+            let menu = Menu::with_items(app, &[&open, &disconnect, &quit])?;
+            if let Some(icon) = app.default_window_icon() {
+                // 转 owned（引用生命周期绑在 app 上，OnceLock 需要 'static）
+                let owned = tauri::image::Image::new_owned(
+                    icon.rgba().to_vec(),
+                    icon.width(),
+                    icon.height(),
+                );
+                let _ = DEFAULT_ICON.set(owned);
+            }
+            let tray = tauri::tray::TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("云书 · 局域网传书")
                 .menu(&menu)
@@ -344,6 +647,12 @@ fn main() {
                             let _ = w.show();
                             let _ = w.set_focus();
                         }
+                    }
+                    "remote-disconnect" => {
+                        app.state::<AppState>()
+                            .ui_tx
+                            .send(UiRequest::RemoteDisconnect)
+                            .ok();
                     }
                     "quit" => app.exit(0),
                     _ => {}
@@ -363,6 +672,7 @@ fn main() {
                     }
                 })
                 .build(app)?;
+            app.manage(TrayHandle(Mutex::new(Some(tray))));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -386,13 +696,34 @@ fn main() {
             stage_blob,
             get_settings,
             save_settings,
-            set_dnd
+            set_dnd,
+            remote_connect,
+            remote_disconnect,
+            remote_assist_request,
+            remote_assist_respond,
+            get_view_info
         ])
         .on_window_event(|window, event| {
-            // 关闭 = 隐藏进托盘；退出走托盘菜单
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let _ = window.hide();
-                api.prevent_close();
+            match window.label() {
+                // 主窗口关闭 = 隐藏进托盘；退出走托盘菜单
+                "main" => {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        let _ = window.hide();
+                        api.prevent_close();
+                    }
+                }
+                // 观看窗口关闭 = 断开远程控制会话
+                "remote-viewer" => {
+                    if let tauri::WindowEvent::CloseRequested { .. } = event {
+                        window
+                            .app_handle()
+                            .state::<AppState>()
+                            .ui_tx
+                            .send(UiRequest::RemoteDisconnect)
+                            .ok();
+                    }
+                }
+                _ => {}
             }
         })
         .run(tauri::generate_context!())

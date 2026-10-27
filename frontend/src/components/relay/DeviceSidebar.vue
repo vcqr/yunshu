@@ -6,7 +6,7 @@
  */
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
-  FileUp, FolderUp, Laptop, Lock, MessagesSquare, Radio, Satellite, Smartphone,
+  FileUp, FolderUp, Laptop, Lock, MessagesSquare, MonitorUp, HandMetal, Radio, Satellite, Smartphone,
 } from '@lucide/vue'
 import RelayAvatar from './RelayAvatar.vue'
 import UnreadBadge from './UnreadBadge.vue'
@@ -88,6 +88,21 @@ function ctxDisconnect() {
   if (!d) return
   relayActions.disconnectPeer(d.id)
   toast.info(`已断开与「${d.name}」的连接`)
+}
+/** 右键发起远程控制（打开密码弹窗） */
+function ctxRemoteControl() {
+  const d = ctx.value?.device
+  closeCtx()
+  if (!d) return
+  emit('select', d.id)
+  relayActions.openControlDialog(d.machineId || '', d.name)
+}
+/** 右键请求对方协助（反向协助：对方同意后自动建连） */
+function ctxAssistRequest() {
+  const d = ctx.value?.device
+  closeCtx()
+  if (!d) return
+  relayActions.assistRequest(d.id)
 }
 
 /* 手机右键：发送文件/文件夹（需已配对） */
@@ -243,7 +258,7 @@ async function ctxSendFolderPhone() {
             role="tab"
             :aria-selected="store.selectedPeer === d.id"
             :class="cn(
-              'flex h-10 w-full items-center gap-2.5 rounded-lg px-2 text-left transition-colors md:h-9',
+              'group flex h-10 w-full items-center gap-2.5 rounded-lg px-2 text-left transition-colors md:h-9',
               'focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none',
               store.selectedPeer === d.id
                 ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300'
@@ -259,6 +274,18 @@ async function ctxSendFolderPhone() {
               :title="d.name"
             >
               {{ d.name }}
+            </span>
+            <span
+              v-if="d.machineId"
+              role="button"
+              tabindex="0"
+              aria-label="远程控制"
+              title="远程控制"
+              class="hidden size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-emerald-600 group-hover:flex"
+              @click.stop="relayActions.openControlDialog(d.machineId, d.name)"
+              @keydown.enter.stop="relayActions.openControlDialog(d.machineId, d.name)"
+            >
+              <MonitorUp class="size-3.5" />
             </span>
             <Lock
               v-if="store.fingerprints[d.id]"
@@ -298,6 +325,22 @@ async function ctxSendFolderPhone() {
           <button class="flex min-h-9 w-full items-center gap-2 rounded-md px-2.5 hover:bg-accent" @click="ctxSelect">
             <MessagesSquare class="size-3.5 text-emerald-600 dark:text-emerald-400" />
             打开会话
+          </button>
+          <button
+            v-if="ctx.device.machineId"
+            class="flex min-h-9 w-full items-center gap-2 rounded-md px-2.5 hover:bg-accent"
+            @click="ctxRemoteControl"
+          >
+            <MonitorUp class="size-3.5 text-emerald-600 dark:text-emerald-400" />
+            远程控制…
+          </button>
+          <button
+            v-if="ctx.device.online"
+            class="flex min-h-9 w-full items-center gap-2 rounded-md px-2.5 hover:bg-accent"
+            @click="ctxAssistRequest"
+          >
+            <HandMetal class="size-3.5 text-amber-500" />
+            请求协助控制对方
           </button>
           <div class="bg-border my-1 h-px"></div>
           <button class="flex min-h-9 w-full items-center gap-2 rounded-md px-2.5 hover:bg-accent" @click="ctxSendFiles">

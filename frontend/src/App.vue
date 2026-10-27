@@ -6,7 +6,7 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { Bird, ShieldCheck } from '@lucide/vue'
+import { Bird, HandMetal, MonitorUp, ShieldAlert, ShieldCheck } from '@lucide/vue'
 import AppHeader from './components/relay/AppHeader.vue'
 import DeviceSidebar from './components/relay/DeviceSidebar.vue'
 import ChatPanel from './components/relay/ChatPanel.vue'
@@ -52,10 +52,21 @@ function rejectTrust() {
 
 /* ------------------------------ 设置 ------------------------------ */
 const showSettings = ref(false)
-const settingsForm = ref({ device_name: '', port: 34256, save_dir: '', autostart: false, dnd_mode: false })
+const settingsForm = ref({
+  device_name: '', port: 34256, save_dir: '', autostart: false, dnd_mode: false,
+  machine_id: '', remote_fixed_password: '', has_fixed_password: false,
+})
 async function openSettings() {
   const s = await invoke<any>('get_settings').catch(() => null)
-  if (s) settingsForm.value = { ...s }
+  if (s) {
+    settingsForm.value = {
+      device_name: s.device_name, port: s.port, save_dir: s.save_dir,
+      autostart: s.autostart, dnd_mode: s.dnd_mode,
+      machine_id: s.machine_id || '',
+      remote_fixed_password: '', has_fixed_password: !!s.remote_fixed_password_hash,
+    }
+    mutations.setRemoteMachineId(s.machine_id || null)
+  }
   showSettings.value = true
 }
 async function browseSaveDir() {
@@ -68,15 +79,53 @@ async function saveSettings() {
   try {
     await invoke('save_settings', {
       deviceName: s.device_name, port: s.port, saveDir: s.save_dir, autostart: s.autostart, dndMode: s.dnd_mode,
+      // 未输入新密码则不动现有固定密码
+      remoteFixedPassword: s.remote_fixed_password === '' ? null : s.remote_fixed_password,
     })
     store.meName = s.device_name
     store.dnd = s.dnd_mode
+    if (s.remote_fixed_password !== '') s.has_fixed_password = true
     toast.success('设置已保存（端口、目录重启后生效）')
     showSettings.value = false
   } catch (e) {
     toast.error(`保存失败：${String(e)}`)
   }
 }
+/** 清除固定密码（无人值守访问关闭） */
+async function clearFixedPassword() {
+  try {
+    await invoke('save_settings', {
+      deviceName: settingsForm.value.device_name, port: settingsForm.value.port,
+      saveDir: settingsForm.value.save_dir, autostart: settingsForm.value.autostart,
+      dndMode: settingsForm.value.dnd_mode, remoteFixedPassword: '',
+    })
+    settingsForm.value.has_fixed_password = false
+    settingsForm.value.remote_fixed_password = ''
+    toast.success('固定密码已清除')
+  } catch (e) {
+    toast.error(`清除失败：${String(e)}`)
+  }
+}
+
+/* --------------------------- 远程控制弹窗 --------------------------- */
+const controlForm = ref({ password: '', connecting: false })
+async function submitControl() {
+  const d = store.controlDialog
+  if (!d || controlForm.value.connecting) return
+  if (!controlForm.value.password.trim()) {
+    toast.error('请输入对方机器的密码')
+    return
+  }
+  controlForm.value.connecting = true
+  relayActions.remoteConnect(d.machine_id, controlForm.value.password.trim())
+  // 连接结果由 remote_view_ready / remote_connect_failed 事件收尾
+  setTimeout(() => { controlForm.value.connecting = false }, 4000)
+}
+function closeControlDialog() {
+  mutations.closeControlDialog()
+  controlForm.value = { password: '', connecting: false }
+}
+const currentAssist = computed(() => store.assistRequests[0] ?? null)
 
 /* ------------------------------ 生命周期 ------------------------------ */
 onMounted(async () => {
@@ -97,6 +146,24 @@ onMounted(async () => {
       @open-settings="openSettings"
       @toggle-sidebar="sidebarOpen = true"
     />
+
+    <!-- 被控醒目横幅（安全要求：被控状态必须持续可见 + 一键断开） -->
+    <div
+      v-if="store.remoteControlled"
+      class="flex h-10 shrink-0 items-center justify-between gap-3 bg-red-600 px-4 text-white"
+      role="alert"
+    >
+      <div class="flex min-w-0 items-center gap-2 text-sm font-medium">
+        <ShieldAlert class="size-4 shrink-0 animate-pulse" />
+        <span class="truncate">「{{ store.remoteControlled.name }}」正在远程控制这台电脑</span>
+      </div>
+      <button
+        class="shrink-0 rounded-lg bg-white/15 px-3 py-1 text-xs font-semibold hover:bg-white/25"
+        @click="relayActions.remoteDisconnect()"
+      >
+        断开控制
+      </button>
+    </div>
 
     <main class="flex min-h-0 flex-1 overflow-hidden">
       <!-- 侧栏：md+ 常驻 -->
@@ -141,6 +208,59 @@ onMounted(async () => {
 
     <!-- 接收请求队列弹窗 -->
     <OfferDialog />
+
+    <!-- 远程协助请求（反向协助） -->
+    <div v-if="currentAssist" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45" @click.self="relayActions.assistRespond(currentAssist.peer_id, false)">
+      <div class="bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
+        <div class="mb-1 flex items-center gap-2.5 text-base font-semibold">
+          <HandMetal class="size-5 text-amber-500" />
+          远程协助请求
+        </div>
+        <p class="mb-1 text-sm">「{{ currentAssist.name }}」请求远程控制这台电脑</p>
+        <p class="mb-4 text-xs text-muted-foreground">同意后将生成一次性密码并自动发送给对方，仅本次连接有效（5 分钟内）</p>
+        <div class="flex justify-end gap-2">
+          <button class="rounded-lg border px-4 py-2 text-sm hover:bg-accent" @click="relayActions.assistRespond(currentAssist.peer_id, false)">拒绝</button>
+          <button class="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700" @click="relayActions.assistRespond(currentAssist.peer_id, true)">
+            允许控制
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 远程控制密码弹窗 -->
+    <div v-if="store.controlDialog" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45" @click.self="closeControlDialog">
+      <div class="bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
+        <div class="mb-1 flex items-center gap-2.5 text-base font-semibold">
+          <MonitorUp class="size-5 text-emerald-600" />
+          远程控制
+        </div>
+        <p class="mb-3 text-sm">正在连接「{{ store.controlDialog.name }}」</p>
+        <label class="mb-1 block text-xs font-medium text-muted-foreground">对方机器 ID</label>
+        <div class="mb-3 rounded-lg border bg-muted/30 px-3 py-2 font-mono text-sm tracking-widest">
+          {{ store.controlDialog.machine_id }}
+        </div>
+        <label class="mb-1 block text-xs font-medium text-muted-foreground">对方密码（临时 / 固定 / 一次性）</label>
+        <input
+          v-model="controlForm.password"
+          type="password"
+          maxlength="32"
+          placeholder="输入对方屏幕上显示的密码"
+          class="mb-1 h-9 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+          @keydown.enter="submitControl"
+        />
+        <p class="mb-4 text-[11px] text-muted-foreground">密码在加密通道内传输；连续输错 5 次将被锁定 10 分钟</p>
+        <div class="flex justify-end gap-2">
+          <button class="rounded-lg border px-4 py-2 text-sm hover:bg-accent" @click="closeControlDialog">取消</button>
+          <button
+            class="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-60"
+            :disabled="controlForm.connecting"
+            @click="submitControl"
+          >
+            {{ controlForm.connecting ? '连接中…' : '连接' }}
+          </button>
+        </div>
+      </div>
+    </div>
 
     <!-- 新设备信任确认（TOFU） -->
     <div v-if="currentTrust" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45" @click.self="rejectTrust">
@@ -211,6 +331,49 @@ onMounted(async () => {
             <input v-model="settingsForm.dnd_mode" type="checkbox" class="size-4 accent-emerald-600" />
             防打扰（仅已信任设备可连接，广播消息静音）
           </label>
+
+          <div class="mt-2 border-t pt-3">
+            <p class="mb-2 text-xs font-semibold text-foreground">远程控制</p>
+            <div class="grid grid-cols-2 gap-2.5">
+              <label class="grid gap-1">
+                <span class="text-xs font-medium text-muted-foreground">本机机器 ID</span>
+                <div class="flex h-9 items-center rounded-lg border bg-muted/30 px-3 font-mono text-sm tracking-widest">
+                  {{ settingsForm.machine_id || '——' }}
+                </div>
+              </label>
+              <label class="grid gap-1">
+                <span class="text-xs font-medium text-muted-foreground">临时密码（重启更换）</span>
+                <div class="flex h-9 items-center rounded-lg border bg-muted/30 px-3 font-mono text-sm tracking-widest">
+                  {{ store.remoteTempPassword || '——' }}
+                </div>
+              </label>
+            </div>
+            <label class="mt-2.5 grid gap-1">
+              <span class="text-xs font-medium text-muted-foreground">
+                固定密码{{ settingsForm.has_fixed_password ? '（已设置，输入可更换，留空保持不变）' : '（无人值守访问用，重启仍有效）' }}
+              </span>
+              <div class="flex gap-2">
+                <input
+                  v-model="settingsForm.remote_fixed_password"
+                  type="password"
+                  maxlength="32"
+                  :placeholder="settingsForm.has_fixed_password ? '••••••••（留空不变，输入即更换）' : '设置长期固定密码'"
+                  autocomplete="new-password"
+                  class="h-9 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                />
+                <button
+                  v-if="settingsForm.has_fixed_password"
+                  class="h-9 shrink-0 rounded-lg border px-3 text-xs text-red-600 hover:bg-red-500/10 dark:text-red-400"
+                  @click="clearFixedPassword"
+                >
+                  清除
+                </button>
+              </div>
+            </label>
+            <p class="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
+              其他云书凭「机器 ID + 密码」即可控制本机（密码正确即授权）。macOS 需授予「屏幕录制」与「辅助功能」权限。
+            </p>
+          </div>
         </div>
         <p class="mt-3 text-xs text-muted-foreground">端口、目录修改后需重启云书生效</p>
         <div class="mt-4 flex justify-end gap-2">
@@ -227,7 +390,10 @@ onMounted(async () => {
         :key="t.id"
         :class="cn(
           'max-w-sm rounded-xl px-4 py-2.5 text-sm shadow-lg backdrop-blur',
-          t.kind === 'error' ? 'bg-red-600/95 text-white' : t.kind === 'success' ? 'bg-emerald-600/95 text-white' : 'bg-slate-800/95 text-white'
+          t.kind === 'error' ? 'bg-red-600/95 text-white'
+            : t.kind === 'warning' ? 'bg-amber-500/95 text-white'
+            : t.kind === 'success' ? 'bg-emerald-600/95 text-white'
+            : 'bg-slate-800/95 text-white'
         )"
         role="status"
       >
