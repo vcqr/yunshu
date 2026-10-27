@@ -336,8 +336,8 @@ function connect() {
   catch (_) { ws = null; scheduleRetry(); return; }
   ws.onopen = () => {
     stopRetry();
-    show('pairing');
-    send({ type: 'hello', token: token, device: $('device-name').value.trim() || deviceName() });
+    if (!paired) show('pairing');
+    send({ type: 'hello', token: token, device: $('device-name').value.trim() || deviceName(), session: session });
   };
   ws.onmessage = e => { try { handle(JSON.parse(e.data)); } catch (_) {} };
   ws.onclose = () => {
@@ -345,15 +345,16 @@ function connect() {
     if (!paired) {
       show('connecting');
       $('conn-text').textContent = '连接断开，正在重连…';
-      scheduleRetry();
     } else {
+      // 配对态掉线（锁屏/切后台）：状态置灰并自动重连，重连时凭会话恢复，聊天记录保留
       setPcOnline(false);
     }
+    scheduleRetry();
   };
   ws.onerror = () => {};
 }
 function scheduleRetry() {
-  if (retryTimer || paired || tokenDead) return;
+  if (retryTimer || tokenDead) return;
   retryTimer = setTimeout(() => { retryTimer = null; connect(); }, 2000);
 }
 function stopRetry() {
@@ -380,6 +381,8 @@ function handle(m) {
         show('main');
       } else {
         setPairBusy(false);
+        // 恢复会话失败（电脑重启/被新配对顶替/主动断开过）：退回正常配对流程
+        if (paired) { paired = false; setPcOnline(false); show('pairing'); }
         $('pair-err').textContent = m.reason || '配对失败';
         const otp = $('otp');
         otp.classList.add('shake');
@@ -387,6 +390,7 @@ function handle(m) {
         if ((m.reason || '').indexOf('过期') >= 0) {
           tokenDead = true;
           stopRetry();
+          paired = false;
           show('connecting');
           $('conn-text').textContent = '二维码已过期，请重新扫码';
           $('btn-reload').classList.remove('hidden');

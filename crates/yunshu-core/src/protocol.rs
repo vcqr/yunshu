@@ -6,8 +6,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsIn {
-    /// 携带二维码里的 token 发起配对
-    Hello { token: String, device: String },
+    /// 携带二维码里的 token 发起配对；session 非空时优先尝试断线恢复（免重新扫码）
+    Hello {
+        token: String,
+        device: String,
+        #[serde(default)]
+        session: Option<String>,
+    },
     /// 提交 6 位配对码
     Pair { code: String },
     /// 发送文本到电脑（写入剪贴板）

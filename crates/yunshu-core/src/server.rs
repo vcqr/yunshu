@@ -946,8 +946,21 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
             continue;
         };
         match input {
-            WsIn::Hello { token, device } => {
+            WsIn::Hello { token, device, session } => {
                 let mut p = st.pairing.lock().unwrap();
+                // 断线恢复：手机锁屏/切后台会断 WS，重连时带着原会话回来免重新扫码
+                if let Some(s) = session.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                    && p.session_valid(s)
+                {
+                    paired = true;
+                    let _ = out_tx2.send(serde_json::to_string(&WsOut::PairResult {
+                        ok: true, session: Some(s.to_string()), reason: None,
+                        pc_name: Some(st.cfg.pc_name.clone()),
+                    }).unwrap());
+                    tracing::info!("手机「{}」恢复会话", device.trim());
+                    st.emit(CoreEvent::PairOk { device: device.trim().to_string() });
+                    continue;
+                }
                 if !p.token_valid(&token) {
                     let _ = out_tx2.send(serde_json::to_string(&WsOut::PairResult {
                         ok: false, session: None,
@@ -956,14 +969,8 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
                     }).unwrap());
                     break;
                 }
-                if p.has_session() {
-                    let _ = out_tx2.send(serde_json::to_string(&WsOut::PairResult {
-                        ok: false, session: None,
-                        reason: Some("已有其他设备连接，请先在电脑端断开".into()),
-                        pc_name: None,
-                    }).unwrap());
-                    break;
-                }
+                // 注：不再以 has_session 拒绝——WS 入口已保证同一时间仅一条连接，
+                // 会话跨连接保留后，新配对直接覆盖旧会话（旧设备恢复会失败并回到扫码流程）
                 let device = if device.trim().is_empty() { "手机".into() } else { device.trim().to_string() };
                 let code = p.begin_pending(device.clone());
                 drop(p);
@@ -1006,9 +1013,9 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
         }
     }
 
-    // 清理
+    // 清理。注意不清 pairing 会话：手机锁屏/切后台断 WS 后重连要靠它静默恢复，
+    // 旧下载链接也因此保持有效；会话仅被新配对覆盖或电脑端主动断开时重置
     *st.conn.lock().unwrap() = None;
-    st.pairing.lock().unwrap().reset();
     writer.abort();
     st.emit(CoreEvent::PeerDisconnected);
 }
@@ -1032,15 +1039,10 @@ fn offer_file(st: &Arc<AppState>, path: PathBuf) {
 async fn download(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Query(q): Query<HashMap<String, String>>,
+    Query(_q): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(s) = q.get("s") else {
-        return err_page(StatusCode::UNAUTHORIZED, "未配对");
-    };
-    // 该端点现在只服务手机浏览器（电脑间文件走加密推送通道）
-    if !st.pairing.lock().unwrap().session_valid(s) {
-        return err_page(StatusCode::UNAUTHORIZED, "会话已失效，请重新配对");
-    }
+    // 文件 id 本身（uuid simple，128 位不可猜测）即下载凭证；
+    // 不再校验配对会话——否则手机断线（锁屏/切后台）后所有旧下载链接全部失效
     let Some((path, name, size)) = st.offers.lock().unwrap().get(&id).cloned() else {
         return err_page(StatusCode::NOT_FOUND, "文件不存在或已被清理");
     };
