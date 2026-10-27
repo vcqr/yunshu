@@ -70,6 +70,7 @@ impl Settings {
     }
 
     /// 写/删 HKCU\...\Run 键。返回描述结果的文本。
+    #[cfg(windows)]
     pub fn apply_autostart(enable: bool) -> Result<(), String> {
         use winreg::enums::*;
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -87,5 +88,11 @@ impl Settings {
                 Err(e) => Err(e.to_string()),
             }
         }
+    }
+
+    /// 非 Windows 平台暂未实现开机自启
+    #[cfg(not(windows))]
+    pub fn apply_autostart(_enable: bool) -> Result<(), String> {
+        Err("开机自启暂不支持当前平台".into())
     }
 }
