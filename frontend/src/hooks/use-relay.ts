@@ -355,18 +355,29 @@ export async function startRelay() {
   }
 
   if (!isTauri) return
-  await listen('core-event', (e: any) => { void apply(e.payload) })
+  // 各监听独立注册互不拖垮：曾因一处注册失败导致整个 startRelay 中断、
+  // App.vue 里排在 await startRelay() 之后的 yunshu-drop 监听永远挂不上
+  await listen('core-event', (e: any) => { void apply(e.payload) }).catch((e) => {
+    console.error('[yunshu] core 事件监听注册失败', e)
+    toast.error(`核心事件监听注册失败：${String(e).slice(0, 80)}`)
+  })
   // 拖拽必须走 onDragDropEvent：裸 tauri://drag-drop 的载荷只有 paths/position，
   // enter/over/drop/leave 的 type 字段是这层封装归一化出来的，裸听永远匹配不上
-  await getCurrentWebview().onDragDropEvent((e: any) => {
-    const p = e.payload || {}
-    if (p.type === 'enter' || p.type === 'over') {
-      if (p.paths?.length) dragState.active = true
-    } else if (p.type === 'leave' || p.type === 'drop') {
-      dragState.active = false
-    }
-    if (p.type === 'drop' && p.paths?.length) {
-      window.dispatchEvent(new CustomEvent('yunshu-drop', { detail: p.paths as string[] }))
-    }
-  })
+  try {
+    await getCurrentWebview().onDragDropEvent((e: any) => {
+      const p = e.payload || {}
+      if (p.type === 'enter' || p.type === 'over') {
+        if (p.paths?.length) dragState.active = true
+      } else if (p.type === 'leave' || p.type === 'drop') {
+        dragState.active = false
+      }
+      if (p.type === 'drop' && p.paths?.length) {
+        window.dispatchEvent(new CustomEvent('yunshu-drop', { detail: p.paths as string[] }))
+      }
+    })
+    console.log('[yunshu] 拖拽事件监听已注册')
+  } catch (e) {
+    console.error('[yunshu] 拖拽事件监听注册失败', e)
+    toast.error(`拖拽监听注册失败：${String(e).slice(0, 80)}`)
+  }
 }

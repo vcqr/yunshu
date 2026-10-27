@@ -13,7 +13,7 @@ import ChatPanel from './components/relay/ChatPanel.vue'
 import TransferPanel from './components/relay/TransferPanel.vue'
 import OfferDialog from './components/relay/OfferDialog.vue'
 import StatusBar from './components/relay/StatusBar.vue'
-import { startRelay } from './hooks/use-relay'
+import { startRelay, relayActions } from './hooks/use-relay'
 import { store, mutations, toggleTransferPanelPersist, restoreTransferPanelPref, restoreChatStylePref } from './stores/relay-store'
 import { toast, toastState } from './hooks/use-toast'
 import { cn } from './lib/utils'
@@ -82,11 +82,12 @@ async function saveSettings() {
 onMounted(async () => {
   restoreTransferPanelPref()
   restoreChatStylePref()
+  // 拖拽落点监听不依赖 startRelay 完成，先挂上（startRelay 里任何一步失败都不能影响它）
+  window.addEventListener('yunshu-drop', onDrop)
   // 无边框窗口：标题栏双击/三击守卫 + 窗口状态跟随（最大化/全屏图标切换）
   installTauriDblclickGuard()
   initWindowControls()
   await startRelay()
-  window.addEventListener('yunshu-drop', onDrop)
 })
 </script>
 
