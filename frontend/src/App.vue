@@ -384,7 +384,7 @@ onMounted(async () => {
           </label>
           <label class="flex items-center gap-2.5 text-sm">
             <input v-model="settingsForm.dnd_mode" type="checkbox" class="size-4 accent-emerald-600" />
-            防打扰（仅已信任设备可连接，广播消息静音）
+            防打扰（仅已信任设备可连接，广播消息静音；首次启动默认开启）
           </label>
           <label class="flex items-center gap-2.5 text-sm">
             <input v-model="settingsForm.stealth_mode" type="checkbox" class="size-4 accent-emerald-600" />

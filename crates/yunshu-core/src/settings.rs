@@ -29,7 +29,8 @@ impl Default for Settings {
             https_port: 34257,
             save_dir,
             autostart: false,
-            dnd_mode: false,
+            // 首次启动默认开启防打扰（仅已信任设备可连接）；已有配置文件里显式的 false 不受影响
+            dnd_mode: true,
             stealth_mode: false,
             remote_fixed_password_hash: None,
         }

@@ -437,6 +437,7 @@ export async function startRelay() {
   const settings = await invoke<any>('get_settings').catch(() => ({}))
   if (settings.device_name) store.meName = settings.device_name
   mutations.setDnd(!!settings.dnd_mode)
+  store.stealth = !!settings.stealth_mode
 
   const snap = await invoke<any>('get_state').catch(() => null)
   if (snap) {
