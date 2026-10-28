@@ -3751,7 +3751,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonbot"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-util",
  "serde",
@@ -6918,7 +6918,7 @@ dependencies = [
 
 [[package]]
 name = "yunshu-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -6933,7 +6933,7 @@ dependencies = [
 
 [[package]]
 name = "yunshu-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "axum",
