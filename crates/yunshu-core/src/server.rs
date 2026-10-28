@@ -1604,7 +1604,7 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
                 if text.is_empty() {
                     continue;
                 }
-                crate::clipboard::copy_text(&text);
+                // 手机发来的文本按普通聊天消息处理，不写入电脑剪贴板
                 let chars = text.chars().count();
                 st.new_transfer(TransferInfo::text(
                     uuid::Uuid::new_v4().simple().to_string(),

@@ -178,18 +178,20 @@ async function apply(ev: any) {
         toast.info('手机已断开')
       }
       break
-    case 'text_from_phone':
-      // 手机发来的文本按普通消息展示（core 侧仍会同步写入电脑剪贴板）
+    case 'text_from_phone': {
+      // 手机发来的文本按普通消息展示，无剪贴板副作用
+      const name = store.phoneConnected ? store.phoneName : '手机'
       mutations.addMessage({
-        id: uuid(), from: 'phone', fromName: store.phoneConnected ? store.phoneName : '手机', to: 'me',
+        id: uuid(), from: 'phone', fromName: name, to: 'me',
         kind: 'text', content: ev.text, createdAt: Date.now(),
       })
       if (store.selectedPeer !== 'phone') {
         mutations.bumpUnread('phone')
-        toast.info('手机发来了文本（已复制到电脑剪贴板）')
+        toast.info(`${name}：${ev.text}`)
         flashTaskbar()
       }
       break
+    }
     case 'toast':
       toast.info(ev.text)
       break

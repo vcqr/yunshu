@@ -15,7 +15,7 @@ pub enum WsIn {
     },
     /// 提交 6 位配对码
     Pair { code: String },
-    /// 发送文本到电脑（写入剪贴板）
+    /// 手机发送文本消息（PC 端按普通聊天消息展示）
     SendText { text: String },
 }
 
