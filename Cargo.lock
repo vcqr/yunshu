@@ -3528,6 +3528,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-video-toolbox"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05bf9a3c14831a7d9641b0d81d87dd913ee238a012b2fde27db5a84b56f5df3e"
+dependencies = [
+ "bitflags 2.13.2",
+ "block2",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-foundation",
+ "objc2-metal",
+]
+
+[[package]]
 name = "objc2-web-kit"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6926,6 +6943,10 @@ dependencies = [
  "futures-util",
  "if-addrs",
  "jpeg-encoder",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-video-toolbox",
  "openh264",
  "pbkdf2",
  "rand 0.10.3",

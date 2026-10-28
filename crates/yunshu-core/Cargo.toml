@@ -33,6 +33,13 @@ jpeg-encoder = "0.7"
 pbkdf2 = "0.13"
 openh264 = { version = "0.9.9", features = ["source"] }
 
+[target.'cfg(target_vendor = "apple")'.dependencies]
+# VideoToolbox 硬件 H.264 编码（encoder.rs 的 VtH264Encoder）
+objc2-core-foundation = "0.3"
+objc2-core-media = { version = "0.3", features = ["CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMSync", "CMTime"] }
+objc2-core-video = { version = "0.3", features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferPool"] }
+objc2-video-toolbox = { version = "0.3", features = ["VTBase", "VTErrors", "VTSession", "VTCompressionSession", "VTCompressionProperties", "VTUtilities"] }
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56.0"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

@@ -111,9 +111,9 @@ bot 参数：第 1 个为 bot→app 推送批次的测试大小（默认 1MB）�
 
 **视频编码自适应**：默认 H.264（Baseline，SPS/PPS 随关键帧内联），观看端通过 WebCodecs
 硬解（WebView2 / Safari 16.4+ 均支持）；观看端不支持 WebCodecs 或出错自动回退 JPEG。
-编码器抽象成 trait（openh264 软编全平台一致，MediaFoundation/VideoToolbox 硬编可按
-trait 接入），画面不变跳帧、链路拥塞丢帧后自动强推关键帧，并按编码耗时/丢帧率在
-质量 40-80、帧率 12-25fps 间自适应。
+编码器抽象成 trait：H.264 优先硬编（macOS VideoToolbox 已落地，Windows
+MediaFoundation 计划中），不可用回退 openh264 软编（全平台一致），画面不变跳帧、
+链路拥塞丢帧后自动强推关键帧，并按编码耗时/丢帧率在质量 40-80、帧率 12-25fps 间自适应。
 
 **手机只看不控**：观看会话中主窗口出现「手机观看」按钮，扫码即可在手机浏览器查看
 受控屏幕（只读凭证独立于控制凭证，接入后视频自动降为 JPEG 保证兼容）。
@@ -169,8 +169,8 @@ netsh advfirewall firewall add rule name="yunshu-disc"  dir=in action=allow prot
 - 手机端同一时间只允许一台设备连接
 - 远程控制仅登录后场景（看不到 UAC/锁屏/安全桌面）；Windows 服务化可在登录前拉起
   会话代理，但锁屏画面本身仍不可见
-- 远程控制 H.264 当前为 openh264 软编（屏幕内容优化），MediaFoundation / VideoToolbox
-  硬编可按 encoder trait 接入
+- 远程控制 H.264 在 Windows 上为 openh264 软编（macOS 已走 VideoToolbox 硬编），
+  MediaFoundation 硬编按 encoder trait 接入中
 - macOS 免登录（LaunchDaemon + 锁屏可见）受登录窗口上下文 TCC 限制，不做
 
 ## 技术栈
@@ -185,6 +185,6 @@ Rust workspace：
 
 ## 后续计划
 
-- H.264 硬编落地（MediaFoundation / VideoToolbox，encoder trait 已就绪）
+- H.264 硬编 Windows MediaFoundation 落地（macOS VideoToolbox 已完成，硬编优先、软编兜底）
 - 观看端多路同看、会话录制
 - 远程控制画质按 RTT 精细自适应（当前按编码耗时/丢帧）
