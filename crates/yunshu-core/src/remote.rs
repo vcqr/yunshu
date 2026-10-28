@@ -516,20 +516,30 @@ pub trait ScreenSource: Send {
 }
 
 pub struct XcapSource {
-    monitors: Vec<xcap::Monitor>,
+    monitors: Vec<SendMonitor>,
     current: usize,
 }
+
+/// xcap::Monitor 因内部裸指针未实现 Send，但其字段均为进程级资源 ID
+/// （Windows HMONITOR GDI 句柄 / macOS CGDirectDisplayID / Linux X11 Output id），
+/// 跨线程使用安全；XcapSource 创建后整体 move 进采集线程，全程单线程访问。
+struct SendMonitor(xcap::Monitor);
+unsafe impl Send for SendMonitor {}
 
 impl XcapSource {
     /// 主屏；取不到主屏时退回第一个显示器
     pub fn new() -> Option<Self> {
-        let monitors = xcap::Monitor::all().ok()?;
+        let monitors: Vec<SendMonitor> = xcap::Monitor::all()
+            .ok()?
+            .into_iter()
+            .map(SendMonitor)
+            .collect();
         if monitors.is_empty() {
             return None;
         }
         let current = monitors
             .iter()
-            .position(|m| m.is_primary().unwrap_or(false))
+            .position(|m| m.0.is_primary().unwrap_or(false))
             .unwrap_or(0);
         Some(XcapSource { monitors, current })
     }
@@ -540,14 +550,14 @@ impl ScreenSource for XcapSource {
         let Some(m) = self.monitors.get(self.current) else {
             return (0, 0);
         };
-        match (m.width(), m.height()) {
+        match (m.0.width(), m.0.height()) {
             (Ok(w), Ok(h)) if w > 0 && h > 0 => (w, h),
             _ => (0, 0),
         }
     }
 
     fn capture(&mut self) -> Option<Frame> {
-        let img = self.monitors.get(self.current)?.capture_image().ok()?;
+        let img = self.monitors.get(self.current)?.0.capture_image().ok()?;
         Some(Frame {
             width: img.width(),
             height: img.height(),
@@ -561,9 +571,9 @@ impl ScreenSource for XcapSource {
             .enumerate()
             .map(|(i, m)| MonitorInfo {
                 index: i as u32,
-                name: m.name().unwrap_or_else(|_| format!("显示器 {}", i + 1)),
-                width: m.width().unwrap_or(0),
-                height: m.height().unwrap_or(0),
+                name: m.0.name().unwrap_or_else(|_| format!("显示器 {}", i + 1)),
+                width: m.0.width().unwrap_or(0),
+                height: m.0.height().unwrap_or(0),
             })
             .collect()
     }
@@ -584,6 +594,9 @@ pub struct FakeSource {
     pub width: u32,
     pub height: u32,
     t: u32,
+    /// YUNSHU_FAKE_SCREEN_STATIC=1：内容静止（复现"画面不变不再发帧"场景，
+    /// 用于心跳补帧回归测试）
+    static_mode: bool,
 }
 
 impl FakeSource {
@@ -592,6 +605,7 @@ impl FakeSource {
             width: 320,
             height: 200,
             t: 0,
+            static_mode: std::env::var("YUNSHU_FAKE_SCREEN_STATIC").is_ok(),
         }
     }
 }
@@ -607,7 +621,9 @@ impl ScreenSource for FakeSource {
         (self.width, self.height)
     }
     fn capture(&mut self) -> Option<Frame> {
-        self.t = self.t.wrapping_add(1);
+        if !self.static_mode {
+            self.t = self.t.wrapping_add(1);
+        }
         let mut rgba = vec![0u8; (self.width * self.height * 4) as usize];
         for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let x = (i % self.width as usize) as u32;
@@ -1235,12 +1251,17 @@ pub async fn handle_remote_socket(
         let cap_codec = codec_flag.clone();
         let cap_monitor = monitor_switch.clone();
         let cap_bounds = bounds.clone();
-        let (cap_tx, cap_rx) = std::sync::mpsc::sync_channel::<RemoteOut>(64);
+        // tokio mpsc：采集线程用 try_send（同步上下文安全），relay 用 recv().await
+        // 正确让出 worker——std 阻塞 recv 在静止画面下会把 worker 扣为人质
+        // （帧间隔可达秒级），饿死同 worker LIFO 槽里的其他任务（观看桥/会话主循环）
+        let (cap_tx, mut cap_rx) = tokio::sync::mpsc::channel::<RemoteOut>(64);
         let capture_thread = std::thread::Builder::new()
             .name("remote-capture".into())
             .spawn(move || {
                 let mut last_hash = 0u64;
                 let mut seq = 0u32;
+                // 心跳补帧计时：画面静止时周期性补发可解码帧
+                let mut last_sent = Instant::now();
                 let mut encoder: Option<Box<dyn crate::encoder::VideoEncoder>> = None;
                 let mut enc_width = 0u32;
                 let mut enc_height = 0u32;
@@ -1282,7 +1303,11 @@ pub async fn handle_remote_socket(
                     if let Some(f) = source.capture() {
                         let scaled = scale_frame(&f, max_side);
                         let hash = fnv_hash(&scaled.rgba);
-                        if hash != last_hash {
+                        // 静止画面每秒补发一帧（H.264 下强制 IDR）：首帧可能早于观看端
+                        // 接入而被观看桥丢弃（无订阅者），补帧保证观看端接入后 1s 内
+                        // 必拿到可解码画面；H.264 中途加入的观看端也借此拿到关键帧
+                        let heartbeat = last_sent.elapsed() >= Duration::from_secs(1);
+                        if hash != last_hash || heartbeat {
                             // 编码器惰性创建/随 codec 与分辨率变化重建
                             let want_codec = cap_codec.load(Ordering::Relaxed);
                             let need_rebuild = match encoder.as_ref() {
@@ -1317,8 +1342,9 @@ pub async fn handle_remote_socket(
                                 }
                             }
                             let te = Instant::now();
-                            let encoded =
-                                encoder.as_mut().and_then(|e| e.encode(&scaled, force_next));
+                            let encoded = encoder
+                                .as_mut()
+                                .and_then(|e| e.encode(&scaled, force_next || heartbeat));
                             stat_encode_ms += te.elapsed().as_millis() as u64;
                             force_next = false;
                             if let Some(ef) = encoded {
@@ -1344,6 +1370,7 @@ pub async fn handle_remote_socket(
                                 }
                                 if sent_any {
                                     last_hash = hash;
+                                    last_sent = Instant::now();
                                 } else {
                                     // 整帧被丢：指纹回退 + 下帧强推关键帧（观看端尽快恢复）
                                     last_hash = hash.wrapping_add(1);
@@ -1396,7 +1423,7 @@ pub async fn handle_remote_socket(
         }
         let out_tx2 = out_tx.clone();
         tokio::spawn(async move {
-            while let Ok(msg) = cap_rx.recv() {
+            while let Some(msg) = cap_rx.recv().await {
                 if out_tx2.send(msg).await.is_err() {
                     break;
                 }
@@ -2451,6 +2478,20 @@ pub async fn handle_view_socket(
                     },
                 );
                 view.recompute_codec();
+            }
+            Some("prefer_codec") if !readonly => {
+                // 观看端解码失败请求回退：{"t":"prefer_codec","codec":"jpeg"}
+                // → 本连接按仅 JPEG 重登记，受控端随之切回 JPEG
+                if v.get("codec").and_then(|x| x.as_str()) == Some("jpeg") {
+                    let remote = st.remote.lock().unwrap();
+                    if let Some(view) = remote.viewing.as_ref() {
+                        view.viewer_caps
+                            .lock()
+                            .unwrap()
+                            .insert(conn_id, crate::encoder::CODEC_JPEG);
+                        view.recompute_codec();
+                    }
+                }
             }
             Some("end") if !readonly => {
                 if let Some(view) = st.remote.lock().unwrap().viewing.as_ref()

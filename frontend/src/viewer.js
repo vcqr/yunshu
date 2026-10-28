@@ -129,7 +129,8 @@ function ensureDecoder() {
         send({ t: 'prefer_codec', codec: 'jpeg' }) // 回退 JPEG
       },
     })
-    videoDecoder.configure({ codec: 'avc1.42001f', optimizeForLatency: true })
+    // Baseline L4.0：1920×1200 需 ≥L3.2，留余量到 4K 内
+    videoDecoder.configure({ codec: 'avc1.420028', optimizeForLatency: true })
     decoderReady = videoDecoder.state === 'configured'
   } catch {
     decoderFailed = true

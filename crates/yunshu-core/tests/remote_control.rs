@@ -25,12 +25,15 @@ fn init_test_env() -> tempfile_guard::Guard {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     // 集成测试进程独占：HOME/XDG 重定向后 load_machine_key 等写临时目录
+    // 静态合成源：复现真实场景（受控桌面静止，首帧早于观看端接入被桥丢弃），
+    // 心跳补帧是唯一让观看端拿到画面的途径——本测试即心跳回归测试
     // SAFETY: 测试进程启动早期（单线程 tokio test 尚未拉起业务线程前）调用，
     // 且本测试二进制内没有并发读取这些变量的其他测试
     unsafe {
         std::env::set_var("HOME", &dir);
         std::env::set_var("XDG_CONFIG_HOME", &dir);
         std::env::set_var("YUNSHU_FAKE_SCREEN", "1");
+        std::env::set_var("YUNSHU_FAKE_SCREEN_STATIC", "1");
     }
     tempfile_guard::Guard(dir)
 }
@@ -151,6 +154,10 @@ async fn send_auth(
 #[tokio::test(flavor = "multi_thread")]
 async fn remote_control_auth_stream_and_lockout() {
     let _guard = init_test_env();
+    // 放出 serve 内部日志（--nocapture 可见）
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("debug"))
+        .try_init();
 
     let (event_tx, event_rx) = std::sync::mpsc::channel::<CoreEvent>();
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<yunshu_core::UiRequest>();
@@ -312,6 +319,17 @@ async fn remote_control_auth_stream_and_lockout() {
                 .as_bytes(),
         );
         ws.send(Message::binary(seal(&noise, &end))).await.unwrap();
+        // 后台持续排空帧流：否则受控端 sink.send 被 TCP 背压卡住，
+        // 主循环停在发送分支，永远处理不到 remote_end（会话不结束）
+        let drain = tokio::spawn(async move {
+            while let Ok(Some(Ok(msg))) =
+                timeout(Duration::from_secs(10), ws.next()).await
+            {
+                if matches!(msg, Message::Close(_)) {
+                    break;
+                }
+            }
+        });
 
         // 受控端应发会话结束事件
         let ended = loop {
@@ -326,7 +344,7 @@ async fn remote_control_auth_stream_and_lockout() {
             }
         };
         let _ = ended;
-        let _ = ws.close(None).await;
+        let _ = drain.abort();
     }
     panic_if_session_started(&mut ev_rx).await;
 
