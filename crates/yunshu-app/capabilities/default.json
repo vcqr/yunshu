@@ -8,6 +8,7 @@
   ],
   "permissions": [
     "core:default",
+    "core:app:allow-version",
     "dialog:default",
     "notification:default",
     "core:webview:allow-set-webview-background-color",

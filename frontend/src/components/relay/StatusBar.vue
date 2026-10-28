@@ -3,11 +3,18 @@
  * StatusBar：桌面软件式底部状态栏（类 VS Code / 传统桌面应用）
  * 左：品牌 · 连接 · 在线统计；右：实时传输进度（lg+ 点击可展开传输面板）
  */
-import { computed } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { Bird, LoaderCircle } from '@lucide/vue'
+import { getVersion } from '@tauri-apps/api/app'
 import { formatBytes, transferTitle } from '../../lib/relay-format'
 import { store, openTransferPanelPersist } from '../../stores/relay-store'
 import { cn } from '../../lib/utils'
+
+/** 软件版本（tauri.conf.json 的 version）；纯浏览器预览拿不到则不显示 */
+const version = ref('')
+onMounted(() => {
+  getVersion().then((v) => (version.value = v)).catch(() => {})
+})
 
 const onlineCount = computed(() => store.devices.length + (store.phoneConnected ? 1 : 0))
 
@@ -44,10 +51,11 @@ const percent = computed(() =>
     class="mt-auto flex h-7 shrink-0 items-center gap-3 border-t bg-muted/40 px-3 text-[11px] text-muted-foreground select-none"
     aria-label="状态栏"
   >
-    <!-- 品牌 -->
+    <!-- 品牌 · 版本 -->
     <span class="flex items-center gap-1.5 font-medium">
       <Bird class="size-3 text-emerald-500" aria-hidden="true" />
       <span class="hidden sm:inline">云书</span>
+      <span v-if="version" class="font-normal tabular-nums text-muted-foreground/70">v{{ version }}</span>
     </span>
 
     <span class="h-3 w-px bg-border" aria-hidden="true" />
