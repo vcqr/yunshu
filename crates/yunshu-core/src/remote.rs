@@ -1538,7 +1538,8 @@ pub async fn handle_remote_socket(
                     }
                     Ok(RemoteIn::Control(RemoteWire::RemoteQuality { max_width, quality })) => {
                         let mut p = params.lock().unwrap();
-                        p.max_width = max_width.clamp(480, 3840);
+                        // 0 = 原始分辨率（不缩放）；其余限制在合理范围
+                        p.max_width = if max_width == 0 { 0 } else { max_width.clamp(480, 3840) };
                         p.quality = quality.clamp(30, 95);
                         p.interval_ms = 50; // 档位切换后自适应重新起步
                     }
@@ -2519,8 +2520,17 @@ pub async fn handle_view_socket(
                 }
             }
             Some("quality") if !readonly => {
-                let tier = v.get("tier").and_then(|x| x.as_u64()).unwrap_or(1920);
-                let (max_width, quality) = quality_tier(tier as u32);
+                // 新观看页显式发送 {max_side, quality}（max_side=0 表示原始分辨率）；
+                // 兼容旧格式 {tier}：按画质档位映射
+                let (max_width, quality) =
+                    if let (Some(mw), Some(q)) = (
+                        v.get("max_side").and_then(|x| x.as_u64()),
+                        v.get("quality").and_then(|x| x.as_u64()),
+                    ) {
+                        (mw as u32, q as u8)
+                    } else {
+                        quality_tier(v.get("tier").and_then(|x| x.as_u64()).unwrap_or(1920) as u32)
+                    };
                 let _ = out_tx.try_send(RemoteOut::Control(RemoteWire::RemoteQuality {
                     max_width,
                     quality,

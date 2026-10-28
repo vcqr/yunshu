@@ -52,10 +52,18 @@
     <span class="dot" id="dot"></span>
     <span id="status">连接中…</span>
     <select id="monitor" title="显示器" style="display:none"></select>
-    <select id="quality" title="画质">
+    <select id="quality" title="画质（压缩质量，自适应浮动）">
       <option value="720">流畅</option>
       <option value="1080">高清</option>
       <option value="1920" selected>超清</option>
+    </select>
+    <select id="resolution" title="画面分辨率（最长边；原始=被控屏幕分辨率）">
+      <option value="auto" selected>自动</option>
+      <option value="0">原始</option>
+      <option value="3840">4K</option>
+      <option value="2560">2K</option>
+      <option value="1920">1080p</option>
+      <option value="1280">720p</option>
     </select>
     <button id="sendfile" title="向对方电脑传文件（也可直接拖文件进窗口）">传文件</button>
     <button id="fullscreen" title="全屏（F11 也可）">全屏</button>

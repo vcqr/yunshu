@@ -16,6 +16,7 @@ const maskText = document.getElementById('maskText')
 const spinner = document.getElementById('spinner')
 const hint = document.getElementById('hint')
 const qualitySel = document.getElementById('quality')
+const resolutionSel = document.getElementById('resolution')
 const monitorSel = document.getElementById('monitor')
 const fullscreenBtn = document.getElementById('fullscreen')
 
@@ -145,8 +146,9 @@ function layout() {
 /* fps 统计（含 0fps 自愈：剪贴板提示等临时文案 1 秒内被覆盖） */
 setInterval(() => {
   const zoomLabel = zoom > 1 ? ` · ×${zoom.toFixed(1)}` : ''
+  const dimLabel = imgW && imgH ? ` · ${imgW}×${imgH}` : ''
   statusEl.textContent =
-    ws && ws.readyState === 1 ? `${peerName} · ${frameCount} fps · ${currentCodec === 1 ? 'H.264' : 'JPEG'}${zoomLabel}` : '未连接'
+    ws && ws.readyState === 1 ? `${peerName} · ${frameCount} fps · ${currentCodec === 1 ? 'H.264' : 'JPEG'}${dimLabel}${zoomLabel}` : '未连接'
   frameCount = 0
   // 远程软光标 2 秒无更新（只看模式/旧版本对端）→ 清除并恢复本地光标
   if (remoteCursor && performance.now() - remoteCursor.ts > 2000) {
@@ -349,9 +351,21 @@ function toggleFullscreen() {
     document.documentElement.requestFullscreen().catch(() => {})
   }
 }
-qualitySel.addEventListener('change', () => {
-  send({ t: 'quality', tier: Number(qualitySel.value) })
-})
+/** 画质档位基线（与受控端 quality_tier 一致） */
+const TIER_QUALITY = { 720: 55, 1080: 65, 1920: 75 }
+
+/** 发送画质：分辨率下拉钉住时显式指定最长边（0=原始），否则跟随画质档位 */
+function sendQuality() {
+  const tier = Number(qualitySel.value)
+  const res = resolutionSel.value
+  if (res === 'auto') {
+    send({ t: 'quality', tier })
+  } else {
+    send({ t: 'quality', max_side: Number(res), quality: TIER_QUALITY[tier] ?? 75 })
+  }
+}
+qualitySel.addEventListener('change', sendQuality)
+resolutionSel.addEventListener('change', sendQuality)
 monitorSel.addEventListener('change', () => {
   send({ t: 'monitor', index: Number(monitorSel.value) })
 })
@@ -383,7 +397,7 @@ async function main() {
   ws.onopen = () => {
     hideMask()
     dot.classList.remove('off')
-    send({ t: 'quality', tier: Number(qualitySel.value) })
+    sendQuality()
     // 上报解码能力（WebCodecs 可用才启用 H.264）
     const h264 = typeof VideoDecoder !== 'undefined' && !!ensureDecoder()
     send({ t: 'caps', h264 })
@@ -446,6 +460,11 @@ async function main() {
 function fillMonitors(monitors) {
   const cur = monitorSel.value
   monitorSel.innerHTML = ''
+  // 被控端真实屏幕分辨率 → "原始"选项动态标注
+  if (monitors.length && resolutionSel) {
+    const raw = resolutionSel.querySelector('option[value="0"]')
+    if (raw) raw.textContent = `原始（${monitors[0].width}×${monitors[0].height}）`
+  }
   if (!monitors.length) {
     const opt = document.createElement('option')
     opt.value = '0'
