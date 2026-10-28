@@ -30,7 +30,7 @@ struct RemoteViewInfo {
 
 fn state_snapshot() -> serde_json::Value {
     json!({
-        "addr": null, "error": null, "qr_url": null,
+        "addr": null, "error": null, "qr_url": null, "qr_alts": [],
         "pending": null, "connected": null,
         "peers": [], "transfers": [], "toasts": [],
         "remote_temp_password": null, "remote_controlled": null,
@@ -50,6 +50,9 @@ fn apply_to_cache(cache: &Mutex<serde_json::Value>, ev: &CoreEvent) {
         }
         CoreEvent::QrUrl(url) => {
             obj.insert("qr_url".into(), json!(url));
+        }
+        CoreEvent::QrAlternates(urls) => {
+            obj.insert("qr_alts".into(), json!(urls));
         }
         CoreEvent::PairPending { code, device } => {
             obj.insert("pending".into(), json!({ "code": code, "device": device }));

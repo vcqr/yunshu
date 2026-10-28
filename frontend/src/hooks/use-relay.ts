@@ -142,6 +142,9 @@ async function apply(ev: any) {
     case 'qr_url':
       mutations.setQrUrl(ev.url)
       break
+    case 'qr_alternates':
+      mutations.setQrAlts(ev.urls || [])
+      break
     case 'pair_pending':
       mutations.setPairPending({ code: ev.code, device: ev.device })
       mutations.setSelectedPeer('phone')
@@ -413,6 +416,7 @@ export async function startRelay() {
     mutations.setServerAddr(snap.addr || '')
     mutations.setServerError(snap.error)
     mutations.setQrUrl(snap.qr_url)
+    if (Array.isArray(snap.qr_alts)) mutations.setQrAlts(snap.qr_alts)
     if (snap.fingerprints) store.fingerprints = snap.fingerprints
     mutations.setPairPending(snap.pending)
     if (snap.connected) mutations.setPhoneConnected(snap.connected)

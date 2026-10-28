@@ -11,6 +11,7 @@ import MessageList from './MessageList.vue'
 import Composer from './Composer.vue'
 import { store, filterEntriesForPeer, setChatStylePersist } from '../../stores/relay-store'
 import { relayActions, dragState } from '../../hooks/use-relay'
+import { toast } from '../../hooks/use-toast'
 
 const props = defineProps<{ peer: string }>()
 
@@ -36,6 +37,16 @@ watch(
   },
   { immediate: true }
 )
+
+/* 复制备用直达地址 */
+async function copyAlt(u: string) {
+  try {
+    await navigator.clipboard.writeText(u)
+    toast.info(`已复制：${u}`)
+  } catch {
+    toast.info(u)
+  }
+}
 
 /* 拖拽遮罩状态（由 use-relay 的全局拖拽事件驱动） */
 const dragActive = computed(() => dragState.active && store.selectedPeer === props.peer)
@@ -78,6 +89,19 @@ function switchChatStyle() {
             二维码生成中…
           </div>
           <p class="text-xs text-muted-foreground">手机扫码 · 浏览器打开 · 免安装</p>
+          <!-- 扫码地址不对时的备用直达地址（全部网卡，随配对码轮换刷新） -->
+          <div v-if="store.qrAlts.length" class="mt-2 w-[240px] space-y-1">
+            <p class="text-[10px] font-medium text-muted-foreground">扫不上？手动访问（点击复制）：</p>
+            <button
+              v-for="u in store.qrAlts"
+              :key="u"
+              class="block w-full truncate rounded bg-muted/40 px-2 py-1 text-left text-[10px] text-muted-foreground transition-colors hover:text-foreground"
+              :title="u"
+              @click="copyAlt(u)"
+            >
+              {{ u }}
+            </button>
+          </div>
         </div>
       </div>
     </template>

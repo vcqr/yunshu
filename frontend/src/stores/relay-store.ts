@@ -64,6 +64,7 @@ export const store = reactive<RelayState>({
   serverAddr: '',
   serverError: null,
   qrUrl: null,
+  qrAlts: [] as string[],
   fingerprints: {},
   trustRequests: [],
   pairPending: null,
@@ -88,6 +89,7 @@ export const mutations = {
   },
   setServerError(e: string) { store.serverError = e },
   setQrUrl(u: string) { store.qrUrl = u },
+  setQrAlts(list: string[]) { store.qrAlts = list },
   setPairPending(p: { code: string; device: string } | null) { store.pairPending = p },
   setPhoneConnected(name: string | null) {
     store.phoneConnected = !!name

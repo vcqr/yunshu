@@ -153,6 +153,8 @@ pub enum CoreEvent {
     },
     /// 新的二维码地址（每 60 秒轮换 token）
     QrUrl(String),
+    /// 二维码备用直达地址（全部网卡 http/https，随 pair token 轮换刷新）
+    QrAlternates(Vec<String>),
     PairPending {
         code: String,
         device: String,

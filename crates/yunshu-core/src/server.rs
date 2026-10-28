@@ -193,17 +193,33 @@ impl AppState {
     }
 }
 
+/// 默认路由所在网卡的 IPv4：UDP connect 只做路由选择、不发包，
+/// 避免多网卡机器（WSL/Hyper-V/虚拟机网卡）误选虚拟地址。仅接受私有网段。
+fn default_route_ip() -> Option<IpAddr> {
+    let s = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    s.connect(("8.8.8.8", 80)).ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    matches!(ip, IpAddr::V4(v) if v.is_private()).then_some(ip)
+}
+
+/// 全部候选局域网 IPv4（默认路由网卡优先，其余私有地址随后）
+fn all_lan_ips() -> Vec<IpAddr> {
+    let mut v: Vec<IpAddr> = default_route_ip().into_iter().collect();
+    if let Ok(addrs) = if_addrs::get_if_addrs() {
+        for i in addrs {
+            if let IpAddr::V4(v4) = i.ip()
+                && v4.is_private()
+                && !v.contains(&IpAddr::V4(v4))
+            {
+                v.push(IpAddr::V4(v4));
+            }
+        }
+    }
+    v
+}
+
 fn lan_ip() -> Option<IpAddr> {
-    let addrs = if_addrs::get_if_addrs().ok()?;
-    let v4: Vec<IpAddr> = addrs
-        .into_iter()
-        .map(|i| i.ip())
-        .filter(|ip| matches!(ip, IpAddr::V4(_)))
-        .collect();
-    v4.iter()
-        .find(|ip| matches!(ip, IpAddr::V4(v) if v.is_private()))
-        .or_else(|| v4.iter().find(|ip| !ip.is_loopback()))
-        .copied()
+    all_lan_ips().into_iter().next()
 }
 
 pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver<UiRequest>) {
@@ -269,13 +285,27 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
         let st = state.clone();
         let ip_str = ip.to_string();
         let https_port = cfg.https_port;
+        let http_port = cfg.port;
+        let candidates = all_lan_ips();
         tokio::spawn(async move {
             loop {
                 let token = uuid::Uuid::new_v4().simple().to_string();
                 st.pairing.lock().unwrap().add_token(token.clone());
                 let url = format!("https://{ip_str}:{https_port}/pair?t={token}");
+                // 备用直达地址（二维码地址不对时手动访问）：全部候选网卡的
+                // http（免证书警告）/ https 两种形式，随 token 轮换同步刷新
+                let mut alts: Vec<String> = Vec::new();
+                for c in &candidates {
+                    let c = c.to_string();
+                    alts.push(format!("http://{c}:{http_port}"));
+                    let alt_https = format!("https://{c}:{https_port}/pair?t={token}");
+                    if alt_https != url {
+                        alts.push(alt_https);
+                    }
+                }
                 tracing::info!("二维码刷新: {url}");
                 st.emit(CoreEvent::QrUrl(url));
+                st.emit(CoreEvent::QrAlternates(alts));
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });
