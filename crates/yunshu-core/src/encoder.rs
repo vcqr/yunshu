@@ -18,6 +18,11 @@ mod videotoolbox;
 #[cfg(target_vendor = "apple")]
 use videotoolbox::VtH264Encoder;
 
+#[cfg(windows)]
+mod mediafoundation;
+#[cfg(windows)]
+use mediafoundation::MfH264Encoder;
+
 /// 线上 codec 标识（'V' 帧头 / RemoteUseCodec / 桥 JSON 共用）
 pub const CODEC_JPEG: u8 = 0;
 pub const CODEC_H264: u8 = 1;
@@ -119,7 +124,7 @@ impl VideoEncoder for H264VideoEncoder {
     }
 }
 
-/// 创建编码器；H.264 优先硬件编码（macOS VideoToolbox / 未来 Windows
+/// 创建编码器；H.264 优先硬件编码（macOS VideoToolbox / Windows
 /// MediaFoundation），不可用回退 openh264 软编；H.264 全部失败返回 None
 /// （调用方回退 JPEG）
 pub fn make_encoder(
@@ -134,6 +139,11 @@ pub fn make_encoder(
             #[cfg(target_vendor = "apple")]
             if let Some(e) = VtH264Encoder::new(width, height, fps) {
                 tracing::info!("远程控制编码器: h264 / videotoolbox（硬编）");
+                return Some(Box::new(e));
+            }
+            #[cfg(windows)]
+            if let Some(e) = MfH264Encoder::new(width, height, fps) {
+                tracing::info!("远程控制编码器: h264 / mediafoundation（硬编）");
                 return Some(Box::new(e));
             }
             let enc = H264VideoEncoder::new(width, height, fps)
