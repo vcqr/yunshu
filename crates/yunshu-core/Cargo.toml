@@ -21,7 +21,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 urlencoding = "2.1.3"
 uuid = { version = "1.29.0", features = ["v4"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 toml = "1.1.8"
 zip = { version = "9.1.0", default-features = false, features = ["deflate"] }
 rcgen = "0.14.10"
@@ -35,4 +35,4 @@ openh264 = { version = "0.9.9", features = ["source"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56.0"
-windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
