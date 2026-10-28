@@ -99,9 +99,28 @@ jobs:
       - name: build tauri app
         shell: bash
         run: |
+          set -o pipefail
           cd crates/yunshu-app
-          # tauri.conf.json 的 beforeBuildCommand 会自动构建 frontend（npm run build）
-          ../../frontend/node_modules/.bin/tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+          # tauri.conf.json 的 beforeBuildCommand 会自动构建 frontend（npm run build）；
+          # 输出 tee 到文件，供失败时的 annotation 诊断步骤使用
+          ../../frontend/node_modules/.bin/tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} 2>&1 | tee build-output.log
+
+      # 构建日志在 Actions 网页需登录查看：失败时把错误尾部转成 error annotation，
+      # 公开仓库匿名经 API（check-runs/{id}/annotations）即可读取
+      - name: report build errors (annotations)
+        if: failure()
+        shell: bash
+        run: |
+          LOG=crates/yunshu-app/build-output.log
+          if [ ! -f "$LOG" ]; then
+            echo "::error::build-output.log 不存在——在 tee 之前就失败了，检查 build 步骤的命令本身"
+            exit 0
+          fi
+          {
+            grep -aiE "error(\[|:| )|panicked|npm error|failed to|No such file" "$LOG" | tail -12
+            echo "-------- 最后 25 行 --------"
+            tail -25 "$LOG"
+          } | tr -d '\r' | cut -c1-360 | sed 's/^/::error::/'
 
       # Windows 便携版（免安装压缩包）：单 exe（WebView2 依赖系统自带的
       # Evergreen 运行时，Win11 内置；Win10 缺失时安装包会自动补装而便携包不会）
