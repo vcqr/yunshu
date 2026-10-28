@@ -34,10 +34,29 @@ async function refreshWinState(): Promise<void> {
   }
 }
 
+/** 圆角窗口：真全屏时摘掉圆角 class——全屏铺满整屏，CSS 圆角会在屏幕四角
+ *  露出透明缺口；最大化 / macOS 绿钮缩放 / Win11 贴边分屏保留圆角（与原生
+ *  应用行为一致）。class 在 index.html 预置，保证首帧就是圆角。 */
+function applyRoundedForFullscreen(): void {
+  if (!appWin) return
+  const apply = async () => {
+    try {
+      document.body.classList.toggle('window-rounded', !(await appWin!.isFullscreen()))
+    } catch {
+      /* not in tauri */
+    }
+  }
+  void apply()
+  void appWin.onResized(() => void apply()).catch(() => {
+    /* not in tauri */
+  })
+}
+
 /** App.vue 挂载时调用：刷新窗口状态并跟随 resize（最大化/还原、全屏状态切换图标） */
 export function initWindowControls(): void {
   if (!appWin) return
   void refreshWinState()
+  applyRoundedForFullscreen()
   void appWin.onResized(() => void refreshWinState()).catch(() => {
     /* not in tauri */
   })

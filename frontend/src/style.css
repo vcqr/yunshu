@@ -69,12 +69,37 @@
 @layer base {
   * { border-color: var(--color-border); outline-color: color-mix(in oklab, var(--color-ring) 50%, transparent); }
   html, body, #app { height: 100%; }
+  /* body 背景透明：窗口圆角（body.window-rounded）外的四角透出桌面，
+     页面底色由 App 根节点 .airpigeon-bg 承担 */
   body {
-    background: var(--color-background);
+    background: transparent;
     color: var(--color-foreground);
     font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
   }
   button, a, [role="button"] { -webkit-tap-highlight-color: transparent; }
+}
+
+/* 无边框窗口圆角（tauri.conf.json：transparent + shadow:false）：
+   圆角画在 body 上；投影交给 ::after 伪元素——直接写在圆角容器上的
+   box-shadow 会超出圆角范围，亮色桌面下形成灰色矩形边框 */
+body.window-rounded {
+  border-radius: 10px;
+  overflow: hidden;
+  /* body 有 transform 即成为 position:fixed 后代的包含块：
+     toast/弹窗/悬浮按钮等 fixed 元素原本不受 body 圆角裁剪（方角会
+     盖住窗口圆角），纳入后统一被裁掉；body 占满视口，fixed 几何不变 */
+  transform: translateZ(0);
+}
+body.window-rounded::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: -1;
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.22),
+    0 2px 8px rgba(0, 0, 0, 0.14);
 }
 
 /* 页面背景：极淡 emerald 渐变 */

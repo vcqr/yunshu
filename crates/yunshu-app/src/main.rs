@@ -777,6 +777,11 @@ fn main() {
             remote_view: Mutex::new(None),
         })
         .setup(move |app| {
+            // 圆角窗口：WebView 背景强制全透明（0,0,0,0），否则 WebView 默认底色
+            // 会从 CSS 圆角外的四角露出色块（窗口 transparent/shadow:false 见 tauri.conf.json）
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.set_background_color(Some(tauri::webview::Color(0, 0, 0, 0)));
+            }
             let handle = app.handle().clone();
             let cache = app.state::<AppState>().cache.clone();
             // 核心事件 → 前端（同时维护初始状态快照）
