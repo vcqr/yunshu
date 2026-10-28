@@ -103,6 +103,9 @@ pub enum RemoteWire {
     RemoteSelectMonitor { index: u32 },
     /// 受控端 → 控制端：屏幕信息更新（显示器切换后）
     RemoteScreen { screen: ScreenInfo },
+    /// 受控端 → 控制端：光标位置（相对当前采集显示器的归一化坐标）。
+    /// GDI 采集画面不含光标，观看端据此绘制软光标
+    RemoteCursor { x: f32, y: f32 },
     /// 控制端 → 受控端：文件回传邀请（受控端自动接受，存「远程回传」目录）
     RemoteFileOffer {
         id: String,
@@ -513,6 +516,12 @@ pub trait ScreenSource: Send {
     fn monitors(&self) -> Vec<MonitorInfo>;
     /// 切换采集显示器；返回是否成功
     fn set_monitor(&mut self, index: u32) -> bool;
+    /// 当前光标在采集显示器上的归一化位置。
+    /// GDI 采集画面不含光标，观看端据此绘制软光标；
+    /// 平台暂不支持 / 光标不在采集屏内返回 None
+    fn cursor(&self) -> Option<(f32, f32)> {
+        None
+    }
 }
 
 pub struct XcapSource {
@@ -586,6 +595,28 @@ impl ScreenSource for XcapSource {
         } else {
             false
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn cursor(&self) -> Option<(f32, f32)> {
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        let m = self.monitors.get(self.current)?;
+        // 显示器在虚拟桌面中的原点 + 尺寸，光标坐标归一化到 [0,1]
+        let mx = m.0.x().ok()?;
+        let my = m.0.y().ok()?;
+        let w = m.0.width().ok()?;
+        let h = m.0.height().ok()?;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let mut pt = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut pt) } == 0 {
+            return None;
+        }
+        let x = (pt.x - mx) as f32 / w as f32;
+        let y = (pt.y - my) as f32 / h as f32;
+        ((0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y)).then_some((x, y))
     }
 }
 
@@ -1262,6 +1293,9 @@ pub async fn handle_remote_socket(
                 let mut seq = 0u32;
                 // 心跳补帧计时：画面静止时周期性补发可解码帧
                 let mut last_sent = Instant::now();
+                // 光标回传状态（观看端软光标）
+                let mut last_cursor: Option<(f32, f32)> = None;
+                let mut last_cursor_sent = Instant::now();
                 let mut encoder: Option<Box<dyn crate::encoder::VideoEncoder>> = None;
                 let mut enc_width = 0u32;
                 let mut enc_height = 0u32;
@@ -1399,6 +1433,37 @@ pub async fn handle_remote_socket(
                                 stat_frames = 0;
                                 stat_encode_ms = 0;
                             }
+                        }
+                    }
+                    // 分辨率/显示器配置变化：更新坐标空间并推送屏幕信息（编码器随
+                    // 采集尺寸变化自动重建）；否则观看端坐标系与实际不一致
+                    let b = source.input_bounds();
+                    if b != *cap_bounds.lock().unwrap() {
+                        *cap_bounds.lock().unwrap() = b;
+                        let _ = cap_tx.try_send(RemoteOut::Control(RemoteWire::RemoteScreen {
+                            screen: ScreenInfo {
+                                width: 0,
+                                height: 0,
+                                logical_w: b.0,
+                                logical_h: b.1,
+                                monitors: source.monitors(),
+                            },
+                        }));
+                        tracing::info!("屏幕配置变化：{}x{}", b.0, b.1);
+                    }
+                    // 光标位置回传（33ms 节流，仅移动时发送）
+                    if last_cursor_sent.elapsed() >= Duration::from_millis(33)
+                        && let Some((cx, cy)) = source.cursor()
+                    {
+                        let moved = last_cursor.is_none_or(|(lx, ly)| {
+                            (lx - cx).abs() > 0.0005 || (ly - cy).abs() > 0.0005
+                        });
+                        if moved {
+                            last_cursor = Some((cx, cy));
+                            last_cursor_sent = Instant::now();
+                            let _ = cap_tx.try_send(RemoteOut::Control(
+                                RemoteWire::RemoteCursor { x: cx, y: cy },
+                            ));
                         }
                     }
                     let spent = t0.elapsed();
@@ -2244,6 +2309,12 @@ async fn remote_connect_inner(
                             .to_string(),
                         ));
                     }
+                    Ok(RemoteIn::Control(RemoteWire::RemoteCursor { x, y })) => {
+                        // 光标位置 → 观看端软光标
+                        let _ = bridge_tx.send(BridgeMsg::Json(
+                            serde_json::json!({"t": "cursor", "x": x, "y": y}).to_string(),
+                        ));
+                    }
                     Ok(RemoteIn::Control(RemoteWire::RemoteFileAck { id, ok })) => {
                         let src = st.remote.lock().unwrap().send_offers.lock().unwrap().remove(&id);
                         match (ok, src) {
@@ -2777,6 +2848,15 @@ mod tests {
         assert_eq!(id.len(), 8);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(id, machine_id());
+    }
+
+    #[test]
+    fn remote_cursor_wire_tag() {
+        let json = serde_json::to_string(&RemoteWire::RemoteCursor { x: 0.25, y: 0.75 }).unwrap();
+        assert!(json.contains(r#""type":"remote_cursor""#));
+        let back: RemoteWire = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, RemoteWire::RemoteCursor { x, y }
+            if (x - 0.25).abs() < 1e-6 && (y - 0.75).abs() < 1e-6));
     }
 
     #[test]

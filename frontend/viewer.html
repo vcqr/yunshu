@@ -6,6 +6,8 @@
   <style>
     html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0f0e; }
     #screen { display: block; width: 100vw; height: 100vh; cursor: default; outline: none; }
+    /* 远程软光标活动时隐藏本地光标，避免双指针 */
+    #screen.remote-cursor { cursor: none; }
     .overlay {
       position: fixed; top: 10px; right: 12px; z-index: 10;
       display: flex; align-items: center; gap: 8px;

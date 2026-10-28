@@ -34,6 +34,9 @@ let decoderReady = false
 let decoderFailed = false
 let h264SeqUs = 0
 let currentCodec = 0 // 0=JPEG 1=H.264（以收到的帧为准）
+/* 远程软光标：受控端回传光标位置（GDI 采集不含光标），活动时隐藏本地光标 */
+let remoteCursor = null // { x, y, ts }，归一化坐标
+let cursorDirty = false
 
 function showMask(text, spinning) {
   mask.classList.add('show')
@@ -64,12 +67,40 @@ function redraw() {
     ctx2d.imageSmoothingQuality = 'low'
     ctx2d.drawImage(latestFrame, drawRect.x, drawRect.y, w, h)
   }
+  drawRemoteCursor()
+}
+
+/** 远程软光标：经典箭头造型，随归一化坐标落在画面上 */
+function drawRemoteCursor() {
+  if (!remoteCursor || !drawRect.w) return
+  const x = drawRect.x + remoteCursor.x * drawRect.w
+  const y = drawRect.y + remoteCursor.y * drawRect.h
+  const s = Math.max(1.1, canvas.width / 1600) // 随画布分辨率缩放
+  ctx2d.save()
+  ctx2d.translate(x, y)
+  ctx2d.scale(s, s)
+  ctx2d.beginPath()
+  ctx2d.moveTo(0, 0)
+  ctx2d.lineTo(0, 17)
+  ctx2d.lineTo(4.2, 13.2)
+  ctx2d.lineTo(7, 19.5)
+  ctx2d.lineTo(9.4, 18.4)
+  ctx2d.lineTo(6.6, 12.2)
+  ctx2d.lineTo(12, 12)
+  ctx2d.closePath()
+  ctx2d.fillStyle = 'rgba(255,255,255,0.95)'
+  ctx2d.strokeStyle = '#111'
+  ctx2d.lineWidth = 1.6
+  ctx2d.fill()
+  ctx2d.stroke()
+  ctx2d.restore()
 }
 
 function rafLoop() {
-  if (latestFrame) {
+  // 帧位图保留到被新帧替换（替换路径内 dropFrame），光标移动可单独重绘
+  if (latestFrame || cursorDirty) {
+    cursorDirty = false
     redraw()
-    dropFrame()
   }
   requestAnimationFrame(rafLoop)
 }
@@ -87,6 +118,12 @@ setInterval(() => {
   statusEl.textContent =
     ws && ws.readyState === 1 ? `${peerName} · ${frameCount} fps · ${currentCodec === 1 ? 'H.264' : 'JPEG'}` : '未连接'
   frameCount = 0
+  // 远程软光标 2 秒无更新（只看模式/旧版本对端）→ 清除并恢复本地光标
+  if (remoteCursor && performance.now() - remoteCursor.ts > 2000) {
+    remoteCursor = null
+    cursorDirty = true
+    canvas.classList.remove('remote-cursor')
+  }
 }, 1000)
 
 /* ---------- 坐标映射（canvas 物理像素 → [0,1] 归一化） ---------- */
@@ -182,10 +219,12 @@ canvas.addEventListener('pointermove', (e) => {
 })
 canvas.addEventListener('pointerdown', (e) => {
   canvas.focus()
+  if (e.button > 2) return // 侧键（前进/后退）不映射，避免误当左键注入
   const btn = e.button === 1 ? 1 : e.button === 2 ? 2 : 0
   send({ t: 'mouse_down', btn })
 })
 canvas.addEventListener('pointerup', (e) => {
+  if (e.button > 2) return
   const btn = e.button === 1 ? 1 : e.button === 2 ? 2 : 0
   send({ t: 'mouse_up', btn })
 })
@@ -333,6 +372,11 @@ async function main() {
         } else if (m.t === 'codec') {
           // 编码切换提示（首个 H.264 关键帧到达前画面可能短暂停顿）
           if (m.codec === 'h264') ensureDecoder()
+        } else if (m.t === 'cursor') {
+          // 受控端光标位置 → 软光标
+          remoteCursor = { x: m.x, y: m.y, ts: performance.now() }
+          cursorDirty = true
+          canvas.classList.add('remote-cursor')
         } else if (m.t === 'screen') {
           fillMonitors(m.monitors || [])
         } else if (m.t === 'hello') {
