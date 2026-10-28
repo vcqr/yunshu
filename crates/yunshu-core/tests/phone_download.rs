@@ -60,6 +60,7 @@ async fn phone_file_download_stream_completes() {
         save_dir: std::env::temp_dir(),
         pc_name: "e2e下载测试".into(),
         dnd_mode: false,
+        stealth_mode: false,
     };
     tokio::spawn(yunshu_core::server::serve(cfg, event_tx, ui_rx));
 

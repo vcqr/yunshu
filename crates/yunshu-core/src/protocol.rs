@@ -63,6 +63,10 @@ pub enum PigeonWire {
     },
     PigeonWelcome {
         ok: bool,
+        /// 对端本会话 id：发起方据此登记链路。发现流程发起前已从广播得知 id，
+        /// 自助添加（仅知 ip:port）必须靠它——旧版本不带此字段，视为不支持添加
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]

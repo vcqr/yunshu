@@ -266,6 +266,24 @@ fn pigeon_disconnect(state: tauri::State<AppState>, peer_id: String) {
     let _ = state.ui_tx.send(UiRequest::PigeonDisconnect { peer_id });
 }
 
+/// 自助添加主机：登记并立即发起加密连接（重复添加等同重连）
+#[tauri::command]
+fn pigeon_add_host(state: tauri::State<AppState>, addr: String, name: String) {
+    let _ = state.ui_tx.send(UiRequest::PigeonAddHost { addr, name });
+}
+
+/// 移除手动添加的主机（连接中的链路一并断开）
+#[tauri::command]
+fn pigeon_remove_host(state: tauri::State<AppState>, addr: String) {
+    let _ = state.ui_tx.send(UiRequest::PigeonRemoveHost { addr });
+}
+
+/// 手动重连某台已添加的主机
+#[tauri::command]
+fn pigeon_connect_host(state: tauri::State<AppState>, addr: String) {
+    let _ = state.ui_tx.send(UiRequest::PigeonConnectHost { addr });
+}
+
 #[tauri::command]
 fn set_save_dir(state: tauri::State<AppState>, batch: String, dir: Option<String>) {
     let _ = state.ui_tx.send(UiRequest::SetSaveDir {
@@ -500,6 +518,7 @@ fn save_settings(
     save_dir: String,
     autostart: bool,
     dnd_mode: bool,
+    stealth_mode: bool,
     remote_fixed_password: Option<String>,
 ) -> Result<(), String> {
     let mut s = yunshu_core::settings::Settings::load_or_default();
@@ -513,6 +532,10 @@ fn save_settings(
     if s.dnd_mode != dnd_mode {
         let _ = state.ui_tx.send(UiRequest::SetDnd(dnd_mode));
         s.dnd_mode = dnd_mode;
+    }
+    if s.stealth_mode != stealth_mode {
+        let _ = state.ui_tx.send(UiRequest::SetStealth(stealth_mode));
+        s.stealth_mode = stealth_mode;
     }
     s.save()?;
     // 固定密码走 core 通道：哈希 + 落盘 + 热更新校验器（None = 未改动）
@@ -900,6 +923,9 @@ fn main() {
             forget_transfer,
             delete_received_file,
             pigeon_disconnect,
+            pigeon_add_host,
+            pigeon_remove_host,
+            pigeon_connect_host,
             set_save_dir,
             open_folder,
             stage_blob,

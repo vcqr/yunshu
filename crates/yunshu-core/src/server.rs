@@ -59,6 +59,10 @@ pub struct AppState {
     pub(crate) dnd: AtomicBool,
     /// 防打扰下握手后判为未信任的地址（ip:port）→ 时间，10 分钟内不再反复握手
     pub(crate) dnd_skipped: Mutex<HashMap<String, Instant>>,
+    /// 隐身模式：不广播本机、不主动外连（对方主机列表将移除本机）
+    pub(crate) stealth: AtomicBool,
+    /// 退出隐身时置位：发现循环下个 tick 立即补发一次广播（不等常规节奏）
+    pub(crate) announce_now: AtomicBool,
     // ---- 飞鸽（PC↔PC，全链路 Noise 加密）----
     /// UDP 广播听到的电脑（发现表）
     pub(crate) pigeon_peers: Mutex<HashMap<String, crate::pigeon::PeerRecord>>,
@@ -66,10 +70,15 @@ pub struct AppState {
     pub(crate) pigeon_conns: Mutex<HashMap<String, crate::pigeon::PigeonLink>>,
     /// 正在发起连接的 peer（防重入）
     pub(crate) pigeon_connecting: Mutex<std::collections::HashSet<String>>,
+    /// 手动添加的主机：addr -> 记录（持久化 manual_hosts.json，离线也显示在列表）
+    pub(crate) manual_hosts: Mutex<HashMap<String, crate::pigeon::ManualHost>>,
     /// 正在接收的加密推送批次：offer_id -> 组装状态
     pub(crate) recv_files: tokio::sync::Mutex<HashMap<String, BatchRecvState>>,
-    /// 收到邀请、尚未 FileStart 的批次清单：offer_id -> (peer_id, 清单)
+    /// 收到邀请、尚未接受（等用户决策）的批次清单：offer_id -> (peer_id, 清单)
     pub(crate) pigeon_incoming: Mutex<HashMap<String, IncomingBatch>>,
+    /// 用户已接受、等待对方 FileStart 的批次清单：offer_id -> (peer_id, 清单)。
+    /// FileStart 只认这份清单——否则跳过用户决策直接发 FileStart 即可落盘任意文件
+    pub(crate) pigeon_ready: Mutex<HashMap<String, IncomingBatch>>,
     /// 已发出邀请、待对方决策的批次：offer_id -> 来源
     pub(crate) pigeon_offers: Mutex<HashMap<String, BatchSource>>,
     /// 正在推送的文件：offer_id -> 取消标记（推送协程轮询）
@@ -229,9 +238,7 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
     let ip = lan_ip().unwrap_or_else(|| "127.0.0.1".parse().unwrap());
     let addr = format!("{}:{}", ip, cfg.port);
 
-    let data_dir = dirs::config_dir()
-        .map(|d| d.join("yunshu"))
-        .unwrap_or_else(std::env::temp_dir);
+    let data_dir = crate::config_dir().unwrap_or_else(std::env::temp_dir);
     let state = Arc::new(AppState {
         cfg: cfg.clone(),
         self_id: uuid::Uuid::new_v4().simple().to_string(),
@@ -246,11 +253,20 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
         rt_handle: tokio::runtime::Handle::current(),
         dnd: AtomicBool::new(cfg.dnd_mode),
         dnd_skipped: Mutex::new(HashMap::new()),
+        stealth: AtomicBool::new(cfg.stealth_mode),
+        announce_now: AtomicBool::new(false),
         pigeon_peers: Mutex::new(HashMap::new()),
         pigeon_conns: Mutex::new(HashMap::new()),
         pigeon_connecting: Mutex::new(std::collections::HashSet::new()),
+        manual_hosts: Mutex::new(
+            crate::pigeon::load_manual_hosts()
+                .into_iter()
+                .map(|m| (m.addr.clone(), m))
+                .collect(),
+        ),
         recv_files: tokio::sync::Mutex::new(HashMap::new()),
         pigeon_incoming: Mutex::new(HashMap::new()),
+        pigeon_ready: Mutex::new(HashMap::new()),
         pigeon_offers: Mutex::new(HashMap::new()),
         pigeon_push_cancel: Mutex::new(HashMap::new()),
         pigeon_push_paused: Mutex::new(HashMap::new()),
@@ -278,6 +294,23 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
     {
         let st = state.clone();
         tokio::spawn(crate::pigeon::run_discovery(st));
+    }
+
+    // 手动主机后台重连：每 60 秒尝试未连接的手动主机（隐身时不主动外连）
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            loop {
+                if !st.stealth.load(Ordering::Relaxed) {
+                    let addrs: Vec<String> = st.manual_hosts.lock().unwrap().keys().cloned().collect();
+                    for addr in addrs {
+                        crate::pigeon::pigeon_connect_manual(st.clone(), addr, true).await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
     }
 
     // 每 60 秒轮换二维码 token
@@ -501,6 +534,16 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                                         &fingerprint[..16.min(fingerprint.len())]
                                     ),
                                 });
+                                // 手动添加的主机可能在等这次确认：固定后立即重连
+                                let st2 = st.clone();
+                                st.rt_handle.spawn(async move {
+                                    let addrs: Vec<String> =
+                                        st2.manual_hosts.lock().unwrap().keys().cloned().collect();
+                                    for addr in addrs {
+                                        crate::pigeon::pigeon_connect_manual(st2.clone(), addr, true)
+                                            .await;
+                                    }
+                                });
                             }
                             _ => st.emit(CoreEvent::Toast {
                                 text: "确认已过期，请等待对方重新连接".into(),
@@ -537,6 +580,10 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                             });
                             continue;
                         }
+                        // 接受：批次转入 ready 表——对方的 FileStart 只有命中这里才开始收
+                        if let Some(entry) = st.pigeon_incoming.lock().unwrap().remove(&offer_id) {
+                            st.pigeon_ready.lock().unwrap().insert(offer_id.clone(), entry);
+                        }
                         // 接受后由对方在加密通道内推送文件，这里只需答复
                         crate::pigeon::try_push(
                             &st,
@@ -549,6 +596,7 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                     }
                     Ok(UiRequest::PigeonRejectFile { peer_id, offer_id }) => {
                         st.pigeon_incoming.lock().unwrap().remove(&offer_id);
+                        st.pigeon_ready.lock().unwrap().remove(&offer_id);
                         crate::pigeon::try_push(
                             &st,
                             &peer_id,
@@ -560,6 +608,9 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                     }
                     Ok(UiRequest::PigeonCancelFile { peer_id, offer_id }) => {
                         let mut cancelled_locally = false;
+                        // 等待决策/已接受未开始的批次清单先行清理
+                        st.pigeon_incoming.lock().unwrap().remove(&offer_id);
+                        st.pigeon_ready.lock().unwrap().remove(&offer_id);
                         // 发送方向：推送中 → 登记取消标记，推送协程停止并回发 FileCancel
                         if let Some(flag) = st.pigeon_push_cancel.lock().unwrap().get(&offer_id) {
                             flag.store(true, Ordering::Relaxed);
@@ -719,6 +770,85 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                             },
                         });
                     }
+                    Ok(UiRequest::SetStealth(enabled)) => {
+                        st.stealth.store(enabled, Ordering::Relaxed);
+                        if enabled {
+                            // 立即从其他设备的主机列表消失（对方收到 leave 即移除）
+                            crate::pigeon::broadcast_leave();
+                        } else {
+                            st.announce_now.store(true, Ordering::Relaxed);
+                        }
+                        st.emit(CoreEvent::Toast {
+                            text: if enabled {
+                                "隐身模式已开启：不再向局域网广播本机，也不主动外连".into()
+                            } else {
+                                "隐身模式已关闭：恢复广播，本机将重新出现在其他设备列表".into()
+                            },
+                        });
+                    }
+                    Ok(UiRequest::PigeonAddHost { addr, name }) => {
+                        match crate::pigeon::parse_host_addr(&addr) {
+                            Ok(addr) => {
+                                let added = {
+                                    let mut hosts = st.manual_hosts.lock().unwrap();
+                                    if hosts.contains_key(&addr) {
+                                        None
+                                    } else {
+                                        let m = crate::pigeon::ManualHost {
+                                            addr: addr.clone(),
+                                            name: if name.trim().is_empty() {
+                                                addr.clone()
+                                            } else {
+                                                name.trim().to_string()
+                                            },
+                                            machine_id: String::new(),
+                                            peer_id: None,
+                                        };
+                                        hosts.insert(addr.clone(), m);
+                                        Some(addr.clone())
+                                    }
+                                };
+                                if added.is_some() {
+                                    let list: Vec<crate::pigeon::ManualHost> =
+                                        st.manual_hosts.lock().unwrap().values().cloned().collect();
+                                    crate::pigeon::save_manual_hosts(&list);
+                                    crate::pigeon::emit_peers(&st);
+                                }
+                                // 新增或重连都立即发起一次连接（失败弹提示）
+                                let st2 = st.clone();
+                                st.rt_handle
+                                    .spawn(async move { crate::pigeon::pigeon_connect_manual(st2, addr, false).await });
+                            }
+                            Err(e) => st.emit(CoreEvent::Toast { text: e }),
+                        }
+                    }
+                    Ok(UiRequest::PigeonRemoveHost { addr }) => {
+                        let removed = st.manual_hosts.lock().unwrap().remove(&addr);
+                        if let Some(m) = removed {
+                            let list: Vec<crate::pigeon::ManualHost> =
+                                st.manual_hosts.lock().unwrap().values().cloned().collect();
+                            crate::pigeon::save_manual_hosts(&list);
+                            crate::pigeon::emit_peers(&st);
+                            // 连接中的链路一并断开
+                            if let Some(pid) = m.peer_id
+                                && st.pigeon_conns.lock().unwrap().contains_key(&pid)
+                            {
+                                if let Some(link) = st.pigeon_conns.lock().unwrap().get(&pid) {
+                                    link.closed.store(true, Ordering::Relaxed);
+                                }
+                                let st2 = st.clone();
+                                st.rt_handle.spawn(crate::pigeon::drop_link(st2, pid));
+                            }
+                            st.emit(CoreEvent::Toast {
+                                text: format!("已移除主机「{}」", m.name),
+                            });
+                        }
+                    }
+                    Ok(UiRequest::PigeonConnectHost { addr }) => {
+                        let st2 = st.clone();
+                        st.rt_handle
+                            .spawn(async move { crate::pigeon::pigeon_connect_manual(st2, addr, false).await });
+                    }
                     Ok(
                         req @ (UiRequest::RemoteConnect { .. }
                         | UiRequest::RemoteDisconnect
@@ -828,6 +958,8 @@ async fn https_config(
         let cert = params.self_signed(&key).map_err(|e| e.to_string())?;
         std::fs::write(&cert_p, cert.pem()).map_err(|e| e.to_string())?;
         std::fs::write(&key_p, key.serialize_pem()).map_err(|e| e.to_string())?;
+        crate::pigeon::set_owner_only(&cert_p);
+        crate::pigeon::set_owner_only(&key_p);
         tracing::info!("已生成 HTTPS 自签证书（{}）", cert_p.display());
     }
 
@@ -836,24 +968,57 @@ async fn https_config(
         .map_err(|e| format!("加载证书失败: {e}"))
 }
 
-async fn serve_page() -> Response {
+/// 手机页面安全头。页面是内联脚本/样式的单文件 HTML，script-src 只能放开内联；
+/// 收益在其余指令：connect-src 阻断被注入脚本向外域回传、frame-ancestors 防
+/// 点击劫持、referrer-policy 不外泄 URL（内含配对 token）。
+const PAGE_HEADERS: [(&str, &str); 4] = [
+    ("cache-control", "no-store"),
     (
-        [(header::CACHE_CONTROL, "no-store")],
-        Html(include_str!("../assets/phone.html")),
-    )
-        .into_response()
+        "content-security-policy",
+        "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self' ws: wss:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    ),
+    ("x-content-type-options", "nosniff"),
+    ("referrer-policy", "no-referrer"),
+];
+
+async fn serve_page() -> Response {
+    (PAGE_HEADERS, Html(include_str!("../assets/phone.html"))).into_response()
 }
 
 /// 手机「只看不控」页面（观看中设备的屏幕直播，只读凭证鉴权）
 async fn serve_view_page() -> Response {
-    (
-        [(header::CACHE_CONTROL, "no-store")],
-        Html(include_str!("../assets/view.html")),
-    )
-        .into_response()
+    (PAGE_HEADERS, Html(include_str!("../assets/view.html"))).into_response()
 }
 
-async fn ws_handler(State(st): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
+/// 手机 WS 入口的浏览器来源校验：跨源网页（任意网站都能向局域网地址发起 WS）
+/// 不得连接——否则可长期占用唯一连接槽位或探测配对状态。非浏览器客户端无
+/// Origin 头，放行（PC↔PC 的飞鸽链路走独立路径，不经此入口）。
+fn origin_allowed(origin: Option<&str>, host: Option<&str>) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    let Some(host) = host else {
+        return false;
+    };
+    let auth = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+        .unwrap_or("");
+    // authority 到第一个路径/查询字符为止；本服务端口非 80/443，浏览器必带端口
+    let auth = auth.split(['/', '?', '#']).next().unwrap_or("");
+    auth == host
+}
+
+async fn ws_handler(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    if !origin_allowed(origin, host) {
+        return (StatusCode::FORBIDDEN, "禁止跨源连接").into_response();
+    }
     ws.on_upgrade(move |socket| handle_socket(st, socket))
 }
 
@@ -955,26 +1120,39 @@ async fn handle_pigeon_socket(st: Arc<AppState>, socket: WebSocket) {
         .get(&peer_id)
         .map(|p| p.last_seen.elapsed() < crate::pigeon::PEER_TTL + Duration::from_secs(60))
         .unwrap_or(false);
-    let welcome = if !known_ok {
-        PigeonWire::PigeonWelcome {
-            ok: false,
-            reason: Some("不在线上发现列表中".into()),
-            pc_name: None,
-        }
+    // id 全分支都带：发起方在「待确认」阶段就能拿到对端 id（自助添加依赖此字段）
+    let (welcome, welcome_ok) = if !known_ok {
+        (
+            PigeonWire::PigeonWelcome {
+                ok: false,
+                id: Some(st.self_id.clone()),
+                reason: Some("不在线上发现列表中".into()),
+                pc_name: None,
+            },
+            false,
+        )
     } else if st.trust_rejected.lock().unwrap().contains(&peer_id) {
-        PigeonWire::PigeonWelcome {
-            ok: false,
-            reason: Some("你已被拒绝接入".into()),
-            pc_name: None,
-        }
+        (
+            PigeonWire::PigeonWelcome {
+                ok: false,
+                id: Some(st.self_id.clone()),
+                reason: Some("你已被拒绝接入".into()),
+                pc_name: None,
+            },
+            false,
+        )
     } else if st.dnd.load(Ordering::Relaxed) && !crate::pigeon::is_pinned(&remote_static) {
         // 防打扰：未信任设备直接拒绝，不弹信任确认
         tracing::info!("防打扰：已拒绝未信任设备「{peer_name}」的连入");
-        PigeonWire::PigeonWelcome {
-            ok: false,
-            reason: Some("对方开启了防打扰".into()),
-            pc_name: None,
-        }
+        (
+            PigeonWire::PigeonWelcome {
+                ok: false,
+                id: Some(st.self_id.clone()),
+                reason: Some("对方开启了防打扰".into()),
+                pc_name: None,
+            },
+            false,
+        )
     } else if !crate::pigeon::is_pinned(&remote_static) {
         let fp = crate::pigeon::fingerprint(&remote_static);
         st.pending_trusts
@@ -987,17 +1165,25 @@ async fn handle_pigeon_socket(st: Arc<AppState>, socket: WebSocket) {
             name: peer_name.clone(),
             fingerprint: fp,
         });
-        PigeonWire::PigeonWelcome {
-            ok: false,
-            reason: Some("新设备待确认".into()),
-            pc_name: None,
-        }
+        (
+            PigeonWire::PigeonWelcome {
+                ok: false,
+                id: Some(st.self_id.clone()),
+                reason: Some("新设备待确认".into()),
+                pc_name: None,
+            },
+            false,
+        )
     } else {
-        PigeonWire::PigeonWelcome {
-            ok: true,
-            reason: None,
-            pc_name: Some(st.cfg.pc_name.clone()),
-        }
+        (
+            PigeonWire::PigeonWelcome {
+                ok: true,
+                id: Some(st.self_id.clone()),
+                reason: None,
+                pc_name: Some(st.cfg.pc_name.clone()),
+            },
+            true,
+        )
     };
     let frame = match crate::pigeon::seal_msg(&noise, &crate::pigeon::PigeonOut::Control(welcome)) {
         Ok(f) => f,
@@ -1006,7 +1192,9 @@ async fn handle_pigeon_socket(st: Arc<AppState>, socket: WebSocket) {
     if sink.send(Message::Binary(frame.into())).await.is_err() {
         return;
     }
-    if !known_ok {
+    // welcome 未放行（未信任/已拒绝/防打扰/不在发现表）：不注册链路即断开。
+    // 链路一旦注册，未信任设备的聊天/文件邀请/协助请求便可绕过确认直达本机 UI
+    if !welcome_ok {
         return;
     }
     if st.pigeon_conns.lock().unwrap().contains_key(&peer_id) {
@@ -1205,8 +1393,31 @@ pub(crate) fn save_manifest(dir: &std::path::Path, files: &[BatchFileState]) {
     }
 }
 
+/// hello 校验通过后原子占位（同一时间只允许一台手机）。
+/// 已是本连接自己的槽位（改名重发 hello）视为成功；被其他连接占用则返回 false。
+fn install_conn(
+    st: &Arc<AppState>,
+    out: &tokio::sync::mpsc::UnboundedSender<String>,
+    closed: &Arc<AtomicBool>,
+    kick: &Arc<Notify>,
+) -> bool {
+    let mut slot = st.conn.lock().unwrap();
+    match slot.as_ref() {
+        Some(c) if Arc::ptr_eq(&c.closed, closed) => true,
+        Some(_) => false,
+        None => {
+            *slot = Some(Conn {
+                out: out.clone(),
+                closed: closed.clone(),
+                kick: kick.clone(),
+            });
+            true
+        }
+    }
+}
+
 async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
-    // 同一时间只允许一台手机
+    // 快速拒绝（权威检查在 hello 后的 install_conn 原子占位）
     if st.conn.lock().unwrap().is_some() {
         if let Ok(json) = serde_json::to_string(&WsOut::PairResult {
             ok: false,
@@ -1220,18 +1431,8 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
         return;
     }
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    {
-        let mut conn_slot = st.conn.lock().unwrap();
-        *conn_slot = Some(Conn {
-            out: out_tx.clone(),
-            closed: Arc::new(AtomicBool::new(false)),
-            kick: Arc::new(Notify::new()),
-        });
-    }
-    let (closed, kick) = {
-        let conn = st.conn.lock().unwrap().clone().expect("conn 刚刚设置");
-        (conn.closed, conn.kick)
-    };
+    let closed = Arc::new(AtomicBool::new(false));
+    let kick = Arc::new(Notify::new());
     let out_tx2 = out_tx.clone();
 
     let (mut sink, mut stream) = socket.split();
@@ -1256,8 +1457,15 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
     });
 
     let mut paired = false;
+    // hello 校验通过（占位成功）前不计入配对态；未占位的连接限时关闭，
+    // 防止无凭证连接长期占着 WS 与写任务
+    let mut installed = false;
+    let started = Instant::now();
     while let Some(Ok(msg)) = stream.next().await {
         if closed.load(Ordering::Relaxed) {
+            break;
+        }
+        if !installed && started.elapsed() > Duration::from_secs(30) {
             break;
         }
         let text = match msg {
@@ -1274,16 +1482,36 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
                 device,
                 session,
             } => {
-                let mut p = st.pairing.lock().unwrap();
                 // 断线恢复：手机锁屏/切后台会断 WS，重连时带着原会话回来免重新扫码
-                if let Some(s) = session.as_deref().map(str::trim).filter(|s| !s.is_empty())
-                    && p.session_valid(s)
-                {
+                let restore = {
+                    let p = st.pairing.lock().unwrap();
+                    session
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .filter(|s| p.session_valid(s))
+                        .map(str::to_string)
+                };
+                if let Some(s) = restore {
+                    if !install_conn(&st, &out_tx, &closed, &kick) {
+                        let _ = out_tx2.send(
+                            serde_json::to_string(&WsOut::PairResult {
+                                ok: false,
+                                session: None,
+                                reason: Some("电脑上已有其他设备连接".into()),
+                                pc_name: None,
+                                http_port: None,
+                            })
+                            .unwrap(),
+                        );
+                        break;
+                    }
+                    installed = true;
                     paired = true;
                     let _ = out_tx2.send(
                         serde_json::to_string(&WsOut::PairResult {
                             ok: true,
-                            session: Some(s.to_string()),
+                            session: Some(s),
                             reason: None,
                             pc_name: Some(st.cfg.pc_name.clone()),
                             http_port: Some(st.cfg.port),
@@ -1296,7 +1524,7 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
                     });
                     continue;
                 }
-                if !p.token_valid(&token) {
+                if !st.pairing.lock().unwrap().token_valid(&token) {
                     let _ = out_tx2.send(
                         serde_json::to_string(&WsOut::PairResult {
                             ok: false,
@@ -1309,6 +1537,21 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
                     );
                     break;
                 }
+                // token 有效才占位：无凭证的连接拿不到唯一槽位（防占位 DoS）
+                if !install_conn(&st, &out_tx, &closed, &kick) {
+                    let _ = out_tx2.send(
+                        serde_json::to_string(&WsOut::PairResult {
+                            ok: false,
+                            session: None,
+                            reason: Some("电脑上已有其他设备连接".into()),
+                            pc_name: None,
+                            http_port: None,
+                        })
+                        .unwrap(),
+                    );
+                    break;
+                }
+                installed = true;
                 // 注：不再以 has_session 拒绝——WS 入口已保证同一时间仅一条连接，
                 // 会话跨连接保留后，新配对直接覆盖旧会话（旧设备恢复会失败并回到扫码流程）
                 let device = if device.trim().is_empty() {
@@ -1316,8 +1559,7 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
                 } else {
                     device.trim().to_string()
                 };
-                let code = p.begin_pending(device.clone());
-                drop(p);
+                let code = st.pairing.lock().unwrap().begin_pending(device.clone());
                 tracing::info!("手机「{device}」发起配对，配对码 {code}");
                 st.emit(CoreEvent::PairPending { code, device });
             }
@@ -1386,10 +1628,20 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
     }
 
     // 清理。注意不清 pairing 会话：手机锁屏/切后台断 WS 后重连要靠它静默恢复，
-    // 旧下载链接也因此保持有效；会话仅被新配对覆盖或电脑端主动断开时重置
-    *st.conn.lock().unwrap() = None;
+    // 旧下载链接也因此保持有效；会话仅被新配对覆盖或电脑端主动断开时重置。
+    // 只清自己占的槽位：未通过 hello 的连接（含被拒/超时）不动 st.conn
+    {
+        let mut slot = st.conn.lock().unwrap();
+        let mine = slot
+            .as_ref()
+            .map(|c| Arc::ptr_eq(&c.closed, &closed))
+            .unwrap_or(false);
+        if mine {
+            *slot = None;
+            st.emit(CoreEvent::PeerDisconnected);
+        }
+    }
     writer.abort();
-    st.emit(CoreEvent::PeerDisconnected);
 }
 
 fn offer_file(st: &Arc<AppState>, path: PathBuf) {
@@ -1453,7 +1705,12 @@ async fn download(
         let max = size - 1;
         let start = s.min(max);
         let end = e.unwrap_or(max).min(max);
-        (StatusCode::PARTIAL_CONTENT, start, end - start + 1)
+        if end >= start {
+            (StatusCode::PARTIAL_CONTENT, start, end - start + 1)
+        } else {
+            // 非法区间（end < start，此前会下溢回绕出超大长度）：回退整文件 200
+            (StatusCode::OK, 0, size)
+        }
     } else {
         (StatusCode::OK, 0, size)
     };
@@ -1567,13 +1824,20 @@ pub(crate) fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
 
 async fn upload(
     State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
     mut mp: Multipart,
 ) -> Response {
-    let Some(s) = q.get("s") else {
+    // 会话凭证优先走请求头（不进 URL，避免被浏览器历史/云同步记录）；兼容旧查询参数
+    let session = headers
+        .get("x-yunshu-session")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| q.get("s").cloned());
+    let Some(s) = session else {
         return json_err("未配对");
     };
-    if !st.pairing.lock().unwrap().session_valid(s) {
+    if !st.pairing.lock().unwrap().session_valid(&s) {
         return json_err("会话已失效，请重新配对");
     }
 
@@ -1711,6 +1975,21 @@ mod tests {
         assert_eq!(sanitize_name("C:\\x"), "C__x");
         // 空名兜底
         assert_eq!(sanitize_name("  "), "未命名文件");
+    }
+
+    #[test]
+    fn origin_check() {
+        // 非浏览器客户端（无 Origin 头）放行
+        assert!(origin_allowed(None, Some("192.168.1.5:34256")));
+        assert!(origin_allowed(Some("http://192.168.1.5:34256"), Some("192.168.1.5:34256")));
+        assert!(origin_allowed(Some("https://192.168.1.5:34257"), Some("192.168.1.5:34257")));
+        // 跨源（任意网页向局域网地址发起的 WS）一律拒绝
+        assert!(!origin_allowed(Some("http://evil.example"), Some("192.168.1.5:34256")));
+        // 同主机不同端口也不算同源
+        assert!(!origin_allowed(Some("http://192.168.1.5:9999"), Some("192.168.1.5:34256")));
+        // 非 http(s) scheme 的怪 Origin 与缺 Host 一律拒绝
+        assert!(!origin_allowed(Some("ftp://192.168.1.5:34256"), Some("192.168.1.5:34256")));
+        assert!(!origin_allowed(Some("http://192.168.1.5:34256"), None));
     }
 
     #[test]

@@ -54,6 +54,7 @@ function rejectTrust() {
 const showSettings = ref(false)
 const settingsForm = ref({
   device_name: '', port: 34256, save_dir: '', autostart: false, dnd_mode: false,
+  stealth_mode: false,
   machine_id: '', remote_fixed_password: '', has_fixed_password: false,
 })
 async function openSettings() {
@@ -61,7 +62,7 @@ async function openSettings() {
   if (s) {
     settingsForm.value = {
       device_name: s.device_name, port: s.port, save_dir: s.save_dir,
-      autostart: s.autostart, dnd_mode: s.dnd_mode,
+      autostart: s.autostart, dnd_mode: s.dnd_mode, stealth_mode: !!s.stealth_mode,
       machine_id: s.machine_id || '',
       remote_fixed_password: '', has_fixed_password: !!s.remote_fixed_password_hash,
     }
@@ -78,7 +79,8 @@ async function saveSettings() {
   const s = settingsForm.value
   try {
     await invoke('save_settings', {
-      deviceName: s.device_name, port: s.port, saveDir: s.save_dir, autostart: s.autostart, dndMode: s.dnd_mode,
+      deviceName: s.device_name, port: s.port, saveDir: s.save_dir, autostart: s.autostart,
+      dndMode: s.dnd_mode, stealthMode: s.stealth_mode,
       // 未输入新密码则不动现有固定密码
       remoteFixedPassword: s.remote_fixed_password === '' ? null : s.remote_fixed_password,
     })
@@ -97,7 +99,8 @@ async function clearFixedPassword() {
     await invoke('save_settings', {
       deviceName: settingsForm.value.device_name, port: settingsForm.value.port,
       saveDir: settingsForm.value.save_dir, autostart: settingsForm.value.autostart,
-      dndMode: settingsForm.value.dnd_mode, remoteFixedPassword: '',
+      dndMode: settingsForm.value.dnd_mode, stealthMode: settingsForm.value.stealth_mode,
+      remoteFixedPassword: '',
     })
     settingsForm.value.has_fixed_password = false
     settingsForm.value.remote_fixed_password = ''
@@ -150,6 +153,12 @@ onMounted(async () => {
   installTauriDblclickGuard()
   initWindowControls()
   await startRelay()
+  // 主界面直接展示本机机器 ID（远程控制/对方添加本机都要用）；临时密码走事件流
+  invoke<any>('get_settings')
+    .then((s) => {
+      if (s) mutations.setRemoteMachineId(s.machine_id || null)
+    })
+    .catch(() => {})
 })
 </script>
 
@@ -366,6 +375,10 @@ onMounted(async () => {
           <label class="flex items-center gap-2.5 text-sm">
             <input v-model="settingsForm.dnd_mode" type="checkbox" class="size-4 accent-emerald-600" />
             防打扰（仅已信任设备可连接，广播消息静音）
+          </label>
+          <label class="flex items-center gap-2.5 text-sm">
+            <input v-model="settingsForm.stealth_mode" type="checkbox" class="size-4 accent-emerald-600" />
+            隐身模式（不向局域网广播本机，其他设备的主机列表将移除本机；本机主动发送不受影响）
           </label>
 
           <div class="mt-2 border-t pt-3">

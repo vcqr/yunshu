@@ -6,11 +6,12 @@
  */
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
-  FileUp, FolderUp, Laptop, Lock, MessagesSquare, MonitorUp, HandMetal, Radio, Satellite, Smartphone,
+  Eye, EyeOff, FileUp, FolderUp, Laptop, Lock, MessagesSquare, MonitorUp, HandMetal, Plus, Radio,
+  RefreshCw, Satellite, Smartphone, Trash2,
 } from '@lucide/vue'
 import RelayAvatar from './RelayAvatar.vue'
 import UnreadBadge from './UnreadBadge.vue'
-import { store, deviceHasActiveTransfer, unreadFor } from '../../stores/relay-store'
+import { store, mutations, deviceHasActiveTransfer, unreadFor } from '../../stores/relay-store'
 import { relayActions } from '../../hooks/use-relay'
 import { toast } from '../../hooks/use-toast'
 import { cn } from '../../lib/utils'
@@ -22,6 +23,24 @@ const phoneName = computed(() => (store.phoneConnected ? store.phoneName : '手�
 const others = computed(() => store.devices)
 const activeFor = (id: string) => deviceHasActiveTransfer(id)
 
+/* ------------------------------ 在线设备搜索 ------------------------------ */
+/* 按名称 / IP / 机器 ID 过滤（设备多时快速定位） */
+const search = ref('')
+const filtered = computed(() => {
+  const q = search.value.trim().toLowerCase()
+  if (!q) return others.value
+  return others.value.filter(
+    (d) =>
+      d.name.toLowerCase().includes(q) ||
+      d.ip.toLowerCase().includes(q) ||
+      (d.machineId || '').toLowerCase().includes(q),
+  )
+})
+
+/* --------------------- 本机远程控制凭证（眼睛开关） --------------------- */
+/* 默认打码防肩窥/录屏泄漏；远程控制发起方需要读出本机 ID 与临时密码 */
+const showSecrets = ref(false)
+
 /* ------------------------------ 右键菜单 ------------------------------ */
 
 interface CtxDevice {
@@ -29,6 +48,8 @@ interface CtxDevice {
   name: string
   ip: string
   online: boolean
+  manual?: boolean
+  addr?: string
 }
 const ctx = ref<{ x: number; y: number; device: CtxDevice } | null>(null)
 /** 手机伪设备右键 */
@@ -104,6 +125,45 @@ function ctxAssistRequest() {
   if (!d) return
   relayActions.assistRequest(d.id)
 }
+/** 右键重连/移除手动主机 */
+function ctxReconnect() {
+  const d = ctx.value?.device
+  closeCtx()
+  if (!d?.addr) return
+  relayActions.connectHost(d.addr)
+  toast.info(`正在连接「${d.name}」…`)
+}
+function ctxRemoveHost() {
+  const d = ctx.value?.device
+  closeCtx()
+  if (!d?.addr) return
+  if (d.id === store.selectedPeer) mutations.setSelectedPeer('broadcast')
+  relayActions.removeHost(d.addr)
+}
+/** 点击设备：离线的手动主机顺手发起重连 */
+function onSelectDevice(d: CtxDevice) {
+  emit('select', d.id)
+  if (d.manual && !d.online && d.addr) relayActions.connectHost(d.addr)
+}
+
+/* ------------------------------ 自助添加主机 ------------------------------ */
+
+const showAdd = ref(false)
+const addForm = ref({ addr: '', name: '' })
+function openAdd() {
+  addForm.value = { addr: '', name: '' }
+  showAdd.value = true
+}
+function submitAdd() {
+  const addr = addForm.value.addr.trim()
+  if (!addr) {
+    toast.error('请输入对方地址（IP 或主机名，可带端口）')
+    return
+  }
+  relayActions.addHost(addr, addForm.value.name.trim())
+  toast.info(`正在连接 ${addr}…（首次连接需双方确认指纹）`)
+  showAdd.value = false
+}
 
 /* 手机右键：发送文件/文件夹（需已配对） */
 async function ctxSendFilesPhone() {
@@ -144,6 +204,30 @@ async function ctxSendFolderPhone() {
         v-if="store.meIp"
         class="shrink-0 font-mono text-[10px] text-muted-foreground"
       >{{ store.meIp }}</span>
+    </div>
+
+    <!-- 本机远程控制凭证：默认打码，点眼睛显示 -->
+    <div class="flex shrink-0 items-center gap-1.5 rounded-lg bg-muted/40 px-2 py-1.5">
+      <div class="min-w-0 flex-1 font-mono text-[10px] leading-tight text-muted-foreground">
+        <p class="truncate">
+          ID
+          <span class="text-foreground">{{ showSecrets ? (store.remoteMachineId || '——') : '••••••••' }}</span>
+        </p>
+        <p class="truncate">
+          密码
+          <span class="text-foreground">{{ showSecrets ? (store.remoteTempPassword || '——') : '••••••••' }}</span>
+        </p>
+      </div>
+      <button
+        type="button"
+        class="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+        :aria-label="showSecrets ? '隐藏机器 ID 与临时密码' : '显示机器 ID 与临时密码'"
+        :title="showSecrets ? '隐藏' : '显示'"
+        @click="showSecrets = !showSecrets"
+      >
+        <EyeOff v-if="showSecrets" class="size-3.5" />
+        <Eye v-else class="size-3.5" />
+      </button>
     </div>
 
     <!-- 会话 -->
@@ -231,11 +315,31 @@ async function ctxSendFolderPhone() {
 
     <!-- 在线设备 -->
     <div class="flex min-h-0 flex-1 flex-col">
-      <p class="shrink-0 px-2 pb-1 text-[10px] font-medium tracking-wide text-muted-foreground">
-        在线设备{{ others.length > 0 ? ` · ${others.length}` : '' }}
-      </p>
+      <div class="shrink-0 px-1 pb-1.5">
+        <input
+          v-model="search"
+          placeholder="搜索名称 / IP / 机器 ID"
+          aria-label="搜索在线设备"
+          class="h-7 w-full rounded-lg border bg-background px-2.5 text-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+        />
+      </div>
+      <div class="flex shrink-0 items-center justify-between px-2 pb-1">
+        <p class="text-[10px] font-medium tracking-wide text-muted-foreground">
+          在线设备{{ filtered.length > 0 ? ` · ${filtered.length}` : '' }}
+        </p>
+        <button
+          type="button"
+          class="flex items-center gap-0.5 rounded-md px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground hover:bg-accent hover:text-emerald-600"
+          title="自助添加主机（对方不广播或跨网段时手动连入）"
+          @click="openAdd"
+        >
+          <Plus class="size-3" />
+          添加主机
+        </button>
+      </div>
       <div class="custom-scroll min-h-0 flex-1 overflow-y-auto">
         <div class="space-y-0.5 pb-2">
+          <!-- 无在线设备：引导空态；有设备但搜索无匹配：提示换关键词 -->
           <div
             v-if="others.length === 0"
             class="flex flex-col items-center gap-2.5 rounded-lg border border-dashed px-4 py-8 text-center"
@@ -251,8 +355,14 @@ async function ctxSendFolderPhone() {
               </p>
             </div>
           </div>
+          <p
+            v-else-if="filtered.length === 0"
+            class="py-6 text-center text-xs text-muted-foreground"
+          >
+            没有匹配「{{ search.trim() }}」的设备
+          </p>
           <button
-            v-for="d in others"
+            v-for="d in filtered"
             :key="d.id"
             type="button"
             role="tab"
@@ -264,7 +374,7 @@ async function ctxSendFolderPhone() {
                 ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300'
                 : 'hover:bg-accent'
             )"
-            @click="emit('select', d.id)"
+            @click="onSelectDevice(d)"
             @contextmenu.prevent="openCtx($event, d)"
           >
             <RelayAvatar :name="d.name" size="sm" :online="d.online" />
@@ -275,6 +385,11 @@ async function ctxSendFolderPhone() {
             >
               {{ d.name }}
             </span>
+            <span
+              v-if="d.manual && !d.online"
+              class="shrink-0 text-[10px] text-muted-foreground"
+              title="手动添加的主机，当前离线"
+            >离线</span>
             <span
               v-if="d.machineId"
               role="button"
@@ -342,6 +457,23 @@ async function ctxSendFolderPhone() {
             <HandMetal class="size-3.5 text-amber-500" />
             请求协助控制对方
           </button>
+          <template v-if="ctx.device.manual">
+            <button
+              v-if="!ctx.device.online"
+              class="flex min-h-9 w-full items-center gap-2 rounded-md px-2.5 hover:bg-accent"
+              @click="ctxReconnect"
+            >
+              <RefreshCw class="size-3.5 text-emerald-600 dark:text-emerald-400" />
+              重新连接
+            </button>
+            <button
+              class="flex min-h-9 w-full items-center gap-2 rounded-md px-2.5 text-red-600 hover:bg-red-500/10 dark:text-red-400"
+              @click="ctxRemoveHost"
+            >
+              <Trash2 class="size-3.5" />
+              移除此主机
+            </button>
+          </template>
           <div class="bg-border my-1 h-px"></div>
           <button class="flex min-h-9 w-full items-center gap-2 rounded-md px-2.5 hover:bg-accent" @click="ctxSendFiles">
             <FileUp class="size-3.5 text-emerald-600 dark:text-emerald-400" />
@@ -385,6 +517,51 @@ async function ctxSendFolderPhone() {
             <FolderUp class="size-3.5 text-amber-500" />
             发送文件夹…
           </button>
+        </div>
+      </div>
+    </Teleport>
+    <!-- 自助添加主机弹窗 -->
+    <Teleport to="body">
+      <div
+        v-if="showAdd"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45"
+        @click.self="showAdd = false"
+      >
+        <div class="bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
+          <div class="mb-1 flex items-center gap-2.5 text-base font-semibold">
+            <Plus class="size-5 text-emerald-600" />
+            添加主机
+          </div>
+          <p class="mb-4 text-xs text-muted-foreground">
+            输入同一局域网（或可达网段）内运行云书的电脑地址；双方首次连接需各自确认指纹
+          </p>
+          <label class="mb-1 block text-xs font-medium text-muted-foreground">对方地址</label>
+          <input
+            v-model="addForm.addr"
+            placeholder="192.168.1.5 或 192.168.1.5:8001"
+            class="mb-3 h-9 w-full rounded-lg border bg-background px-3 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+            @keydown.enter="submitAdd"
+          />
+          <label class="mb-1 block text-xs font-medium text-muted-foreground">备注名（可选）</label>
+          <input
+            v-model="addForm.name"
+            maxlength="24"
+            placeholder="留空则自动采用对方的电脑名"
+            class="mb-4 h-9 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+            @keydown.enter="submitAdd"
+          />
+          <p class="mb-4 text-[11px] leading-relaxed text-muted-foreground">
+            提示：对方若开启了隐身模式，需由对方也添加本机（或由非隐身一方发起添加）才能互相建立连接
+          </p>
+          <div class="flex justify-end gap-2">
+            <button class="rounded-lg border px-4 py-2 text-sm hover:bg-accent" @click="showAdd = false">取消</button>
+            <button
+              class="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
+              @click="submitAdd"
+            >
+              连接
+            </button>
+          </div>
         </div>
       </div>
     </Teleport>

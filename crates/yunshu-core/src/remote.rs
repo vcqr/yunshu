@@ -35,6 +35,9 @@ const CHUNK_SIZE: usize = 60_000;
 /// 密码错误锁定阈值与时长
 const MAX_FAILS: u32 = 5;
 const LOCK_MINS: u64 = 10;
+/// 全局失败滑动窗口上限：跨 IP 防爆破——局域网攻击者可换 IP 绕过单 IP 锁定
+/// （/24 即 254×5 次/10 分钟），全局窗口把所有来源的失败合计限流
+const GLOBAL_MAX_FAILS: usize = 30;
 /// 一次性密码有效期
 const ONETIME_TTL: Duration = Duration::from_secs(300);
 const ONETIME_PW_LEN: usize = 8;
@@ -314,18 +317,28 @@ impl FrameAssembler {
 
 // ---------- 机器 ID 与密码 ----------
 
-/// 公开机器 ID：静态密钥 SHA-256 指纹前 8 位 hex（16⁸≈43 亿，局域网无碰撞之忧）。
+/// 公开机器 ID：静态公钥 SHA-256 指纹前 8 位 hex（16⁸≈43 亿，局域网无碰撞之忧）。
 /// 随 UDP 广播包分发，输入对方 ID 即可从发现表定位 ip:port。
+/// 必须从公钥（而非私钥）派生：控制端 Noise 握手后拿到对方静态公钥，
+/// 可自行复算机器 ID 与用户输入比对——发现表的 ID 伪造与中继 MITM 由此失效。
 pub fn machine_id() -> String {
+    machine_id_from_static(&crate::pigeon::public_from_private(
+        &crate::pigeon::load_machine_key(),
+    ))
+}
+
+/// 由 X25519 静态公钥复算机器 ID（发起端握手后校验用）
+pub fn machine_id_from_static(static_pub: &[u8]) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
-    h.update(crate::pigeon::load_machine_key());
+    h.update(static_pub);
     crate::pigeon::sha_hex(&h.finalize())[..8].to_string()
 }
 
-/// 临时密码：6 位数字，每次启动重新生成
+/// 临时密码：8 位无易混淆字母数字（数字+大写字母，无 0/O/1/I/L），每次启动重新生成。
+/// 字母数字混合后空间 31⁸≈8521 亿，配合防爆破限流，局域网暴力穷举不可行
 fn gen_temp_password() -> String {
-    format!("{:06}", rand::random::<u32>() % 1_000_000)
+    gen_onetime_password()
 }
 
 /// 一次性密码：8 位无易混淆字符（无 0/O/1/I/L）
@@ -385,6 +398,8 @@ pub struct RemoteAuthState {
     fixed_hash: Option<String>,
     one_time: Option<(String, Instant)>,
     failures: HashMap<IpAddr, FailState>,
+    /// 全局失败时间戳（LOCK_MINS 滑动窗口，跨 IP 合计限流）
+    global_fails: Vec<Instant>,
 }
 
 #[derive(Default)]
@@ -407,6 +422,7 @@ impl RemoteAuthState {
             fixed_hash,
             one_time: None,
             failures: HashMap::new(),
+            global_fails: Vec::new(),
         }
     }
 
@@ -439,6 +455,16 @@ impl RemoteAuthState {
         {
             return Err(AuthError::Locked(left.as_secs().max(1)));
         }
+        // 全局滑动窗口：近期失败过多（换 IP 爆破）时暂停所有来源的验证
+        let window = Duration::from_secs(LOCK_MINS * 60);
+        self.global_fails.retain(|t| t.elapsed() < window);
+        if self.global_fails.len() >= GLOBAL_MAX_FAILS {
+            let left = window
+                .saturating_sub(self.global_fails[0].elapsed())
+                .as_secs()
+                .max(1);
+            return Err(AuthError::Locked(left));
+        }
 
         // 用后即焚：一次性密码只消耗一次，过期作废
         let one_time_hit = self
@@ -458,6 +484,7 @@ impl RemoteAuthState {
         } else {
             let f = self.failures.entry(ip).or_default();
             f.count += 1;
+            self.global_fails.push(Instant::now());
             if f.count >= MAX_FAILS {
                 f.locked_until = Some(Instant::now() + Duration::from_secs(LOCK_MINS * 60));
                 f.count = 0;
@@ -1677,7 +1704,8 @@ fn on_remote_file_offer(
     controller_machine: &str,
     out_tx: &tokio::sync::mpsc::Sender<RemoteOut>,
 ) {
-    let id8 = id[..8.min(id.len())].to_string();
+    // id 来自对端消息，截断后仍可能含路径分隔符——清洗后再拼进半成品目录名
+    let id8 = crate::server::sanitize_name(&id[..8.min(id.len())]);
     let dir = st
         .cfg
         .save_dir
@@ -1785,6 +1813,7 @@ async fn remote_file_chunk(st: &Arc<AppState>, id: [u8; 16], offset: u64, data: 
         let done_file = s.written >= s.files[s.index].size;
         if done_file {
             s.file = None; // 落盘关闭
+            s.written = 0; // 按文件复位：否则多文件批次拿累计值比大小，必然错位
             s.index += 1;
         }
         let transferred = s.got;
@@ -2131,11 +2160,25 @@ async fn remote_connect_inner(
     if st.remote.lock().unwrap().viewing.is_some() {
         return Err("已有远程控制会话进行中".into());
     }
-    let (ip, port, name) = {
+    let (host, port, name) = {
         let peers = st.pigeon_peers.lock().unwrap();
         match peers.values().find(|p| p.machine_id == machine) {
-            Some(p) => (p.ip, p.tcp_port, p.name.clone()),
-            None => return Err(format!("未发现机器 ID 为 {machine} 的设备（对方需在线）")),
+            Some(p) => (p.ip.to_string(), p.tcp_port, p.name.clone()),
+            None => {
+                drop(peers);
+                // 发现表没有（对方隐身不广播）：查手动添加的主机表
+                let manual = st.manual_hosts.lock().unwrap();
+                match manual.values().find(|m| m.machine_id == machine) {
+                    Some(m) => (
+                        crate::pigeon::addr_host(&m.addr).to_string(),
+                        crate::pigeon::addr_port(&m.addr),
+                        m.name.clone(),
+                    ),
+                    None => {
+                        return Err(format!("未发现机器 ID 为 {machine} 的设备（对方需在线）"));
+                    }
+                }
+            }
         }
     };
     st.emit(CoreEvent::RemoteConnecting {
@@ -2143,14 +2186,19 @@ async fn remote_connect_inner(
         name: name.clone(),
     });
 
-    let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect((ip, port)))
-        .await
-        .map_err(|_| "连接超时".to_string())?
-        .map_err(|e| e.to_string())?;
-    let (ws, _resp) =
-        tokio_tungstenite::client_async(format!("ws://{ip}:{port}{REMOTE_WS_PATH}"), tcp)
-            .await
-            .map_err(|e| e.to_string())?;
+    let tcp = tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    .map_err(|_| "连接超时".to_string())?
+    .map_err(|e| e.to_string())?;
+    let (ws, _resp) = tokio_tungstenite::client_async(
+        format!("ws://{host}:{port}{REMOTE_WS_PATH}"),
+        tcp,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let (mut sink, mut stream) = ws.split();
 
     // Noise XX 握手（initiator）
@@ -2180,6 +2228,19 @@ async fn remote_connect_inner(
     let noise = Arc::new(Mutex::new(
         hs.into_transport_mode().map_err(|e| e.to_string())?,
     ));
+
+    // 身份绑定：机器 ID 必须与加密通道对端的静态公钥一致。
+    // 发现表条目可被 UDP 广播伪造（把目标机器 ID 指到攻击者 ip:port 骗走密码），
+    // 中继 MITM 也依赖"对端身份不校验"——此校验一并封死
+    let remote_static = noise
+        .lock()
+        .unwrap()
+        .get_remote_static()
+        .map(|s| s.to_vec())
+        .unwrap_or_default();
+    if machine_id_from_static(&remote_static) != machine {
+        return Err("对方机器 ID 与加密通道身份不符（疑似伪造或中间人），已中止".into());
+    }
 
     // 认证
     let auth = RemoteWire::RemoteAuth {
@@ -2948,5 +3009,33 @@ mod tests {
             assert_eq!(pw.len(), 8);
             assert!(pw.chars().all(|c| c.is_ascii_alphanumeric() && !matches!(c, '0' | 'O' | '1' | 'I' | 'L')));
         }
+    }
+
+    #[test]
+    fn auth_global_fail_window() {
+        let mut auth = RemoteAuthState::new(None);
+        // 不同 IP 各错 1 次，累计到全局上限
+        for i in 0..GLOBAL_MAX_FAILS {
+            let ip: IpAddr = format!("192.168.{}.{}", (i / 254) + 1, (i % 254) + 1)
+                .parse()
+                .unwrap();
+            assert_eq!(auth.verify(ip, "000000"), Err(AuthError::Wrong));
+        }
+        // 全局窗口打满后，换新 IP 也被拒绝（防爆破限流绕不过）
+        let fresh: IpAddr = "10.9.9.9".parse().unwrap();
+        assert!(matches!(
+            auth.verify(fresh, "000000"),
+            Err(AuthError::Locked(_))
+        ));
+    }
+
+    #[test]
+    fn machine_id_binds_to_public_key() {
+        // 机器 ID 从公钥派生：握手后拿到对方静态公钥即可复算比对（身份绑定前提）
+        let public = crate::pigeon::public_from_private(&crate::pigeon::load_machine_key());
+        assert_eq!(machine_id(), machine_id_from_static(&public));
+        let mut other = public;
+        other[0] ^= 0xff;
+        assert_ne!(machine_id(), machine_id_from_static(&other));
     }
 }

@@ -380,7 +380,12 @@ function stopRetry() {
 
 function setPcOnline(online) {
   const s = $('pc-status');
-  s.innerHTML = '<i class="dot"></i>' + (online ? '在线 · ' + location.host : '已断开，等待重连');
+  // 状态行重建：圆点独立元素 + textContent（不把 location.host 拼进 HTML）
+  s.innerHTML = '';
+  const dot = document.createElement('i');
+  dot.className = 'dot';
+  s.appendChild(dot);
+  s.appendChild(document.createTextNode(online ? '在线 · ' + location.host : '已断开，等待重连'));
   s.classList.toggle('online', online);
 }
 
@@ -391,7 +396,7 @@ function handle(m) {
         paired = true;
         session = m.session;
         storeSession(session);
-        if (m.http_port) httpPort = m.http_port;
+        if (m.http_port && /^\d{1,5}$/.test(String(m.http_port))) httpPort = String(m.http_port);
         pcName = m.pc_name || '电脑';
         $('pc-name').textContent = pcName;
         $('pc-avatar').textContent = (pcName[0] || '云').toUpperCase();
@@ -609,9 +614,12 @@ function addInFile(m) {
   addMeta('left', pcName + ' ' + now());
   const row = el('div', 'row');
   const card = fileCard(m.name, m.size, false);
-  const sameOrigin = '/file/' + m.id + '?s=' + encodeURIComponent(session);
+  // 文件 id 即下载凭证（服务端不校验 session），不把会话凭证暴露进 URL/浏览器历史；
+  // id 经 encodeURIComponent 编码后再拼路径（纵深防御，服务端 id 本为 uuid hex）
+  const fid = encodeURIComponent(m.id);
+  const sameOrigin = '/file/' + fid;
   const httpUrl = httpPort && String(httpPort) !== location.port
-    ? 'http://' + location.hostname + ':' + httpPort + '/file/' + m.id + '?s=' + encodeURIComponent(session)
+    ? 'http://' + location.hostname + ':' + httpPort + '/file/' + fid
     : '';
   // 主通道走 HTTP 直连：自签 HTTPS 下多数国产手机浏览器的下载管理器不继承页面的
   // 证书信任（响应头能到、body 0 字节或无反应），顶级导航到 HTTP 可完全绕开。
@@ -664,7 +672,8 @@ function uploadFile(f) {
   fd.append('file', f);
   const xhr = new XMLHttpRequest();
   const card = addOutFile(f.name, f.size);
-  xhr.open('POST', '/upload?s=' + encodeURIComponent(session));
+  xhr.open('POST', '/upload');
+  xhr.setRequestHeader('X-Yunshu-Session', session);
   xhr.upload.onprogress = e => card.setProgress(e.loaded, e.total);
   xhr.onload = () => {
     card.setProgress(1, 1);

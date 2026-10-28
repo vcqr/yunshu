@@ -137,8 +137,12 @@ pub struct PigeonPeerInfo {
     pub ip: String,
     pub tcp_port: u16,
     pub connected: bool,
-    /// 公开机器 ID（静态密钥指纹前 8 位 hex；远程控制以此定位设备）
+    /// 公开机器 ID（静态公钥指纹前 8 位 hex；远程控制以此定位设备）
     pub machine_id: String,
+    /// 手动添加的主机（自助添加，不经广播发现）
+    pub manual: bool,
+    /// 可达地址 host:port（手动主机的移除/重连用）
+    pub addr: String,
 }
 
 /// 核心线程 → UI 的事件
@@ -318,6 +322,15 @@ pub enum UiRequest {
     },
     /// 切换防打扰模式（仅已信任设备可连接、广播静音）
     SetDnd(bool),
+    /// 切换隐身模式（不广播本机、不主动外连，其他设备的主机列表将移除本机）
+    SetStealth(bool),
+    // ---- 自助添加主机 ----
+    /// 手动添加并立即连接（addr 为 host:port，name 为备注可空）
+    PigeonAddHost { addr: String, name: String },
+    /// 移除手动主机（连接中的链路一并断开）
+    PigeonRemoveHost { addr: String },
+    /// 手动重连某台已添加的主机
+    PigeonConnectHost { addr: String },
     // ---- 远程控制 ----
     /// 发起远程控制：machine_id 从发现表定位设备，password 为对方临时/固定/一次性密码
     RemoteConnect {
@@ -354,6 +367,45 @@ pub struct CoreConfig {
     pub pc_name: String,
     /// 防打扰：仅已信任（指纹固定）设备可连接，广播静音
     pub dnd_mode: bool,
+    /// 隐身模式：不广播本机（从其他设备的主机列表消失），也不主动外连；
+    /// 手动外发/远程控制等用户主动行为不受影响
+    pub stealth_mode: bool,
+}
+
+/// 配置目录：~/.yunshu（跨平台一致、直观可寻：身份密钥/信任表/设置/证书都在这里）
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".yunshu"))
+}
+
+/// 旧版配置在系统配置目录（macOS ~/Library/Application Support/yunshu、
+/// Windows %APPDATA%\yunshu、Linux ~/.config/yunshu）。新目录还没有身份密钥
+/// 而旧目录存在时整体搬迁——身份密钥换了会连带换机器 ID 并作废所有 TOFU 信任。
+pub fn ensure_config_dir() {
+    let Some(new_dir) = config_dir() else { return };
+    let _ = std::fs::create_dir_all(&new_dir);
+    if new_dir.join("pigeon_key.bin").exists() {
+        return;
+    }
+    let Some(legacy) = dirs::config_dir().map(|d| d.join("yunshu")) else {
+        return;
+    };
+    if !legacy.is_dir() {
+        return;
+    }
+    let mut moved = 0;
+    if let Ok(entries) = std::fs::read_dir(&legacy) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_file()
+                && std::fs::copy(&p, new_dir.join(e.file_name())).is_ok()
+            {
+                moved += 1;
+            }
+        }
+    }
+    if moved > 0 {
+        tracing::info!("已从旧配置目录迁移 {moved} 个文件：{}", legacy.display());
+    }
 }
 
 /// 在后台线程启动 tokio runtime 与 axum 服务

@@ -108,20 +108,33 @@ function systemMessage(content: string) {
 }
 
 function applyPeers(peers: any[]) {
-  const devices = (peers || []).map((p: any) => ({ id: p.id, name: p.name, ip: p.ip, online: p.connected, machineId: p.machine_id || '' }))
+  const devices = (peers || []).map((p: any) => ({
+    id: p.id, name: p.name, ip: p.ip, online: p.connected,
+    machineId: p.machine_id || '', manual: !!p.manual, addr: p.addr || '',
+  }))
   if (peersInitialized) {
     for (const d of devices) {
-      if (!store.devices.some((x) => x.id === d.id)) systemMessage(`${d.name} 上线了`)
+      if (!store.devices.some((x) => x.id === d.id) && d.online) systemMessage(`${d.name} 上线了`)
     }
     for (const d of store.devices) {
-      if (!devices.some((x: any) => x.id === d.id)) systemMessage(`${d.name} 离开了`)
+      // 手动主机的离线条目常驻列表，只在真在线的设备消失时提示
+      if (!devices.some((x: any) => x.id === d.id) && d.online) systemMessage(`${d.name} 离开了`)
     }
   }
   peersInitialized = true
+  // 手动主机连上后 id 从离线占位（manual:addr）变为真实会话 id：选中状态跟随迁移
+  let selected = store.selectedPeer
+  if (selected && selected.startsWith('manual:')) {
+    const live = devices.find((d) => d.addr === selected!.slice(7) && d.id !== selected)
+    if (live) {
+      selected = live.id
+      mutations.setSelectedPeer(live.id)
+    }
+  }
   mutations.setDevices(devices)
   // 选中设备消失时回到广播会话
-  if (store.selectedPeer && store.selectedPeer !== 'phone' && store.selectedPeer !== 'broadcast' &&
-      !store.devices.some((d) => d.id === store.selectedPeer)) {
+  if (selected && selected !== 'phone' && selected !== 'broadcast' &&
+      !devices.some((d) => d.id === selected)) {
     mutations.setSelectedPeer('broadcast')
   }
 }
@@ -365,6 +378,17 @@ export const relayActions = {
   },
   disconnectPeer(peerId: string) {
     invoke('pigeon_disconnect', { peerId })
+  },
+  /* ---- 自助添加主机 ---- */
+  /** 登记并立即连接（重复添加等同重连） */
+  addHost(addr: string, name: string) {
+    invoke('pigeon_add_host', { addr, name }).catch((e) => toast.error(`添加失败：${String(e)}`))
+  },
+  removeHost(addr: string) {
+    invoke('pigeon_remove_host', { addr }).catch((e) => toast.error(`移除失败：${String(e)}`))
+  },
+  connectHost(addr: string) {
+    invoke('pigeon_connect_host', { addr }).catch(() => {})
   },
   /* ---- 远程控制 ---- */
   /** 发起远程控制（打开密码弹窗） */

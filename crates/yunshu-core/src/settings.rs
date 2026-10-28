@@ -13,6 +13,8 @@ pub struct Settings {
     pub autostart: bool,
     /// 防打扰：仅已固定指纹（信任过）的设备可连接，广播消息静音
     pub dnd_mode: bool,
+    /// 隐身模式：不向局域网广播本机（其他设备的主机列表将移除本机），也不主动外连
+    pub stealth_mode: bool,
     /// 远程控制固定密码（pbkdf2-sha256 加盐哈希，格式 pbkdf2-sha256$rounds$salt$hash）
     pub remote_fixed_password_hash: Option<String>,
 }
@@ -28,6 +30,7 @@ impl Default for Settings {
             save_dir,
             autostart: false,
             dnd_mode: false,
+            stealth_mode: false,
             remote_fixed_password_hash: None,
         }
     }
@@ -41,7 +44,8 @@ fn default_save_dir() -> PathBuf {
 
 impl Settings {
     fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("yunshu").join("config.toml"))
+        crate::ensure_config_dir();
+        crate::config_dir().map(|d| d.join("config.toml"))
     }
 
     pub fn load_or_default() -> Self {
@@ -62,7 +66,10 @@ impl Settings {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, text).map_err(|e| e.to_string())
+        std::fs::write(&path, text).map_err(|e| e.to_string())?;
+        // 含远程控制固定密码哈希，权限收紧为属主可读写
+        crate::pigeon::set_owner_only(&path);
+        Ok(())
     }
 
     pub fn save_dir_path(&self) -> PathBuf {
@@ -80,6 +87,7 @@ impl Settings {
             save_dir: self.save_dir_path(),
             pc_name: self.device_name.clone(),
             dnd_mode: self.dnd_mode,
+            stealth_mode: self.stealth_mode,
         }
     }
 

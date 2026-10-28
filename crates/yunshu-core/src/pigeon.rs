@@ -71,8 +71,30 @@ pub struct PigeonLink {
 
 // ---------- 本机静态密钥与 TOFU 固定 ----------
 
+/// Unix 下把文件权限收紧为属主可读写（私钥/信任表等敏感落盘）。
+pub(crate) fn set_owner_only(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// X25519 私钥 → 公钥（snow 不暴露本地静态公钥；
+/// 机器 ID 须从公钥派生，控制端才能在握手后复算校验对方身份）
+pub fn public_from_private(private: &[u8]) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    if private.len() == 32 {
+        key.copy_from_slice(private);
+    }
+    *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(key)).as_bytes()
+}
+
 pub fn load_machine_key() -> Vec<u8> {
-    let dir = dirs::config_dir().map(|d| d.join("yunshu"));
+    crate::ensure_config_dir();
+    let dir = crate::config_dir();
     if let Some(d) = &dir {
         let _ = std::fs::create_dir_all(d);
         let path = d.join("pigeon_key.bin");
@@ -85,6 +107,7 @@ pub fn load_machine_key() -> Vec<u8> {
             .generate_keypair()
             .expect("生成密钥对");
         let _ = std::fs::write(&path, &kp.private);
+        set_owner_only(&path);
         return kp.private;
     }
     snow::Builder::new(NOISE_PATTERN.parse().expect("pattern"))
@@ -94,7 +117,8 @@ pub fn load_machine_key() -> Vec<u8> {
 }
 
 fn pinned_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("yunshu").join("known_peers.json"))
+    crate::ensure_config_dir();
+    crate::config_dir().map(|d| d.join("known_peers.json"))
 }
 
 fn load_pinned() -> HashMap<String, String> {
@@ -110,6 +134,8 @@ fn save_pinned(map: &HashMap<String, String>) {
         && let Err(e) = std::fs::write(p, json)
     {
         tracing::warn!("写入固定密钥失败: {e}");
+    } else if let Some(p) = pinned_path() {
+        set_owner_only(&p);
     }
 }
 
@@ -242,6 +268,346 @@ pub fn pin_fingerprint(fp: &str) {
     tracing::info!("设备已被用户信任（指纹 {}…）", &fp[..16.min(fp.len())]);
 }
 
+// ---------- 自助添加主机（手动登记，不经广播发现） ----------
+
+/// 手动添加的主机（持久化于配置目录 manual_hosts.json）。
+/// addr 为 "host:port"；peer_id / machine_id / 名称在首次成功连接后回填。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManualHost {
+    pub addr: String,
+    pub name: String,
+    #[serde(default)]
+    pub machine_id: String,
+    #[serde(default)]
+    pub peer_id: Option<String>,
+}
+
+fn manual_hosts_path() -> Option<PathBuf> {
+    crate::ensure_config_dir();
+    crate::config_dir().map(|d| d.join("manual_hosts.json"))
+}
+
+pub fn load_manual_hosts() -> Vec<ManualHost> {
+    manual_hosts_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_manual_hosts(hosts: &[ManualHost]) {
+    if let Some(p) = manual_hosts_path()
+        && let Ok(json) = serde_json::to_string_pretty(hosts)
+    {
+        if let Err(e) = std::fs::write(&p, json) {
+            tracing::warn!("写入手动主机表失败: {e}");
+        }
+        set_owner_only(&p);
+    }
+}
+
+/// 解析用户输入的地址：`192.168.1.5` / `192.168.1.5:8001` / `puter.local`。
+/// 缺省端口 34256；暂不支持 IPv6 字面量。
+pub fn parse_host_addr(input: &str) -> Result<String, String> {
+    let input = input.trim();
+    let (host, port) = match input.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (
+            h,
+            p.parse::<u16>()
+                .map_err(|_| "端口无效（1-65535）".to_string())?,
+        ),
+        _ if input.contains("::") => {
+            return Err("暂不支持 IPv6 字面量，请使用 IPv4 地址或主机名".into());
+        }
+        _ => (input, 34256),
+    };
+    let host = host.trim();
+    let ok = !host.is_empty()
+        && host.len() <= 253
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    if !ok {
+        return Err("地址格式：IPv4 或主机名，可带端口（如 192.168.1.5 或 192.168.1.5:8001）".into());
+    }
+    Ok(format!("{host}:{port}"))
+}
+
+pub fn addr_host(addr: &str) -> &str {
+    addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr)
+}
+
+pub fn addr_port(addr: &str) -> u16 {
+    addr.rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or(34256)
+}
+
+fn same_addr(manual_addr: &str, ip: &str, port: u16) -> bool {
+    manual_addr == &format!("{ip}:{port}")
+}
+
+/// 手动连接入口：guard 防重入，quiet 控制失败是否弹提示（后台重试静默）
+pub async fn pigeon_connect_manual(st: Arc<AppState>, addr: String, quiet: bool) {
+    if !st
+        .pigeon_connecting
+        .lock()
+        .unwrap()
+        .insert(format!("manual:{addr}"))
+    {
+        return; // 已有同地址连接在途
+    }
+    let result = pigeon_connect_manual_inner(&st, &addr).await;
+    st.pigeon_connecting
+        .lock()
+        .unwrap()
+        .remove(&format!("manual:{addr}"));
+    match result {
+        Ok(()) => {}
+        Err(e) => {
+            tracing::info!("手动连接 {addr} 失败：{e}");
+            if !quiet {
+                st.emit(CoreEvent::Toast {
+                    text: format!("连接 {addr} 失败：{e}"),
+                });
+            }
+        }
+    }
+}
+
+async fn pigeon_connect_manual_inner(st: &Arc<AppState>, addr: &str) -> Result<(), String> {
+    // 该地址已有存活链路则不重复连
+    let known_peer = st
+        .manual_hosts
+        .lock()
+        .unwrap()
+        .get(addr)
+        .and_then(|m| m.peer_id.clone());
+    if let Some(pid) = known_peer
+        && st.pigeon_conns.lock().unwrap().contains_key(&pid)
+    {
+        return Ok(());
+    }
+    let port: u16 = addr_port(addr);
+    let host = addr_host(addr).to_string();
+    let display_name = st
+        .manual_hosts
+        .lock()
+        .unwrap()
+        .get(addr)
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| addr.to_string());
+
+    let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect((host.as_str(), port)))
+        .await
+        .map_err(|_| "连接超时".to_string())?
+        .map_err(|e| e.to_string())?;
+    let (ws, _resp) = tokio_tungstenite::client_async(format!("ws://{addr}/pigeon-ws"), tcp)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (mut sink, mut stream) = ws.split();
+
+    // ---- Noise XX 握手（initiator，同发现流程）----
+    let mut hs = new_handshake(true)?;
+    let mut buf = vec![0u8; 65535];
+    let n = hs.write_message(&[], &mut buf).map_err(|e| e.to_string())?;
+    sink.send(tokio_tungstenite::tungstenite::Message::binary(
+        buf[..n].to_vec(),
+    ))
+    .await
+    .map_err(|e| e.to_string())?;
+    let m2 = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .map_err(|_| "握手超时".to_string())?
+        .ok_or("对方断开")?
+        .map_err(|e| e.to_string())?;
+    let m2 = match m2 {
+        tokio_tungstenite::tungstenite::Message::Binary(b) => b.to_vec(),
+        _ => return Err("握手消息格式错误".into()),
+    };
+    hs.read_message(&m2, &mut buf).map_err(|e| e.to_string())?;
+    let n = hs.write_message(&[], &mut buf).map_err(|e| e.to_string())?;
+    sink.send(tokio_tungstenite::tungstenite::Message::binary(
+        buf[..n].to_vec(),
+    ))
+    .await
+    .map_err(|e| e.to_string())?;
+    let noise = hs.into_transport_mode().map_err(|e| e.to_string())?;
+    let noise = Arc::new(Mutex::new(noise));
+    let remote_static = noise
+        .lock()
+        .unwrap()
+        .get_remote_static()
+        .map(|s| s.to_vec())
+        .unwrap_or_default();
+
+    // ---- 加密 hello / welcome ----
+    let hello = PigeonOut::Control(PigeonWire::PigeonHello {
+        id: st.self_id.clone(),
+        name: st.cfg.pc_name.clone(),
+        port: st.cfg.port,
+    });
+    let frame = seal_msg(&noise, &hello)?;
+    sink.send(tokio_tungstenite::tungstenite::Message::binary(frame))
+        .await
+        .map_err(|e| e.to_string())?;
+    let welcome = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .map_err(|_| "握手超时".to_string())?
+        .ok_or("对方断开")?
+        .map_err(|e| e.to_string())?;
+    let tokio_tungstenite::tungstenite::Message::Binary(wb) = welcome else {
+        return Err("welcome 格式错误".into());
+    };
+    let (ok, welcome_id, reason, pc_name) = match open_msg(&noise, &wb)? {
+        PigeonIn::Control(PigeonWire::PigeonWelcome {
+            ok,
+            id,
+            reason,
+            pc_name,
+        }) => (ok, id, reason, pc_name),
+        _ => return Err("welcome 格式错误".into()),
+    };
+    if !ok {
+        let r = reason.unwrap_or_else(|| "对方拒绝连接".into());
+        if r.contains("待确认") {
+            // 对方在等它的用户确认本机；本地同步弹确认（id 已随 welcome 带回）
+            let fp = fingerprint(&remote_static);
+            let pid = welcome_id.clone().unwrap_or_else(|| format!("manual:{addr}"));
+            st.emit(crate::CoreEvent::PigeonTrustRequest {
+                peer_id: pid.clone(),
+                name: display_name.clone(),
+                fingerprint: fp.clone(),
+            });
+            st.pending_trusts
+                .lock()
+                .unwrap()
+                .insert(pid, (display_name.clone(), fp));
+        }
+        return Err(r);
+    }
+    let Some(peer_id) = welcome_id else {
+        return Err("对方版本过旧，不支持自助添加（请双方升级后重试）".into());
+    };
+    // 未固定指纹的设备不建业务链路（同发现流程），确认后由重试自动接上
+    if !is_pinned(&remote_static) {
+        let fp = fingerprint(&remote_static);
+        st.pending_trusts
+            .lock()
+            .unwrap()
+            .insert(peer_id.clone(), (display_name.clone(), fp.clone()));
+        st.emit(crate::CoreEvent::PigeonTrustRequest {
+            peer_id: peer_id.clone(),
+            name: display_name.clone(),
+            fingerprint: fp,
+        });
+        let _ = sink.close().await;
+        return Err("新设备待确认".into());
+    }
+    if st.pigeon_conns.lock().unwrap().contains_key(&peer_id) {
+        return Ok(());
+    }
+
+    // ---- 回填手动主机记录（机器 ID 来自本次握手对端静态公钥）----
+    let mut record_changed = false;
+    {
+        let mut hosts = st.manual_hosts.lock().unwrap();
+        if let Some(m) = hosts.get_mut(addr) {
+            let machine = crate::remote::machine_id_from_static(&remote_static);
+            record_changed = m.peer_id.as_deref() != Some(peer_id.as_str()) || m.machine_id != machine;
+            m.peer_id = Some(peer_id.clone());
+            m.machine_id = machine;
+            // 用户没起备注名时采用对方的电脑名
+            if let Some(n) = pc_name
+                && (m.name.is_empty() || m.name == *addr)
+            {
+                m.name = n;
+            }
+        }
+    }
+    if record_changed {
+        let list: Vec<ManualHost> = st.manual_hosts.lock().unwrap().values().cloned().collect();
+        save_manual_hosts(&list);
+    }
+    let link_name = st
+        .manual_hosts
+        .lock()
+        .unwrap()
+        .get(addr)
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| display_name.clone());
+
+    // ---- 注册链路 + 加密泵（同发现流程）----
+    let (plain_out_tx, plain_out_rx) = tokio::sync::mpsc::channel::<PigeonOut>(64);
+    st.pigeon_conns.lock().unwrap().insert(
+        peer_id.clone(),
+        PigeonLink {
+            name: link_name.clone(),
+            out: plain_out_tx.clone(),
+            closed: Arc::new(AtomicBool::new(false)),
+        },
+    );
+    tracing::info!("已与「{link_name}」（{addr}）建立加密飞鸽链路（手动添加）");
+    emit_peers(st);
+
+    let (cipher_tx, mut cipher_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let pump = tokio::spawn(pump(
+        st.clone(),
+        peer_id.clone(),
+        link_name.clone(),
+        noise.clone(),
+        frame_rx,
+        plain_out_rx,
+        cipher_tx,
+    ));
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = cipher_rx.recv().await {
+            if sink
+                .send(tokio_tungstenite::tungstenite::Message::binary(frame))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        let _ = sink.close().await;
+    });
+    let mut drop_reason = "手动链路读流结束（对端关闭）";
+    while let Some(Ok(msg)) = stream.next().await {
+        let closed = st
+            .pigeon_conns
+            .lock()
+            .unwrap()
+            .get(&peer_id)
+            .map(|l| l.closed.load(Ordering::Relaxed))
+            .unwrap_or(true);
+        if closed {
+            drop_reason = "本端 closed 标志";
+            break;
+        }
+        match msg {
+            tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                if frame_tx.send(b.to_vec()).await.is_err() {
+                    drop_reason = "加密泵已退出";
+                    break;
+                }
+            }
+            tokio_tungstenite::tungstenite::Message::Close(_) => {
+                drop_reason = "对端发送了 Close";
+                break;
+            }
+            _ => continue,
+        }
+    }
+
+    st.pigeon_conns.lock().unwrap().remove(&peer_id);
+    pump.abort();
+    writer.abort();
+    tracing::info!("与「{link_name}」（{addr}）的手动链路断开（{drop_reason}）");
+    emit_peers(st);
+    Ok(())
+}
+
 // ---------- Noise 基础 ----------
 
 pub fn new_handshake(initiator: bool) -> Result<snow::HandshakeState, String> {
@@ -357,9 +723,10 @@ pub async fn push_control(st: &AppState, peer_id: &str, wire: PigeonWire) -> boo
 }
 
 pub fn peers_event(st: &AppState) -> CoreEvent {
-    let peers: Vec<PigeonPeerInfo> = {
+    let mut v: Vec<PigeonPeerInfo> = {
         let known = st.pigeon_peers.lock().unwrap();
         let conns = st.pigeon_conns.lock().unwrap();
+        let manual = st.manual_hosts.lock().unwrap();
         let mut v: Vec<PigeonPeerInfo> = known
             .iter()
             .map(|(id, p)| PigeonPeerInfo {
@@ -369,12 +736,44 @@ pub fn peers_event(st: &AppState) -> CoreEvent {
                 tcp_port: p.tcp_port,
                 connected: conns.contains_key(id),
                 machine_id: p.machine_id.clone(),
+                manual: manual.values().any(|m| {
+                    m.peer_id.as_deref() == Some(id.as_str())
+                        || same_addr(&m.addr, &p.ip.to_string(), p.tcp_port)
+                }),
+                addr: format!("{}:{}", p.ip, p.tcp_port),
             })
             .collect();
-        v.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        // 手动主机在发现表覆盖不到时补条目：对方隐身不广播、或尚未连上（离线也可见）
+        for m in manual.values() {
+            let covered = m
+                .peer_id
+                .as_deref()
+                .is_some_and(|pid| known.contains_key(pid))
+                || known
+                    .values()
+                    .any(|p| same_addr(&m.addr, &p.ip.to_string(), p.tcp_port));
+            if covered {
+                continue;
+            }
+            let connected = m
+                .peer_id
+                .as_deref()
+                .is_some_and(|pid| conns.contains_key(pid));
+            v.push(PigeonPeerInfo {
+                id: m.peer_id.clone().unwrap_or_else(|| format!("manual:{}", m.addr)),
+                name: m.name.clone(),
+                ip: addr_host(&m.addr).to_string(),
+                tcp_port: addr_port(&m.addr),
+                connected,
+                machine_id: m.machine_id.clone(),
+                manual: true,
+                addr: m.addr.clone(),
+            });
+        }
         v
     };
-    CoreEvent::PigeonPeers { peers }
+    v.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    CoreEvent::PigeonPeers { peers: v }
 }
 
 pub fn emit_peers(st: &AppState) {
@@ -471,8 +870,11 @@ pub async fn run_discovery(st: Arc<AppState>) {
         name: st.cfg.pc_name.clone(),
     });
 
-    for bc in broadcast_targets() {
-        let _ = sock.send_to(&announce, bc).await;
+    // 启动即广播一次（隐身模式不开机广播）
+    if !st.stealth.load(Ordering::Relaxed) {
+        for bc in broadcast_targets() {
+            let _ = sock.send_to(&announce, bc).await;
+        }
     }
 
     tracing::info!(
@@ -493,9 +895,11 @@ pub async fn run_discovery(st: Arc<AppState>) {
             }
             _ = tick.tick() => {
                 n += 1;
-                // 启动后 10 秒补一次广播，让对方尽快发现
-                // 启动后前 50 秒密集广播（0/10/20/30/40s 各一次），让对方尽快发现
-                if n <= 5 || n.is_multiple_of(3) {
+                // 隐身模式不广播（本机不出现在其他设备列表）；
+                // 退出隐身时 announce_now 置位，下个 tick 立即补发恢复可见
+                if !st.stealth.load(Ordering::Relaxed)
+                    && (n <= 5 || n.is_multiple_of(3) || st.announce_now.swap(false, Ordering::Relaxed))
+                {
                     for bc in broadcast_targets() {
                         let _ = sock.send_to(&announce, bc).await;
                     }
@@ -553,10 +957,14 @@ async fn handle_packet(st: &Arc<AppState>, data: &[u8], from: SocketAddr) {
         }
         // 只要没有链路就尝试连接（覆盖：首次发现 / 链路断开后重连）。
         // 双方同时外连会互相拆链路：约定只有 id 更大的一方主动发起，另一侧等待连入。
-        let should_connect = p.id > st.self_id && {
-            let mut connecting = st.pigeon_connecting.lock().unwrap();
-            !st.pigeon_conns.lock().unwrap().contains_key(&p.id) && connecting.insert(p.id.clone())
-        };
+        // 隐身模式不主动外连——一旦外连，对方立刻看得到本机（隐身即失效）；
+        // 用户手动发送/远程控制等主动行为不受此限制
+        let should_connect = !st.stealth.load(Ordering::Relaxed)
+            && p.id > st.self_id
+            && {
+                let mut connecting = st.pigeon_connecting.lock().unwrap();
+                !st.pigeon_conns.lock().unwrap().contains_key(&p.id) && connecting.insert(p.id.clone())
+            };
         if should_connect {
             let st2 = st.clone();
             let id = p.id.clone();
@@ -713,6 +1121,23 @@ async fn pigeon_connect_inner(
         return Err(r);
     }
     // 身份即密钥：指纹已固定 = 密钥与首次信任时完全一致（SHA-256 派生），无需再比对
+    // 未固定指纹的设备不建业务链路：对端若是改制客户端可伪造 welcome ok:true，
+    // 链路一旦注册，其聊天/文件邀请/协助请求即可绕过信任确认直达本机 UI
+    if !is_pinned(&remote_static) {
+        let fp = fingerprint(&remote_static);
+        st.pending_trusts
+            .lock()
+            .unwrap()
+            .insert(peer_id.to_string(), (name.clone(), fp.clone()));
+        st.emit(crate::CoreEvent::PigeonTrustRequest {
+            peer_id: peer_id.to_string(),
+            name: name.clone(),
+            fingerprint: fp,
+        });
+        let _ = sink.close().await;
+        tracing::info!("「{name}」未在信任列表，已挂起连接等待本机确认");
+        return Err("新设备待确认".into());
+    }
     if st.pigeon_conns.lock().unwrap().contains_key(peer_id) {
         return Ok(()); // 对方已抢先建立，放弃本连接
     }
@@ -917,6 +1342,10 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
                     return;
                 }
                 tracing::info!("AUTO_ACCEPT：自动接受「{name}」");
+                // 自动接受同样要登记进 ready：FileStart 只认已接受的批次
+                if let Some(entry) = st.pigeon_incoming.lock().unwrap().remove(&id) {
+                    st.pigeon_ready.lock().unwrap().insert(id.clone(), entry);
+                }
                 push_control(st, peer_id, PigeonWire::FileDecision { id, accepted: true }).await;
             } else {
                 let entries: Vec<FileEntry> = files
@@ -957,12 +1386,20 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
             }
         }
         PigeonIn::Control(PigeonWire::FileStart { id }) => {
-            let incoming = st.pigeon_incoming.lock().unwrap().remove(&id);
-            let Some((peer, mut files)) = incoming else {
-                tracing::warn!("FileStart 找不到对应邀请（{id}）");
+            // 只认用户已接受的批次：未接受（或压根没有）的 FileStart 一律拒绝，
+            // 否则改制客户端可不经确认直接把文件落进保存目录
+            let ready = st.pigeon_ready.lock().unwrap().remove(&id);
+            let Some((peer, mut files)) = ready else {
+                tracing::warn!("FileStart 找不到已接受的批次（{id}）");
                 let _ = push_control(st, peer_id, PigeonWire::FileCancel { id }).await;
                 return;
             };
+            if peer != peer_id {
+                tracing::warn!("FileStart 与批次接受来源不符（{id}），已拒绝");
+                st.pigeon_ready.lock().unwrap().insert(id.clone(), (peer, files));
+                let _ = push_control(st, peer_id, PigeonWire::FileCancel { id }).await;
+                return;
+            }
             let dir = st.cfg.save_dir.join(".yunshu-parts").join(&id);
             if let Err(e) = tokio::fs::create_dir_all(&dir).await {
                 tracing::error!("创建半成品目录失败 {dir:?}: {e}");
@@ -1071,7 +1508,12 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
             let failure = {
                 let mut states = st.recv_files.lock().await;
                 let Some(s) = states.get_mut(&id) else { return };
-                if index as usize != s.index || (!s.hash_pending && s.files[s.index].size != 0) {
+                // 越界守卫须在最前：index == files.len()（全部校验完、等 FileEnd）时
+                // s.files[s.index] 会越界 panic，而 release 是 panic=abort 全进程退出
+                if s.index >= s.files.len()
+                    || index as usize != s.index
+                    || (!s.hash_pending && s.files[s.index].size != 0)
+                {
                     tracing::warn!("FileHash 与当前状态不符（{id} #{index}）");
                     return;
                 }
@@ -1161,6 +1603,9 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
                 flag.store(true, Ordering::Relaxed);
             }
             st.pigeon_offers.lock().unwrap().remove(&id);
+            // 等待决策/已接受未开始的批次一并清掉
+            st.pigeon_incoming.lock().unwrap().remove(&id);
+            st.pigeon_ready.lock().unwrap().remove(&id);
             let state = st.recv_files.lock().await.remove(&id);
             if let Some(mut s) = state {
                 s.file = None;
@@ -1687,8 +2132,12 @@ pub async fn drop_link(st: Arc<AppState>, peer_id: String) {
         st.update_transfer(&s.row_id, s.have, None, TransferStatus::Failed, None);
         tracing::info!("链路断开，「{}」已保留 {} 字节半成品待续传", s.name, s.have);
     }
-    // 未开始推送的邀请清单一并清理
+    // 未开始推送的邀请清单一并清理（含已接受未开始的）
     st.pigeon_incoming
+        .lock()
+        .unwrap()
+        .retain(|_, (peer, _)| peer != &peer_id);
+    st.pigeon_ready
         .lock()
         .unwrap()
         .retain(|_, (peer, _)| peer != &peer_id);
@@ -1777,5 +2226,21 @@ mod tests {
         // 32 字节 → SHA-256 → 64 hex，冒号分 32 组
         assert_eq!(fp.len(), 32 * 3 - 1);
         assert_eq!(fp.matches(':').count(), 31);
+    }
+
+    #[test]
+    fn parse_host_addr_forms() {
+        // 缺省端口 / 显式端口 / 主机名
+        assert_eq!(parse_host_addr("192.168.1.5").unwrap(), "192.168.1.5:34256");
+        assert_eq!(parse_host_addr("192.168.1.5:8001").unwrap(), "192.168.1.5:8001");
+        assert_eq!(parse_host_addr(" puter.local ").unwrap(), "puter.local:34256");
+        assert_eq!(parse_host_addr("puter.local:80").unwrap(), "puter.local:80");
+        // 非法输入
+        assert!(parse_host_addr("").is_err());
+        assert!(parse_host_addr("1.2.3.4:").is_err());
+        assert!(parse_host_addr("1.2.3.4:99999").is_err());
+        assert!(parse_host_addr("a b c").is_err());
+        assert!(parse_host_addr("::1").is_err());
+        assert!(parse_host_addr("http://1.2.3.4").is_err());
     }
 }

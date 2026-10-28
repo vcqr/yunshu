@@ -167,6 +167,7 @@ async fn remote_control_auth_stream_and_lockout() {
         save_dir: std::env::temp_dir(),
         pc_name: "e2e受控端".into(),
         dnd_mode: false,
+        stealth_mode: false,
     };
     tokio::spawn(yunshu_core::server::serve(cfg, event_tx, ui_rx));
 
@@ -186,7 +187,13 @@ async fn remote_control_auth_stream_and_lockout() {
             .unwrap()
             .unwrap();
         if let CoreEvent::RemoteTempPassword { password } = ev {
-            assert_eq!(password.len(), 6, "临时密码应为 6 位数字");
+            assert_eq!(password.len(), 8, "临时密码应为 8 位字母数字");
+            assert!(
+                password
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
+                "临时密码应为数字+大写字母: {password}"
+            );
             break password;
         }
     };
@@ -239,6 +246,7 @@ async fn remote_control_auth_stream_and_lockout() {
             save_dir: std::env::temp_dir(),
             pc_name: "e2e受控端2".into(),
             dnd_mode: false,
+            stealth_mode: false,
         },
         event_tx2,
         ui_rx2,
@@ -351,10 +359,43 @@ async fn remote_control_auth_stream_and_lockout() {
     // ---- ④ 控制端全链路：UDP 注入假发现节点（指向实例 2）→ UiRequest::RemoteConnect →
     //        实例 1 发起连接（覆盖 UI 线程 spawn 投递）→ RemoteViewReady → 双端会话事件 → 断开 ----
     {
+        // 实例 2 的真实机器 ID：测试进程与两个实例共享临时配置目录（同一静态密钥）。
+        // 身份绑定修复后，发现包 mid 必须与受控端加密通道身份一致，否则握手即被拒
+        let real_machine_id = yunshu_core::remote::machine_id();
+        // ---- ④-0 负例：发现包携带伪造 mid → 连接必须失败（防机器 ID 伪造骗密码）----
+        {
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let spoof = serde_json::json!({
+                "v": 1, "kind": "entry", "id": "e2efake0002", "name": "e2e假节点",
+                "port": port2, "mid": "cafe5678"
+            })
+            .to_string();
+            for _ in 0..20 {
+                let _ = sock.send_to(spoof.as_bytes(), ("127.0.0.1", 34255u16));
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+            ui_tx
+                .send(UiRequest::RemoteConnect {
+                    machine_id: "cafe5678".into(),
+                    password: temp2.clone(),
+                })
+                .unwrap();
+            loop {
+                let ev = timeout(Duration::from_secs(20), ev_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let CoreEvent::RemoteConnectFailed { reason, .. } = ev {
+                    assert!(reason.contains("身份不符"), "伪造 mid 应被身份校验拦截: {reason}");
+                    break;
+                }
+            }
+            panic_if_session_started(&mut ev2_rx).await;
+        }
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let announce = serde_json::json!({
             "v": 1, "kind": "entry", "id": "e2efake0001", "name": "e2e假节点",
-            "port": port2, "mid": "cafe5678"
+            "port": port2, "mid": real_machine_id
         })
         .to_string();
         // 共享 UDP 端口存在负载均衡投递，多发几遍确保实例 1 的发现表收到
@@ -364,7 +405,7 @@ async fn remote_control_auth_stream_and_lockout() {
         }
         ui_tx
             .send(UiRequest::RemoteConnect {
-                machine_id: "cafe5678".into(),
+                machine_id: real_machine_id.clone(),
                 password: temp2.clone(),
             })
             .unwrap();
@@ -384,7 +425,7 @@ async fn remote_control_auth_stream_and_lockout() {
                     port,
                     ..
                 } => {
-                    assert_eq!(peer_id, "cafe5678");
+                    assert_eq!(peer_id, real_machine_id);
                     assert_eq!(port, PORT, "观看桥端口应为本机 HTTP 端口");
                     assert!(!token.is_empty());
                     assert_eq!(token.len(), 32, "主凭证 32 位 hex");
@@ -493,7 +534,7 @@ async fn remote_control_auth_stream_and_lockout() {
                     .unwrap();
                 if let CoreEvent::TransferUpdate { t } = ev {
                     if t.direction == yunshu_core::Direction::ToPhone
-                        && t.peer.as_deref() == Some("cafe5678")
+                        && t.peer.as_deref() == Some(real_machine_id.as_str())
                         && t.status == yunshu_core::TransferStatus::Done
                     {
                         assert_eq!(t.transferred, data.len() as u64);
