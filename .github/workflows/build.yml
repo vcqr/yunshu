@@ -1,0 +1,161 @@
+name: "build"
+
+# 打包流程参考 AShell（ashell/.github/workflows/build.yml）：
+# 推送 v* tag 触发全平台构建并发布 GitHub Release；workflow_dispatch 可手动试跑。
+# 项目结构差异：Tauri 工程在 crates/yunshu-app（非 src-tauri），前端在 frontend/，
+# Rust workspace 的 target 在仓库根目录——因此用 frontend 本地的 @tauri-apps/cli
+# 直接构建，不经 tauri-action（其对非标准目录布局的探测不可靠）。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build-tauri:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS ARM64（Apple Silicon）
+          - platform: macos-15
+            target: aarch64-apple-darwin
+            bundles: "dmg"
+            files: |
+              target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          # macOS x86_64（Intel）
+          - platform: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: "dmg"
+            files: |
+              target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+          # Linux x86_64（X11）
+          - platform: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: "appimage"
+            files: |
+              target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+          # Windows x86_64（NSIS 安装包 + 免安装便携包）
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: "nsis"
+            files: |
+              target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+              云书_*_windows_x64_portable.zip
+
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: install dependencies (ubuntu only)
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+
+      - name: install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: generate release notes
+        id: release_notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          # 获取上一个 tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            # 首次发布：全部 commit（排除 Initial commit）
+            NOTES=$(git log --no-merges --pretty=format:"- %s" HEAD ^github/main 2>/dev/null || git log --no-merges --pretty=format:"- %s" HEAD)
+          else
+            NOTES=$(git log --no-merges --pretty=format:"- %s" ${PREV_TAG}..HEAD)
+          fi
+          # 转义换行，写入 GITHUB_OUTPUT
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "body<<$EOF" >> "$GITHUB_OUTPUT"
+          echo "$NOTES" >> "$GITHUB_OUTPUT"
+          echo "$EOF" >> "$GITHUB_OUTPUT"
+
+      - name: build tauri app
+        shell: bash
+        run: |
+          cd crates/yunshu-app
+          # tauri.conf.json 的 beforeBuildCommand 会自动构建 frontend（npm run build）
+          ../../frontend/node_modules/.bin/tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      # Windows 便携版（免安装压缩包）：单 exe（WebView2 依赖系统自带的
+      # Evergreen 运行时，Win11 内置；Win10 缺失时安装包会自动补装而便携包不会）
+      - name: build portable archive (windows)
+        if: startsWith(matrix.platform, 'windows')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = "target/x86_64-pc-windows-msvc/release"
+          if (-not (Test-Path "$dir/yunshu.exe")) { throw "yunshu.exe not found in $dir" }
+          $version = (Get-Content crates/yunshu-app/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $zip = "云书_${version}_windows_x64_portable.zip"
+          $stage = "portable-staging/云书"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "$dir/yunshu.exe" -Destination "$stage/云书.exe"
+          @(
+            "云书 $version 便携版（免安装）"
+            ""
+            "双击 云书.exe 直接运行，无需安装。"
+            "需系统已安装 WebView2 运行时：Win11 自带；Win10 若无法启动，"
+            "请到 https://developer.microsoft.com/microsoft-edge/webview2/ 安装。"
+            ""
+            "设置与接收的文件都在用户目录下，删除本文件夹即可完全卸载。"
+          ) | Set-Content -Path "$stage/使用说明.txt" -Encoding utf8
+          Compress-Archive -Path "portable-staging/云书" -DestinationPath $zip -Force
+
+      - name: verify artifacts
+        shell: bash
+        run: |
+          ok=1
+          while IFS= read -r pat; do
+            [ -z "$pat" ] && continue
+            if ! compgen -G "$pat" > /dev/null; then
+              echo "::error::缺少打包产物：$pat"
+              ok=0
+            else
+              ls -1 $pat
+            fi
+          done <<'PATTERNS'
+          ${{ matrix.files }}
+          PATTERNS
+          [ "$ok" = 1 ] || exit 1
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: yunshu-${{ matrix.target }}
+          path: ${{ matrix.files }}
+          if-no-files-found: error
+
+      - name: create release and upload assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.files }}
+          body: ${{ steps.release_notes.outputs.body || 'See assets to download and install.' }}
+          fail_on_unmatched_files: true
