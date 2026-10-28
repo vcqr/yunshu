@@ -57,7 +57,7 @@ jobs:
         run: |
           sudo apt-get update
           # libpipewire-0.3-dev：xcap 在 Linux 的抓屏走 PipeWire（libspa-sys 经 pkg-config 探测）
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils libpipewire-0.3-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils libpipewire-0.3-dev libgbm-dev
 
       - name: setup node
         uses: actions/setup-node@v4
