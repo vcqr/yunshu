@@ -17,6 +17,9 @@ export interface Device {
 
 export type MessageKind = 'text' | 'system'
 
+/** 头像右下角状态灯：online 绿 / stealth 隐身黄 / dnd 免打扰紫 / offline 灰 */
+export type Presence = 'online' | 'stealth' | 'dnd' | 'offline'
+
 export interface ChatMessage {
   id: string
   from: string // deviceId 或 'me'

@@ -33,6 +33,8 @@ export interface RelayState {
   chatStyle: ChatStyle
   /** 防打扰：仅已信任设备可连接，广播静音 */
   dnd: boolean
+  /** 隐身模式：不向局域网广播本机（头像状态灯与设置弹窗用） */
+  stealth: boolean
   /** 未读消息数：key 为 peer id（'broadcast' | 'phone' | 设备 id），切入会话即清零 */
   unread: Record<string, number>
   /** 远程控制：本机临时密码（每次启动重新生成） */
@@ -71,6 +73,7 @@ export const store = reactive<RelayState>({
   transferPanelOpen: true,
   chatStyle: 'bubble',
   dnd: false,
+  stealth: false,
   unread: {},
   remoteTempPassword: null,
   remoteMachineId: null,

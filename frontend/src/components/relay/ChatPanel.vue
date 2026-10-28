@@ -168,7 +168,7 @@ function switchChatStyle() {
         >
           <Radio class="size-3.5" />
         </span>
-        <RelayAvatar v-if="!isBroadcast" :name="peerName" size="sm" :online="peerOnline" />
+        <RelayAvatar v-if="!isBroadcast" :name="peerName" size="sm" :presence="peerOnline ? 'online' : 'offline'" />
         <p class="min-w-0 flex-1 truncate text-sm font-semibold">
           {{ peerName }}
           <span v-if="isBroadcast" class="ml-2 text-xs font-normal text-muted-foreground">

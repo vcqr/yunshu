@@ -23,6 +23,11 @@ const phoneName = computed(() => (store.phoneConnected ? store.phoneName : '手�
 const others = computed(() => store.devices)
 const activeFor = (id: string) => deviceHasActiveTransfer(id)
 
+/** 本机状态灯：隐身 > 免打扰 > 在线（同时开启时隐身优先） */
+const myPresence = computed<'online' | 'stealth' | 'dnd'>(() =>
+  store.stealth ? 'stealth' : store.dnd ? 'dnd' : 'online'
+)
+
 /* ------------------------------ 在线设备搜索 ------------------------------ */
 /* 按名称 / IP / 机器 ID 过滤（设备多时快速定位） */
 const search = ref('')
@@ -199,7 +204,7 @@ async function ctxSendFolderPhone() {
       )"
       @click="emit('select', 'self')"
     >
-      <RelayAvatar :name="store.meName" size="sm" :online="true" />
+      <RelayAvatar :name="store.meName" size="sm" :presence="myPresence" />
       <div class="min-w-0 flex-1 leading-tight">
         <p class="truncate text-[13px] font-medium" :title="store.meName">
           {{ store.meName }}
@@ -359,7 +364,7 @@ async function ctxSendFolderPhone() {
             @click="onSelectDevice(d)"
             @contextmenu.prevent="openCtx($event, d)"
           >
-            <RelayAvatar :name="d.name" size="sm" :online="d.online" />
+            <RelayAvatar :name="d.name" size="sm" :presence="d.online ? 'online' : 'offline'" />
             <span
               class="min-w-0 flex-1 truncate text-[13px]"
               :class="unreadFor(d.id) > 0 ? 'font-semibold' : 'font-medium'"

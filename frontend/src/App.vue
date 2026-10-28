@@ -87,6 +87,7 @@ async function saveSettings() {
     })
     store.meName = s.device_name
     store.dnd = s.dnd_mode
+    store.stealth = s.stealth_mode
     if (s.remote_fixed_password !== '') s.has_fixed_password = true
     toast.success('设置已保存（端口、目录重启后生效）')
     showSettings.value = false
@@ -157,7 +158,11 @@ onMounted(async () => {
   // 主界面直接展示本机机器 ID（远程控制/对方添加本机都要用）；临时密码走事件流
   invoke<any>('get_settings')
     .then((s) => {
-      if (s) mutations.setRemoteMachineId(s.machine_id || null)
+      if (s) {
+        mutations.setRemoteMachineId(s.machine_id || null)
+        store.dnd = !!s.dnd_mode
+        store.stealth = !!s.stealth_mode
+      }
     })
     .catch(() => {})
 })

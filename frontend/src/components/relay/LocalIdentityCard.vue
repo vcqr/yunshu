@@ -11,6 +11,11 @@ import { store } from '../../stores/relay-store'
 import { relayActions } from '../../hooks/use-relay'
 import { toast } from '../../hooks/use-toast'
 
+/** 本机状态灯：隐身 > 免打扰 > 在线（与侧栏「我」行一致） */
+const myPresence = computed<'online' | 'stealth' | 'dnd'>(() =>
+  store.stealth ? 'stealth' : store.dnd ? 'dnd' : 'online'
+)
+
 /* 密码默认打码（防肩窥/录屏），点眼睛显示 */
 const showPw = ref(false)
 const idText = computed(() => store.remoteMachineId || '')
@@ -61,7 +66,7 @@ function connectPeer() {
   >
     <!-- 头部（与会话头同规格）：自己的头像 + 设备名/IP -->
     <div class="flex h-11 shrink-0 items-center gap-2.5 border-b bg-card/70 px-3 backdrop-blur-sm">
-      <RelayAvatar :name="store.meName" size="sm" :online="true" />
+      <RelayAvatar :name="store.meName" size="sm" :presence="myPresence" />
       <p class="min-w-0 flex-1 truncate text-sm font-semibold">
         {{ store.meName }}
         <span v-if="store.meIp" class="ml-2 font-mono text-xs font-normal text-muted-foreground">{{ store.meIp }}</span>
