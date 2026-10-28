@@ -10,6 +10,7 @@ import {
   ArrowLeftRight, Bell, BellOff, Menu, Moon, PanelRight, Settings2, Sun,
 } from '@lucide/vue'
 import AppLogo from './AppLogo.vue'
+import RelayAvatar from './RelayAvatar.vue'
 import TrafficLights from './TrafficLights.vue'
 import TransferPanel from './TransferPanel.vue'
 import { store, toggleTransferPanelPersist } from '../../stores/relay-store'
@@ -25,6 +26,7 @@ import {
 const emit = defineEmits<{
   (e: 'open-settings'): void
   (e: 'toggle-sidebar'): void
+  (e: 'go-home'): void
 }>()
 
 const activeCount = computed(
@@ -38,6 +40,13 @@ const badge = computed(() =>
   activeCount.value > 0
     ? activeCount.value > 9 ? '9+' : String(activeCount.value)
     : ''
+)
+
+/** 在「本机识别」首页（头像高亮） */
+const inHome = computed(() => store.selectedPeer === 'self')
+/** 各会话未读总数：首页头像角标（首页本身看不到各会话未读，靠它提醒） */
+const homeUnread = computed(() =>
+  Object.values(store.unread).reduce((sum, n) => sum + n, 0)
 )
 
 const transferOpen = ref(false)
@@ -158,6 +167,25 @@ const transferOpen = ref(false)
         @click="emit('open-settings')"
       >
         <Settings2 class="size-4" />
+      </button>
+
+      <!-- 自己的头像：回到「本机识别」首页（机器 ID + 验证码），选中会话时提示未读 -->
+      <button
+        aria-label="本机识别（机器 ID 与验证码）"
+        title="本机识别"
+        :aria-pressed="inHome"
+        :class="cn(
+          'relative flex size-9 items-center justify-center rounded-lg transition-colors',
+          inHome ? 'bg-accent' : 'hover:bg-accent'
+        )"
+        @click="emit('go-home')"
+      >
+        <RelayAvatar :name="store.meName" size="sm" :online="true" />
+        <span
+          v-if="homeUnread > 0"
+          aria-hidden="true"
+          class="absolute top-0.5 right-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-red-500 px-0.5 text-[9px] font-bold leading-none text-white"
+        >{{ homeUnread > 9 ? '9+' : homeUnread }}</span>
       </button>
 
       <!-- Windows/Linux 方块窗口按钮：只在 Tauri 壳里渲染；浏览器里不显示（关闭=隐藏进托盘，退出走托盘菜单） -->

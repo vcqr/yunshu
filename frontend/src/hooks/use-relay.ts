@@ -132,10 +132,10 @@ function applyPeers(peers: any[]) {
     }
   }
   mutations.setDevices(devices)
-  // 选中设备消失时回到广播会话
-  if (selected && selected !== 'phone' && selected !== 'broadcast' &&
+  // 选中设备消失时回到本机识别首页
+  if (selected && selected !== 'self' && selected !== 'phone' && selected !== 'broadcast' &&
       !devices.some((d) => d.id === selected)) {
-    mutations.setSelectedPeer('broadcast')
+    mutations.setSelectedPeer('self')
   }
 }
 

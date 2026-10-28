@@ -133,7 +133,7 @@ function ctxRemoveHost() {
   const d = ctx.value?.device
   closeCtx()
   if (!d?.addr) return
-  if (d.id === store.selectedPeer) mutations.setSelectedPeer('broadcast')
+  if (d.id === store.selectedPeer) mutations.setSelectedPeer('self')
   relayActions.removeHost(d.addr)
 }
 /** 点击设备：离线的手动主机顺手发起重连 */
@@ -184,10 +184,20 @@ async function ctxSendFolderPhone() {
 
 <template>
   <div class="flex h-full min-h-0 flex-col gap-1.5 p-2">
-    <!-- 我的信息行 -->
-    <div
-      class="flex h-10 items-center gap-2.5 rounded-lg px-2 md:h-9"
-      :title="`${store.meName} · ${store.meIp || store.serverAddr}`"
+    <!-- 我的信息行：点击回到「本机识别」首页（与头部头像一致） -->
+    <button
+      type="button"
+      role="tab"
+      :aria-selected="store.selectedPeer === 'self'"
+      :title="`${store.meName} · 本机识别（机器 ID 与验证码）`"
+      :class="cn(
+        'flex h-10 w-full items-center gap-2.5 rounded-lg px-2 text-left transition-colors md:h-9',
+        'focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none',
+        store.selectedPeer === 'self'
+          ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300'
+          : 'hover:bg-accent'
+      )"
+      @click="emit('select', 'self')"
     >
       <RelayAvatar :name="store.meName" size="sm" :online="true" />
       <div class="min-w-0 flex-1 leading-tight">
@@ -200,7 +210,7 @@ async function ctxSendFolderPhone() {
         v-if="store.meIp"
         class="shrink-0 font-mono text-[10px] text-muted-foreground"
       >{{ store.meIp }}</span>
-    </div>
+    </button>
 
     <!-- 会话 -->
     <div class="shrink-0">

@@ -14,7 +14,7 @@ export interface RelayState {
   meIp: string
   connection: ConnectionState
   devices: Device[]           // 飞鸽电脑设备（手机作为伪设备单独处理）
-  selectedPeer: string        // 'phone' | 'broadcast' 或 deviceId
+  selectedPeer: string        // 'self'（本机识别首页）| 'phone' | 'broadcast' 或 deviceId
   phoneConnected: boolean     // 手机配对状态
   phoneName: string
   messages: ChatMessage[]
@@ -54,7 +54,7 @@ export const store = reactive<RelayState>({
   meIp: '',
   connection: 'connecting',
   devices: [],
-  selectedPeer: 'broadcast',
+  selectedPeer: 'self',
   phoneConnected: false,
   phoneName: '手机',
   messages: [],

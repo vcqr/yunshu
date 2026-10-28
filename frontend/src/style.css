@@ -68,11 +68,14 @@
 
 @layer base {
   * { border-color: var(--color-border); outline-color: color-mix(in oklab, var(--color-ring) 50%, transparent); }
-  html, body, #app { height: 100%; }
-  /* body 背景透明：窗口圆角（body.window-rounded）外的四角透出桌面，
-     页面底色由 App 根节点 .airpigeon-bg 承担 */
+  /* 圆角窗口前提（AShell 方案，缺一不可）：
+     - background transparent：圆角外的四角透出桌面，页面底色由 .airpigeon-bg 承担；
+     - html 必须 overflow:hidden —— CSS 规定 html 为默认 visible 时，body 的
+       overflow:hidden 会传播给视口、body 自身变成 visible，body.window-rounded
+       的 border-radius 就裁不住内容（四角方角的根因）；html 非 visible 后
+       body 的 overflow 才在自己身上生效 */
+  html, body, #app { height: 100%; background: transparent; overflow: hidden; }
   body {
-    background: transparent;
     color: var(--color-foreground);
     font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
   }

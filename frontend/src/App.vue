@@ -27,7 +27,7 @@ const sidebarOpen = ref(false)
 function onDrop(e: Event) {
   const paths: string[] = (e as CustomEvent).detail
   const peer = store.selectedPeer
-  if (!peer || peer === 'broadcast') {
+  if (!peer || peer === 'broadcast' || peer === 'self') {
     toast.error('先在左侧选择一台设备')
     return
   }
@@ -168,6 +168,7 @@ onMounted(async () => {
     <AppHeader
       @open-settings="openSettings"
       @toggle-sidebar="sidebarOpen = true"
+      @go-home="mutations.setSelectedPeer('self')"
     />
 
     <!-- 被控醒目横幅（安全要求：被控状态必须持续可见 + 一键断开） -->
@@ -199,10 +200,11 @@ onMounted(async () => {
         />
       </aside>
 
-      <!-- 中栏：本机识别卡（ID/验证码 + 远程协助直连） + 会话主体 -->
+      <!-- 中栏：默认「本机识别」首页（机器 ID/验证码 + 远程协助）；
+           选中手机或主机后整个中栏切为会话布局 -->
       <div class="flex min-h-0 min-w-0 flex-1 flex-col">
-        <LocalIdentityCard />
-        <ChatPanel :peer="store.selectedPeer" />
+        <LocalIdentityCard v-if="store.selectedPeer === 'self'" />
+        <ChatPanel v-else :peer="store.selectedPeer" />
       </div>
 
       <!-- 第三栏：传输任务面板（lg+ 常驻，可收起/展开） -->
