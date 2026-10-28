@@ -37,6 +37,12 @@ jobs:
             bundles: "appimage"
             files: |
               target/x86_64-unknown-linux-gnu/release/bundle/appimage/yunshu_*.AppImage
+          # Linux ARM64（原生 ARM runner）
+          - platform: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundles: "appimage"
+            files: |
+              target/aarch64-unknown-linux-gnu/release/bundle/appimage/yunshu_*.AppImage
           # Windows x86_64（NSIS 安装包 + 免安装便携包）
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
@@ -44,6 +50,13 @@ jobs:
             files: |
               target/x86_64-pc-windows-msvc/release/bundle/nsis/yunshu_*.exe
               yunshu_*_windows_x64_portable.zip
+          # Windows ARM64（原生 ARM runner）
+          - platform: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bundles: "nsis"
+            files: |
+              target/aarch64-pc-windows-msvc/release/bundle/nsis/yunshu_*.exe
+              yunshu_*_windows_arm64_portable.zip
 
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 60
@@ -129,10 +142,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $dir = "target/x86_64-pc-windows-msvc/release"
+          $dir = "target/${{ matrix.target }}/release"
           if (-not (Test-Path "$dir/yunshu.exe")) { throw "yunshu.exe not found in $dir" }
+          $arch = if ("${{ matrix.target }}".StartsWith("x86_64")) { "x64" } else { "arm64" }
           $version = (Get-Content crates/yunshu-app/tauri.conf.json -Raw | ConvertFrom-Json).version
-          $zip = "yunshu_${version}_windows_x64_portable.zip"
+          $zip = "yunshu_${version}_windows_${arch}_portable.zip"
           $stage = "portable-staging/云书"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "$dir/yunshu.exe" -Destination "$stage/云书.exe"
