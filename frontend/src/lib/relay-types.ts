@@ -15,7 +15,7 @@ export interface Device {
   addr?: string
 }
 
-export type MessageKind = 'text' | 'clipboard' | 'system'
+export type MessageKind = 'text' | 'system'
 
 export interface ChatMessage {
   id: string

@@ -3,17 +3,16 @@
  * MessageList：消息流渲染，支持两种显示格式：
  * - bubble：气泡模式（微信式，头像 + 左右分侧气泡）
  * - list：列表模式（IRC 式，「时间 姓名： 内容」单行紧凑，信息密度高）
- * 传输卡片/剪贴板卡片在两种模式下均保留功能性展示，自动滚底
+ * 传输卡片在两种模式下均保留功能性展示，自动滚底
  */
 import { computed, nextTick, ref, watch } from 'vue'
-import { ClipboardList, Copy, MessageSquare } from '@lucide/vue'
+import { MessageSquare } from '@lucide/vue'
 import RelayAvatar from './RelayAvatar.vue'
 import TransferCard from './TransferCard.vue'
 import { formatTime } from '../../lib/relay-format'
 import { store } from '../../stores/relay-store'
-import { toast } from '../../hooks/use-toast'
 import { cn } from '../../lib/utils'
-import type { ChatEntry, ChatMessage } from '../../lib/relay-types'
+import type { ChatEntry } from '../../lib/relay-types'
 
 const props = defineProps<{ entries: ChatEntry[] }>()
 
@@ -53,19 +52,6 @@ const renderItems = computed<RenderItem[]>(() => {
 })
 
 const isList = computed(() => store.chatStyle === 'list')
-
-async function copyContent(text: string) {
-  try {
-    await navigator.clipboard.writeText(text)
-    toast.success('已复制到剪贴板')
-  } catch {
-    toast.error('复制失败，请手动选择复制')
-  }
-}
-
-function summaryOf(m: ChatMessage): string {
-  return m.content.replace(/\s+/g, ' ').trim()
-}
 </script>
 
 <template>
@@ -129,30 +115,7 @@ function summaryOf(m: ChatMessage): string {
             >
               {{ item.entry.message.from === 'me' ? '我' : item.entry.message.fromName }}
             </span>
-            <template v-if="item.entry.message.kind === 'clipboard'">
-              <span
-                class="text-muted-foreground flex shrink-0 items-center gap-1 text-[12px] leading-5"
-                :title="item.entry.message.content"
-              >
-                <ClipboardList class="size-3 shrink-0 text-emerald-600/70 dark:text-emerald-400/70" aria-hidden="true" />
-                [剪贴板]
-              </span>
-              <p
-                class="text-foreground/75 min-w-0 flex-1 truncate text-[13px] leading-5"
-                :title="item.entry.message.content"
-              >
-                {{ summaryOf(item.entry.message) || '（空）' }}
-              </p>
-              <button
-                aria-label="复制剪贴板内容"
-                title="复制完整内容"
-                class="text-muted-foreground hover:text-foreground size-6 shrink-0 self-center rounded-md opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 hover:bg-accent"
-                @click="copyContent(item.entry.message.content)"
-              >
-                <Copy class="size-3" />
-              </button>
-            </template>
-            <p v-else class="min-w-0 flex-1 text-[13px] leading-5 break-words whitespace-pre-wrap">
+            <p class="min-w-0 flex-1 text-[13px] leading-5 break-words whitespace-pre-wrap">
               {{ item.entry.message.content }}
             </p>
           </div>
@@ -160,51 +123,8 @@ function summaryOf(m: ChatMessage): string {
 
         <!-- 气泡模式（默认） -->
         <div v-else class="px-2.5 sm:px-3">
-          <!-- 剪贴板卡片 -->
-          <div
-            v-if="item.entry.message.kind === 'clipboard'"
-            :class="item.entry.message.from === 'me' ? 'flex justify-end gap-2 py-0.5' : 'flex items-start justify-start gap-2 py-0.5'"
-          >
-            <template v-if="item.entry.message.from !== 'me'">
-              <RelayAvatar
-                v-if="!item.grouped"
-                :name="item.entry.message.fromName"
-                size="sm"
-                class="mb-auto"
-              />
-              <div v-else class="w-7 shrink-0" aria-hidden="true"></div>
-            </template>
-            <div class="flex max-w-[85%] flex-col gap-0.5 sm:max-w-[68%]">
-              <p v-if="!item.grouped" class="text-[10px] font-medium text-foreground/70">
-                {{ item.entry.message.from === 'me' ? '我' : item.entry.message.fromName }}
-                <span class="ml-1.5 font-normal text-muted-foreground">{{ formatTime(item.entry.message.createdAt) }}</span>
-              </p>
-              <div class="overflow-hidden rounded-xl border bg-card shadow-sm">
-                <div class="flex items-center gap-1.5 border-b bg-muted/40 px-2.5 py-1">
-                  <span class="text-emerald-600 dark:text-emerald-400 flex size-5 items-center justify-center rounded-md bg-emerald-500/15">
-                    <ClipboardList class="size-3" />
-                  </span>
-                  <span class="text-[10px] font-medium text-muted-foreground">剪贴板</span>
-                  <span class="ml-auto text-[10px] text-muted-foreground tabular-nums">
-                    {{ item.entry.message.content.length }} 字符
-                  </span>
-                </div>
-                <pre class="custom-scroll max-h-36 overflow-auto px-2.5 py-2 font-mono text-[11px] leading-relaxed break-all whitespace-pre-wrap">{{ item.entry.message.content }}</pre>
-                <div class="border-t p-1">
-                  <button
-                    class="text-emerald-600 hover:text-emerald-700 dark:text-emerald-400 hover:bg-emerald-500/10 flex h-7 items-center gap-1.5 rounded-md px-2 text-[11px] transition-colors"
-                    @click="copyContent(item.entry.message.content)"
-                  >
-                    <Copy class="size-3" />
-                    复制到剪贴板
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
           <!-- 文本气泡 -->
           <div
-            v-else
             :class="item.entry.message.from === 'me' ? 'flex justify-end gap-2 py-0.5' : 'flex items-start justify-start gap-2 py-0.5'"
           >
             <template v-if="item.entry.message.from !== 'me'">

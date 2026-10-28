@@ -179,9 +179,10 @@ async function apply(ev: any) {
       }
       break
     case 'text_from_phone':
+      // 手机发来的文本按普通消息展示（core 侧仍会同步写入电脑剪贴板）
       mutations.addMessage({
         id: uuid(), from: 'phone', fromName: store.phoneConnected ? store.phoneName : '手机', to: 'me',
-        kind: 'clipboard', content: ev.text, createdAt: Date.now(),
+        kind: 'text', content: ev.text, createdAt: Date.now(),
       })
       if (store.selectedPeer !== 'phone') {
         mutations.bumpUnread('phone')
