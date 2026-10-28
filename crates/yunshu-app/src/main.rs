@@ -556,6 +556,15 @@ fn set_dnd(state: tauri::State<AppState>, enabled: bool) -> Result<(), String> {
     s.save()
 }
 
+/// 隐身模式开关（状态菜单）：立即生效并持久化
+#[tauri::command]
+fn set_stealth(state: tauri::State<AppState>, enabled: bool) -> Result<(), String> {
+    let _ = state.ui_tx.send(UiRequest::SetStealth(enabled));
+    let mut s = yunshu_core::settings::Settings::load_or_default();
+    s.stealth_mode = enabled;
+    s.save()
+}
+
 // ---- 远程控制 ----
 
 #[tauri::command]
@@ -937,6 +946,7 @@ fn main() {
             get_settings,
             save_settings,
             set_dnd,
+            set_stealth,
             remote_connect,
             remote_disconnect,
             remote_send_files,

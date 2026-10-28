@@ -376,6 +376,17 @@ export const relayActions = {
       .then(() => mutations.setDnd(enabled))
       .catch((e) => toast.error(`切换失败：${String(e)}`))
   },
+  /** 本机状态一键切换（状态菜单）：在线/免打扰/隐身互斥，两个开关一起下发 */
+  setPresence(dnd: boolean, stealth: boolean) {
+    invoke('set_dnd', { enabled: dnd })
+      .then(() => mutations.setDnd(dnd))
+      .catch((e) => toast.error(`切换防打扰失败：${String(e)}`))
+    invoke('set_stealth', { enabled: stealth })
+      .then(() => {
+        store.stealth = stealth
+      })
+      .catch((e) => toast.error(`切换隐身失败：${String(e)}`))
+  },
   openFolder(path: string) {
     invoke('open_folder', { path }).catch((e) => toast.error(`打开文件夹失败：${String(e)}`))
   },

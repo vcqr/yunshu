@@ -2,7 +2,7 @@
  * 云书 — 全局状态（移植自 demo relay-store，zustand → Vue reactive）
  */
 import { reactive } from 'vue'
-import type { ChatMessage, ConnectionState, Device, Transfer } from '../lib/relay-types'
+import type { ChatMessage, ConnectionState, Device, Presence, Transfer } from '../lib/relay-types'
 
 export const PANEL_PREF_KEY = 'yunshu.panel.transfer'
 export const CHAT_STYLE_KEY = 'yunshu.chat.style'
@@ -257,6 +257,11 @@ export function deviceHasActiveTransfer(deviceId: string): boolean {
       ((t.from === deviceId && t.to === 'me') || (t.from === 'me' && t.to === deviceId)) &&
       (t.status === 'pending' || t.status === 'uploading')
   )
+}
+
+/** 本机状态（隐身 > 免打扰 > 在线，同时开启时隐身优先；侧栏/首页状态灯共用） */
+export function myPresence(): Presence {
+  return store.stealth ? 'stealth' : store.dnd ? 'dnd' : 'online'
 }
 
 export function splitTransfers(): { active: Transfer[]; finished: Transfer[] } {

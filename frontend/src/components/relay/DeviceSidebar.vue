@@ -6,12 +6,12 @@
  */
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
-  FileUp, FolderUp, Laptop, Lock, MessagesSquare, MonitorUp, HandMetal, Plus, Radio,
+  Check, FileUp, FolderUp, Laptop, Lock, MessagesSquare, MonitorUp, HandMetal, Plus, Radio,
   RefreshCw, Satellite, Smartphone, Trash2,
 } from '@lucide/vue'
 import RelayAvatar from './RelayAvatar.vue'
 import UnreadBadge from './UnreadBadge.vue'
-import { store, mutations, deviceHasActiveTransfer, unreadFor } from '../../stores/relay-store'
+import { store, mutations, deviceHasActiveTransfer, unreadFor, myPresence } from '../../stores/relay-store'
 import { relayActions } from '../../hooks/use-relay'
 import { toast } from '../../hooks/use-toast'
 import { cn } from '../../lib/utils'
@@ -23,10 +23,53 @@ const phoneName = computed(() => (store.phoneConnected ? store.phoneName : '手�
 const others = computed(() => store.devices)
 const activeFor = (id: string) => deviceHasActiveTransfer(id)
 
-/** 本机状态灯：隐身 > 免打扰 > 在线（同时开启时隐身优先） */
-const myPresence = computed<'online' | 'stealth' | 'dnd'>(() =>
-  store.stealth ? 'stealth' : store.dnd ? 'dnd' : 'online'
-)
+/* ------------------------------ 本机状态菜单 ------------------------------ */
+/* Slack 式：点头像弹状态菜单（在线/免打扰/隐身互斥一键切换），点行体回首页 */
+
+type PresenceOption = {
+  value: 'online' | 'dnd' | 'stealth'
+  label: string
+  desc: string
+  dot: string
+}
+
+const presenceOptions: PresenceOption[] = [
+  {
+    value: 'online',
+    label: '在线',
+    desc: '正常广播本机并接受连接',
+    dot: 'bg-emerald-500',
+  },
+  {
+    value: 'dnd',
+    label: '免打扰',
+    desc: '仅已信任设备可连接，广播消息静音',
+    dot: 'bg-violet-500',
+  },
+  {
+    value: 'stealth',
+    label: '隐身',
+    desc: '不向局域网广播本机，他人列表立即移除',
+    dot: 'bg-amber-400',
+  },
+]
+
+const presenceMenu = ref<{ x: number; y: number } | null>(null)
+
+function openPresenceMenu(e: MouseEvent) {
+  const w = 252
+  const h = 186
+  presenceMenu.value = {
+    x: Math.max(4, Math.min(e.clientX + 8, window.innerWidth - w - 4)),
+    y: Math.max(4, Math.min(e.clientY + 12, window.innerHeight - h - 4)),
+  }
+}
+
+function pickPresence(value: PresenceOption['value']) {
+  presenceMenu.value = null
+  // 三态互斥一键切换（精细组合可去设置里配）
+  relayActions.setPresence(value === 'dnd', value === 'stealth')
+}
 
 /* ------------------------------ 在线设备搜索 ------------------------------ */
 /* 按名称 / IP / 机器 ID 过滤（设备多时快速定位） */
@@ -189,33 +232,40 @@ async function ctxSendFolderPhone() {
 
 <template>
   <div class="flex h-full min-h-0 flex-col gap-1.5 p-2">
-    <!-- 我的信息行：点击回到「本机识别」首页（与头部头像一致） -->
-    <button
-      type="button"
-      role="tab"
-      :aria-selected="store.selectedPeer === 'self'"
-      :title="`${store.meName} · 本机识别（机器 ID 与验证码）`"
-      :class="cn(
-        'flex h-10 w-full items-center gap-2.5 rounded-lg px-2 text-left transition-colors md:h-9',
-        'focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none',
+    <!-- 我的信息行：头像钮弹状态菜单；行体点击回「本机识别」首页 -->
+    <div
+      class="group flex h-10 w-full items-center gap-2.5 rounded-lg px-2 transition-colors md:h-9"
+      :class="
         store.selectedPeer === 'self'
           ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300'
           : 'hover:bg-accent'
-      )"
-      @click="emit('select', 'self')"
+      "
     >
-      <RelayAvatar :name="store.meName" size="sm" :presence="myPresence" />
-      <div class="min-w-0 flex-1 leading-tight">
+      <button
+        type="button"
+        class="relative shrink-0 rounded-full outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+        title="更改本机状态"
+        aria-label="更改本机状态"
+        @click.stop="openPresenceMenu($event)"
+      >
+        <RelayAvatar :name="store.meName" size="sm" :presence="myPresence()" />
+      </button>
+      <button
+        type="button"
+        class="min-w-0 flex-1 text-left leading-tight outline-none focus-visible:rounded-lg focus-visible:ring-[3px] focus-visible:ring-ring/50"
+        :title="`${store.meName} · 本机识别（机器 ID 与验证码）`"
+        @click="emit('select', 'self')"
+      >
         <p class="truncate text-[13px] font-medium" :title="store.meName">
           {{ store.meName }}
           <span class="ml-1 text-[10px] font-normal text-muted-foreground">（我）</span>
         </p>
-      </div>
+      </button>
       <span
         v-if="store.meIp"
         class="shrink-0 font-mono text-[10px] text-muted-foreground"
       >{{ store.meIp }}</span>
-    </button>
+    </div>
 
     <!-- 会话 -->
     <div class="shrink-0">
@@ -411,6 +461,50 @@ async function ctxSendFolderPhone() {
         </div>
       </div>
     </div>
+
+    <!-- 本机状态菜单（Teleport 到 body，点击外部关闭） -->
+    <Teleport to="body">
+      <div
+        v-if="presenceMenu"
+        class="fixed inset-0 z-[70]"
+        @click="presenceMenu = null"
+        @contextmenu.prevent="presenceMenu = null"
+      >
+        <div
+          class="bg-popover absolute w-64 overflow-hidden rounded-xl border p-1.5 shadow-lg"
+          :style="{ left: presenceMenu.x + 'px', top: presenceMenu.y + 'px' }"
+          role="menu"
+          aria-label="本机状态"
+        >
+          <p class="px-2.5 py-1.5 text-[10px] font-medium tracking-wide text-muted-foreground">
+            本机状态
+          </p>
+          <button
+            v-for="opt in presenceOptions"
+            :key="opt.value"
+            type="button"
+            role="menuitemradio"
+            :aria-checked="myPresence() === opt.value"
+            class="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-accent"
+            @click="pickPresence(opt.value)"
+          >
+            <span
+              :class="cn('size-2.5 shrink-0 rounded-full', opt.dot)"
+              aria-hidden="true"
+            />
+            <span class="min-w-0 flex-1">
+              <span class="block text-[13px] font-medium">{{ opt.label }}</span>
+              <span class="block text-[10px] leading-snug text-muted-foreground">{{ opt.desc }}</span>
+            </span>
+            <Check
+              v-if="myPresence() === opt.value"
+              class="size-4 shrink-0 text-emerald-600 dark:text-emerald-400"
+              aria-hidden="true"
+            />
+          </button>
+        </div>
+      </div>
+    </Teleport>
 
     <!-- 电脑右键菜单 -->
     <Teleport to="body">

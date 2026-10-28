@@ -7,13 +7,12 @@
  */
 import { computed, ref } from 'vue'
 import {
-  ArrowLeftRight, Bell, BellOff, Menu, Moon, PanelRight, Settings2, Sun,
+  ArrowLeftRight, Moon, PanelRight, Settings2, Sun,
 } from '@lucide/vue'
 import AppLogo from './AppLogo.vue'
 import TrafficLights from './TrafficLights.vue'
 import TransferPanel from './TransferPanel.vue'
 import { store, toggleTransferPanelPersist } from '../../stores/relay-store'
-import { relayActions } from '../../hooks/use-relay'
 import { toggleTheme } from '../../lib/theme'
 import { cn } from '../../lib/utils'
 import {
@@ -123,22 +122,7 @@ const transferOpen = ref(false)
         >{{ badge }}</span>
       </button>
 
-      <!-- 防打扰开关 -->
-      <button
-        :aria-label="store.dnd ? '关闭防打扰' : '开启防打扰'"
-        :aria-pressed="store.dnd"
-        :title="store.dnd ? '防打扰已开启：仅已信任设备可连接，广播已静音（点击关闭）' : '开启防打扰：仅已信任设备可连接，广播消息静音'"
-        :class="cn(
-          'flex size-9 items-center justify-center rounded-lg transition-colors',
-          store.dnd
-            ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-            : 'text-muted-foreground hover:bg-accent hover:text-foreground'
-        )"
-        @click="relayActions.setDnd(!store.dnd)"
-      >
-        <BellOff v-if="store.dnd" class="size-4" />
-        <Bell v-else class="size-4" />
-      </button>
+      <!-- 防打扰开关已收敛到侧栏「我」行的状态菜单（头像点按） -->
 
       <!-- 主题切换 -->
       <button
