@@ -2440,11 +2440,6 @@ pub async fn handle_view_socket(
             continue;
         };
         match v.get("t").and_then(|t| t.as_str()) {
-            Some("input") if !readonly => {
-                if let Ok(ev) = serde_json::from_value::<InputEvent>(v) {
-                    let _ = out_tx.try_send(RemoteOut::Control(RemoteWire::RemoteInput { ev }));
-                }
-            }
             Some("clip_paste") if !readonly => {
                 if let Some(text) = crate::clipboard::read_text()
                     && text.len() <= CLIPBOARD_MAX
@@ -2505,7 +2500,16 @@ pub async fn handle_view_socket(
                     view.closed.store(true, Ordering::Relaxed);
                 }
             }
-            _ => {}
+            // 其余消息按输入事件反序列化：观看页的 t 即事件类型
+            // （mouse_move/mouse_down/mouse_up/wheel/key_down/key_up，与
+            // InputEvent 的 serde tag 一致）；只读观看连接不注入
+            _ => {
+                if !readonly
+                    && let Ok(ev) = serde_json::from_value::<InputEvent>(v)
+                {
+                    let _ = out_tx.try_send(RemoteOut::Control(RemoteWire::RemoteInput { ev }));
+                }
+            }
         }
     }
     writer.abort();
@@ -2773,6 +2777,47 @@ mod tests {
         assert_eq!(id.len(), 8);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(id, machine_id());
+    }
+
+    #[test]
+    fn viewer_bridge_input_json_deserializes() {
+        // 观看桥上行：viewer.js 直接发 InputEvent 的 serde tag（t 即事件类型）。
+        // 回归：曾错误匹配 t=="input" 导致键鼠上行全部丢失。
+        let cases: Vec<(serde_json::Value, InputEvent)> = vec![
+            (
+                serde_json::json!({"t": "mouse_move", "x": 0.5, "y": 0.25}),
+                InputEvent::MouseMove { x: 0.5, y: 0.25 },
+            ),
+            (
+                serde_json::json!({"t": "mouse_down", "btn": 0}),
+                InputEvent::MouseDown { btn: 0 },
+            ),
+            (
+                serde_json::json!({"t": "mouse_up", "btn": 2}),
+                InputEvent::MouseUp { btn: 2 },
+            ),
+            (serde_json::json!({"t": "wheel", "dy": -120.0}), InputEvent::Wheel { dy: -120.0 }),
+            (
+                serde_json::json!({"t": "key_down", "key": "a"}),
+                InputEvent::KeyDown { key: "a".into() },
+            ),
+            (
+                serde_json::json!({"t": "key_up", "key": "ControlLeft"}),
+                InputEvent::KeyUp { key: "ControlLeft".into() },
+            ),
+        ];
+        for (json, want) in cases {
+            let ev: InputEvent = serde_json::from_value(json.clone())
+                .unwrap_or_else(|e| panic!("{json} 反序列化失败: {e}"));
+            assert!(matches!(
+                (std::mem::discriminant(&ev), std::mem::discriminant(&want)),
+                (a, b) if a == b
+            ));
+        }
+        // 错误匹配的 "input" 包裹格式不成立（防止回归）
+        assert!(serde_json::from_value::<InputEvent>(serde_json::json!({"t": "input"})).is_err());
+        // 非输入消息（桥控制类）不反序列化为事件
+        assert!(serde_json::from_value::<InputEvent>(serde_json::json!({"t": "quality", "tier": 1080})).is_err());
     }
 
     #[test]
