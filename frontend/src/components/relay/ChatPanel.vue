@@ -30,13 +30,6 @@ const entries = computed(() => filterEntriesForPeer(props.peer))
 
 /* 手机未配对：显示扫码配对视图 */
 const qrData = ref<string | null>(null)
-watch(
-  () => store.qrUrl,
-  (url) => {
-    if (url) QRCode.toDataURL(url, { width: 460, margin: 1 }).then((d) => { qrData.value = d })
-  },
-  { immediate: true }
-)
 
 /* 复制备用直达地址 */
 async function copyAlt(u: string) {
@@ -47,6 +40,36 @@ async function copyAlt(u: string) {
     toast.info(u)
   }
 }
+
+/* ---------- 二维码协议切换（HTTPS 默认 / HTTP 免证书警告） ---------- */
+/* HTTP 地址取备用列表里与当前二维码同网卡的条目（随 token 同步轮换），
+   选择记忆在 localStorage；token 两种协议通用，切换不影响进行中的配对 */
+const QR_SCHEME_KEY = 'ys-qr-scheme'
+const qrScheme = ref<'https' | 'http'>(
+  localStorage.getItem(QR_SCHEME_KEY) === 'http' ? 'http' : 'https'
+)
+function setQrScheme(s: 'https' | 'http') {
+  qrScheme.value = s
+  try { localStorage.setItem(QR_SCHEME_KEY, s) } catch { /* 隐私模式等 */ }
+}
+const httpAltForCurrentIp = computed(() => {
+  const ip = (store.qrUrl || '').match(/^https:\/\/([^:/]+)/)?.[1] ?? ''
+  return (
+    store.qrAlts.find((u) => u.startsWith('http://') && u.includes(`//${ip}:`)) ??
+    store.qrAlts.find((u) => u.startsWith('http://')) ??
+    ''
+  )
+})
+const activeQrUrl = computed(() =>
+  qrScheme.value === 'http' && httpAltForCurrentIp.value ? httpAltForCurrentIp.value : store.qrUrl
+)
+watch(
+  activeQrUrl,
+  (url) => {
+    if (url) QRCode.toDataURL(url, { width: 460, margin: 1 }).then((d) => { qrData.value = d })
+  },
+  { immediate: true }
+)
 
 /* 拖拽遮罩状态（由 use-relay 的全局拖拽事件驱动） */
 const dragActive = computed(() => dragState.active && store.selectedPeer === props.peer)
@@ -89,6 +112,34 @@ function switchChatStyle() {
             二维码生成中…
           </div>
           <p class="text-xs text-muted-foreground">手机扫码 · 浏览器打开 · 免安装</p>
+          <!-- 二维码协议切换：HTTPS 默认（自签证书需一次信任）；HTTP 免证书警告 -->
+          <div class="mt-1 flex w-[240px] overflow-hidden rounded-lg border text-xs">
+            <button
+              type="button"
+              :class="qrScheme === 'https'
+                ? 'flex-1 bg-emerald-600 px-2 py-1.5 font-medium text-white'
+                : 'flex-1 px-2 py-1.5 text-muted-foreground hover:bg-accent'"
+              @click="setQrScheme('https')"
+            >
+              HTTPS（默认）
+            </button>
+            <button
+              type="button"
+              :class="qrScheme === 'http'
+                ? 'flex-1 bg-emerald-600 px-2 py-1.5 font-medium text-white'
+                : 'flex-1 px-2 py-1.5 text-muted-foreground hover:bg-accent'"
+              :disabled="!httpAltForCurrentIp"
+              :title="httpAltForCurrentIp ? '' : '未获取到 HTTP 备用地址'"
+              @click="setQrScheme('http')"
+            >
+              HTTP
+            </button>
+          </div>
+          <p class="max-w-[240px] text-center text-[10px] leading-relaxed text-muted-foreground">
+            {{ qrScheme === 'http'
+              ? 'HTTP 免证书警告，但明文传输（仅建议可信局域网使用）'
+              : 'HTTPS 首次访问需信任自签证书' }}
+          </p>
           <!-- 扫码地址不对时的备用直达地址（全部网卡，随配对码轮换刷新） -->
           <div v-if="store.qrAlts.length" class="mt-2 w-[240px] space-y-1">
             <p class="text-[10px] font-medium text-muted-foreground">扫不上？手动访问（点击复制）：</p>

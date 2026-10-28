@@ -330,7 +330,9 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                 let mut alts: Vec<String> = Vec::new();
                 for c in &candidates {
                     let c = c.to_string();
-                    alts.push(format!("http://{c}:{http_port}"));
+                    // http 备用地址同样带上配对路径与 token（否则打开页面无 token，
+                    // 无法发起配对；二维码协议切换也取自这些条目）
+                    alts.push(format!("http://{c}:{http_port}/pair?t={token}"));
                     let alt_https = format!("https://{c}:{https_port}/pair?t={token}");
                     if alt_https != url {
                         alts.push(alt_https);
