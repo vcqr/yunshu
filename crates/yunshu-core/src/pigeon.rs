@@ -27,7 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub const PIGEON_UDP_PORT: u16 = 34255;
-pub const PEER_TTL: Duration = Duration::from_secs(90);
+pub const PEER_TTL: Duration = Duration::from_secs(45);
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const CHUNK_SIZE: usize = 60_000;
 
@@ -381,6 +381,65 @@ pub fn emit_peers(st: &AppState) {
     st.emit(peers_event(st));
 }
 
+/// 本机发现身份（run_discovery 启动时登记，退出告别广播使用）
+static SELF_IDENTITY: std::sync::OnceLock<SelfIdentity> = std::sync::OnceLock::new();
+struct SelfIdentity {
+    id: String,
+    name: String,
+}
+
+/// 本机每个 IPv4 网卡的子网广播地址（外加全局广播兜底）。
+/// 多网卡机器上 255.255.255.255 只从默认路由出口发，其他网卡上的实例收不到。
+fn broadcast_targets() -> Vec<SocketAddr> {
+    let mut v = vec![SocketAddr::from(([255, 255, 255, 255], PIGEON_UDP_PORT))];
+    if let Ok(addrs) = if_addrs::get_if_addrs() {
+        for i in addrs {
+            if let if_addrs::IfAddr::V4(v4) = i.addr {
+                let bc = v4.broadcast.unwrap_or_else(|| {
+                    let mask = u32::from_be_bytes(v4.netmask.octets());
+                    let ip = u32::from_be_bytes(v4.ip.octets());
+                    std::net::Ipv4Addr::from(ip | !mask)
+                });
+                v.push(SocketAddr::from((
+                    std::net::Ipv4Addr::from(u32::from(bc)),
+                    PIGEON_UDP_PORT,
+                )));
+            }
+        }
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// 退出前广播下线通知（尽力而为，总计约 150ms，不阻塞退出流程）：
+/// 对端收到 leave 即从设备列表移除，无需等心跳超时
+pub fn broadcast_leave() {
+    let Some(identity) = SELF_IDENTITY.get() else {
+        return; // 发现服务未运行（UDP 被占用等），无 peers 可告别
+    };
+    let Ok(packet) = serde_json::to_vec(&Announce {
+        v: 1,
+        kind: "leave".into(),
+        id: identity.id.clone(),
+        name: identity.name.clone(),
+        port: 0,
+        mid: String::new(),
+    }) else {
+        return;
+    };
+    let Ok(sock) = std::net::UdpSocket::bind(("0.0.0.0", 0)) else {
+        return;
+    };
+    let _ = sock.set_broadcast(true);
+    for _ in 0..3 {
+        for bc in broadcast_targets() {
+            let _ = sock.send_to(&packet, bc);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// 发现主循环：广播 + 收包 + 过期清扫
 pub async fn run_discovery(st: Arc<AppState>) {
     let Some(std_sock) = make_udp_socket() else {
@@ -406,29 +465,11 @@ pub async fn run_discovery(st: Arc<AppState>) {
     })
     .unwrap_or_default();
 
-    // 多网卡机器上 255.255.255.255 只从默认路由出口发，其他网卡上的实例收不到。
-    // 改为：对本机每个 IPv4 网卡的子网广播地址各发一份（外加全局广播兜底）。
-    fn broadcast_targets() -> Vec<SocketAddr> {
-        let mut v = vec![SocketAddr::from(([255, 255, 255, 255], PIGEON_UDP_PORT))];
-        if let Ok(addrs) = if_addrs::get_if_addrs() {
-            for i in addrs {
-                if let if_addrs::IfAddr::V4(v4) = i.addr {
-                    let bc = v4.broadcast.unwrap_or_else(|| {
-                        let mask = u32::from_be_bytes(v4.netmask.octets());
-                        let ip = u32::from_be_bytes(v4.ip.octets());
-                        std::net::Ipv4Addr::from(ip | !mask)
-                    });
-                    v.push(SocketAddr::from((
-                        std::net::Ipv4Addr::from(u32::from(bc)),
-                        PIGEON_UDP_PORT,
-                    )));
-                }
-            }
-        }
-        v.sort();
-        v.dedup();
-        v
-    }
+    // 登记本机身份：进程退出前 broadcast_leave() 用它构造告别广播
+    let _ = SELF_IDENTITY.set(SelfIdentity {
+        id: st.self_id.clone(),
+        name: st.cfg.pc_name.clone(),
+    });
 
     for bc in broadcast_targets() {
         let _ = sock.send_to(&announce, bc).await;
@@ -481,6 +522,15 @@ async fn handle_packet(st: &Arc<AppState>, data: &[u8], from: SocketAddr) {
     let Ok(p) = serde_json::from_slice::<Announce>(data) else {
         return;
     };
+    if p.kind == "leave" && p.id != st.self_id && !p.id.is_empty() {
+        // 对端优雅退出：立即从发现表移除（TCP 链路若有，随断开自清理）
+        let removed = st.pigeon_peers.lock().unwrap().remove(&p.id).is_some();
+        if removed {
+            tracing::info!("电脑「{}」已退出，从列表移除", p.name);
+            emit_peers(st);
+        }
+        return;
+    }
     if p.id != st.self_id && !p.id.is_empty() && p.kind == "entry" {
         let is_new = {
             let mut known = st.pigeon_peers.lock().unwrap();

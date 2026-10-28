@@ -856,7 +856,11 @@ fn main() {
                             .send(UiRequest::RemoteDisconnect)
                             .ok();
                     }
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        // 广播下线通知：其他设备即时从列表移除本机
+                        yunshu_core::pigeon::broadcast_leave();
+                        app.exit(0)
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, ev| {
