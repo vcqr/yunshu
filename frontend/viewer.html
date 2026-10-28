@@ -4,6 +4,9 @@
   <meta charset="UTF-8" />
   <title>远程控制</title>
   <style>
+    /* 页面固定深色：声明 color-scheme 让原生控件（下拉弹层/滚动条）按深色渲染，
+       否则 select 弹出列表是系统浅色（白底），与浅色文字叠加导致看不清 */
+    :root { color-scheme: dark; }
     html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0f0e; }
     #screen { display: block; width: 100vw; height: 100vh; cursor: default; outline: none; }
     /* 远程软光标活动时隐藏本地光标，避免双指针 */
@@ -38,6 +41,12 @@
       font: inherit; padding: 2px 10px; cursor: pointer;
     }
     .overlay button:hover { background: rgba(255,255,255,0.16); }
+    /* 下拉弹出列表：color-scheme 之外再显式配色兜底（部分 WebView 版本
+       不完全遵循 color-scheme），避免浅色文字落进浅色弹层 */
+    .overlay select option {
+      background: #141a19;
+      color: #e7ece9;
+    }
     .overlay button.danger { border-color: rgba(255,90,100,0.5); color: #ff8a93; }
     .hint {
       position: fixed; bottom: 10px; left: 12px; z-index: 10;
