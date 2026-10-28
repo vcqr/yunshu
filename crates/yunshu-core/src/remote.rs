@@ -98,6 +98,10 @@ pub enum RemoteWire {
     RemoteClipboard { text: String },
     /// 控制端 → 受控端：设置对方剪贴板并注入平台粘贴组合键
     RemotePaste { text: String },
+    /// 受控端 → 控制端：RTT 探测（观看端原样回 pong，附丢帧统计）
+    Ping { t: u64 },
+    /// 观看端 → 受控端：RTT 应答（t 原样带回）+ 上个窗口观看端丢帧数
+    Pong { t: u64, lost: u32 },
     /// 控制端调画质（max_width 缩放上限 / quality JPEG 质量）
     RemoteQuality { max_width: u32, quality: u8 },
     /// 控制端 → 受控端：切换编码格式（0=JPEG 1=H.264；观看端能力变化时协商）
@@ -503,8 +507,14 @@ pub struct QualityParams {
     pub max_width: u32,
     /// JPEG 质量基线（自适应在 40..=80 间浮动，H.264 下仅作参考）
     pub quality: u8,
-    /// 目标帧间隔（自适应在 40..=80ms 间浮动）
+    /// 目标帧间隔（自适应在 40..=120ms 间浮动）
     pub interval_ms: u64,
+    /// 控制端↔观看端 RTT 指数滑动平均（Pong 处更新；0 = 尚无样本）
+    pub rtt_ms: u32,
+    /// 观看端上报的丢帧累计（结算窗口消费后清零）
+    pub viewer_lost: u32,
+    /// H.264 码率缩放（自适应调整，作用于 base_bitrate，0.3..=1.0）
+    pub bitrate_scale: f32,
 }
 
 impl Default for QualityParams {
@@ -513,6 +523,9 @@ impl Default for QualityParams {
             max_width: 1920,
             quality: 70,
             interval_ms: 50,
+            rtt_ms: 0,
+            viewer_lost: 0,
+            bitrate_scale: 1.0,
         }
     }
 }
@@ -1332,6 +1345,11 @@ pub async fn handle_remote_socket(
                 let mut stat_frames = 0u32;
                 let mut stat_encode_ms = 0u64;
                 let mut stable_cycles = 0u32;
+                // RTT 探测：每 1s 一个 Ping，观看端回 Pong（附丢帧统计）
+                let mut last_ping = Instant::now();
+                // H.264 码率自适应：编码器基准码率 + 最近下发的目标（避免重复设置）
+                let mut base_bps = 0u32;
+                let mut last_sent_bps = 0u32;
                 loop {
                     if cap_killed.load(Ordering::Relaxed) {
                         break;
@@ -1389,6 +1407,9 @@ pub async fn handle_remote_socket(
                                 );
                                 enc_width = scaled.width;
                                 enc_height = scaled.height;
+                                // 新编码器处于基准码率；JPEG/未知后端 base=0 不参与码率自适应
+                                base_bps = encoder.as_ref().map(|e| e.base_bitrate()).unwrap_or(0);
+                                last_sent_bps = base_bps;
                                 if encoder.is_none() {
                                     // H.264 初始化失败 → 回退 JPEG
                                     tracing::warn!("H.264 编码器创建失败，本会话回退 JPEG");
@@ -1400,6 +1421,8 @@ pub async fn handle_remote_socket(
                                         (1000 / interval.max(1)) as u32,
                                         quality,
                                     );
+                                    base_bps = 0;
+                                    last_sent_bps = 0;
                                 }
                             }
                             let te = Instant::now();
@@ -1438,22 +1461,50 @@ pub async fn handle_remote_socket(
                                     force_next = true;
                                 }
                             }
-                            // ---- 自适应（每 20 帧结算）----
+                            // ---- 自适应（每 20 帧结算；输入：RTT / 观看端丢帧 /
+                            // 通道满丢帧 / 编码耗时，分层降质，连续稳定再回升）----
                             if stat_frames >= 20 {
                                 let avg_ms = stat_encode_ms / stat_frames.max(1) as u64;
                                 let mut p = cap_params.lock().unwrap();
-                                if stat_drops > 0 || avg_ms * 10 > p.interval_ms * 9 {
-                                    // 压力：降画质、拉长间隔
-                                    p.quality = p.quality.saturating_sub(10).max(40);
-                                    p.interval_ms = (p.interval_ms + 10).min(80);
+                                let rtt = p.rtt_ms;
+                                let vlost = p.viewer_lost;
+                                p.viewer_lost = 0;
+                                if stat_drops > 0 || vlost > 2 || rtt > 250 {
+                                    // 强降：通道拥塞或观看端明显跟不上
+                                    p.quality = p.quality.saturating_sub(12).max(40);
+                                    p.interval_ms = (p.interval_ms + 12).min(120);
+                                    p.bitrate_scale = (p.bitrate_scale * 0.7).max(0.3);
+                                    stable_cycles = 0;
+                                } else if rtt > 120 || vlost > 0 || avg_ms * 10 > p.interval_ms * 9 {
+                                    // 温和降：RTT 偏高 / 观看端偶发丢帧 / 编码吃紧
+                                    p.quality = p.quality.saturating_sub(6).max(40);
+                                    p.interval_ms = (p.interval_ms + 6).min(120);
+                                    p.bitrate_scale = (p.bitrate_scale * 0.85).max(0.3);
                                     stable_cycles = 0;
                                 } else {
                                     stable_cycles += 1;
                                     if stable_cycles >= 3 {
                                         // 持续无压力：逐步回升
                                         p.quality = (p.quality + 5).min(80);
-                                        p.interval_ms = p.interval_ms.saturating_sub(10).max(40);
+                                        p.interval_ms = p.interval_ms.saturating_sub(8).max(40);
+                                        p.bitrate_scale = (p.bitrate_scale / 0.85).min(1.0);
                                         stable_cycles = 0;
+                                    }
+                                }
+                                // H.264 码率目标随缩放下发（变化 >8% 才动，避免频繁调整）
+                                if base_bps > 0
+                                    && let Some(enc) = encoder.as_mut()
+                                {
+                                    let want =
+                                        (base_bps as f32 * p.bitrate_scale) as u32;
+                                    let drift = if last_sent_bps == 0 {
+                                        1.0
+                                    } else {
+                                        (want as f32 / last_sent_bps as f32 - 1.0).abs()
+                                    };
+                                    if drift > 0.08 {
+                                        enc.set_target(p.quality, want);
+                                        last_sent_bps = want;
                                     }
                                 }
                                 stat_drops = 0;
@@ -1492,6 +1543,15 @@ pub async fn handle_remote_socket(
                                 RemoteWire::RemoteCursor { x: cx, y: cy },
                             ));
                         }
+                    }
+                    // RTT 探测：每 1s 一个 Ping（观看端原样回 Pong 并附丢帧统计）
+                    if last_ping.elapsed() >= Duration::from_millis(1000) {
+                        last_ping = Instant::now();
+                        let t = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let _ = cap_tx.try_send(RemoteOut::Control(RemoteWire::Ping { t }));
                     }
                     let spent = t0.elapsed();
                     let wait = Duration::from_millis(interval)
@@ -1563,12 +1623,28 @@ pub async fn handle_remote_socket(
                     Ok(RemoteIn::Control(RemoteWire::RemoteInput { ev })) => {
                         let _ = apply_input(&input_tx, ev);
                     }
+                    Ok(RemoteIn::Control(RemoteWire::Pong { t, lost })) => {
+                        // RTT 指数滑动平均 + 观看端丢帧累计（采集线程结算窗口消费）
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let rtt = now.saturating_sub(t).min(2000) as u32;
+                        let mut p = params.lock().unwrap();
+                        p.rtt_ms = if p.rtt_ms == 0 {
+                            rtt
+                        } else {
+                            (p.rtt_ms * 3 + rtt) / 4
+                        };
+                        p.viewer_lost = p.viewer_lost.saturating_add(lost);
+                    }
                     Ok(RemoteIn::Control(RemoteWire::RemoteQuality { max_width, quality })) => {
                         let mut p = params.lock().unwrap();
                         // 0 = 原始分辨率（不缩放）；其余限制在合理范围
                         p.max_width = if max_width == 0 { 0 } else { max_width.clamp(480, 3840) };
                         p.quality = quality.clamp(30, 95);
                         p.interval_ms = 50; // 档位切换后自适应重新起步
+                        p.bitrate_scale = 1.0;
                     }
                     Ok(RemoteIn::Control(RemoteWire::RemoteUseCodec { codec })) => {
                         if codec == crate::encoder::CODEC_JPEG
@@ -2377,6 +2453,12 @@ async fn remote_connect_inner(
                             serde_json::json!({"t": "cursor", "x": x, "y": y}).to_string(),
                         ));
                     }
+                    Ok(RemoteIn::Control(RemoteWire::Ping { t })) => {
+                        // RTT 探测 → 观看页（原样回 pong，附观看端丢帧统计）
+                        let _ = bridge_tx.send(BridgeMsg::Json(
+                            serde_json::json!({"t": "ping", "ts": t}).to_string(),
+                        ));
+                    }
                     Ok(RemoteIn::Control(RemoteWire::RemoteFileAck { id, ok })) => {
                         let src = st.remote.lock().unwrap().send_offers.lock().unwrap().remove(&id);
                         match (ok, src) {
@@ -2573,6 +2655,12 @@ pub async fn handle_view_socket(
             continue;
         };
         match v.get("t").and_then(|t| t.as_str()) {
+            Some("pong") => {
+                // 观看端 RTT 应答 + 丢帧统计（只读连接同样上报，透传给受控端）
+                let ts = v.get("ts").and_then(|x| x.as_u64()).unwrap_or(0);
+                let lost = v.get("lost").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                let _ = out_tx.try_send(RemoteOut::Control(RemoteWire::Pong { t: ts, lost }));
+            }
             Some("clip_paste") if !readonly => {
                 if let Some(text) = crate::clipboard::read_text()
                     && text.len() <= CLIPBOARD_MAX

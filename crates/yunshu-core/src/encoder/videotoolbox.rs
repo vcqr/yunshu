@@ -152,6 +152,7 @@ pub struct VtH264Encoder {
     session: CFRetained<VTCompressionSession>,
     fps: u32,
     frame_count: u64,
+    bitrate_bps: u32,
 }
 
 // 会话只在创建它的采集线程上使用；Send 仅为满足 trait 约束（整体移交，无并发触碰）
@@ -174,7 +175,7 @@ impl VtH264Encoder {
                 NonNull::from(&mut session),
             );
             if status != 0 || session.is_null() {
-                eprintln!("VTDBG 会话创建失败: status={status}");
+                tracing::debug!("VideoToolbox 会话创建失败: status={status}");
                 return None;
             }
             let session = CFRetained::from_raw(NonNull::new_unchecked(session));
@@ -223,6 +224,7 @@ impl VtH264Encoder {
                 session,
                 fps: fps.max(1),
                 frame_count: 0,
+                bitrate_bps: bitrate as u32,
             })
         }
     }
@@ -277,6 +279,26 @@ impl VideoEncoder for VtH264Encoder {
 
     fn backend(&self) -> &'static str {
         "videotoolbox"
+    }
+
+    fn base_bitrate(&self) -> u32 {
+        self.bitrate_bps
+    }
+
+    /// VT 支持会话中改 AverageBitRate（下一帧生效）
+    fn set_target(&mut self, _quality: u8, bitrate_bps: u32) {
+        if bitrate_bps == 0 {
+            return;
+        }
+        self.bitrate_bps = bitrate_bps;
+        unsafe {
+            let vt: &VTSession = &*(std::ptr::from_ref(&*self.session).cast::<VTSession>());
+            VTSessionSetProperty(
+                vt,
+                &kVTCompressionPropertyKey_AverageBitRate,
+                Some(&cf_i32(bitrate_bps as i32)),
+            );
+        }
     }
 
     fn encode(&mut self, frame: &Frame, force_key: bool) -> Option<EncodedFrame> {

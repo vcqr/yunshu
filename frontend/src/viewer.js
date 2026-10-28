@@ -69,6 +69,8 @@ let drawRect = { x: 0, y: 0, w: 1, h: 1 }
 let videoDecoder = null
 let decoderReady = false
 let decoderFailed = false
+// 观看端丢帧统计（RTT Pong 随带上报：解码器未就绪/解码失败/位图转换失败）
+let lostAcc = 0
 let h264SeqUs = 0
 let currentCodec = 0 // 0=JPEG 1=H.264（以收到的帧为准）
 /* 远程软光标：受控端回传光标位置（GDI 采集不含光标），活动时隐藏本地光标 */
@@ -248,7 +250,10 @@ function ensureDecoder() {
 }
 
 function feedH264(data) {
-  if (!ensureDecoder() || !videoDecoder || videoDecoder.state !== 'configured') return
+  if (!ensureDecoder() || !videoDecoder || videoDecoder.state !== 'configured') {
+    lostAcc++
+    return
+  }
   const key = data.length > 4 && data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1
     ? hasIdr(data)
     : false
@@ -261,6 +266,7 @@ function feedH264(data) {
   try {
     videoDecoder.decode(chunk)
   } catch (e) {
+    lostAcc++
     console.error('decode 失败', e)
   }
 }
@@ -461,12 +467,18 @@ async function main() {
             imgW = bmp.width
             imgH = bmp.height
           })
-          .catch(() => {})
+          .catch(() => {
+            lostAcc++
+          })
       }
     } else {
       try {
         const m = JSON.parse(ev.data)
-        if (m.t === 'clipboard') {
+        if (m.t === 'ping') {
+          // RTT 应答：受控端据此做画质自适应（ts 原样带回 + 窗口内丢帧数）
+          send({ t: 'pong', ts: m.ts, lost: lostAcc })
+          lostAcc = 0
+        } else if (m.t === 'clipboard') {
           statusEl.textContent = `${peerName} · 已同步对方剪贴板`
         } else if (m.t === 'codec') {
           // 编码切换提示（首个 H.264 关键帧到达前画面可能短暂停顿）

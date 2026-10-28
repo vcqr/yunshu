@@ -31,7 +31,7 @@ use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4};
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode,
 };
 
 use super::{EncodedFrame, VideoEncoder, CODEC_H264};
@@ -48,6 +48,7 @@ pub struct MfH264Encoder {
     height: u32,
     fps: u32,
     frame_count: u64,
+    bitrate_bps: u32,
 }
 
 // COM 对象只在本线程使用；Send 仅为满足 trait 约束（整体移交，无并发触碰）
@@ -79,6 +80,10 @@ impl MfH264Encoder {
             if let Some(api) = &codec_api {
                 let _ = api.SetValue(&CODECAPI_AVLowLatencyMode, &ui4_variant(1));
             }
+            // 码率与 configure_types 同公式
+            let pixels = (width.max(1) as u64) * (height.max(1) as u64);
+            let bitrate =
+                ((pixels * fps.max(1) as u64 * 3) / 10 / 8).clamp(1_500_000, 16_000_000) as u32;
             Some(Self {
                 transform,
                 events,
@@ -87,6 +92,7 @@ impl MfH264Encoder {
                 height,
                 fps: fps.max(1),
                 frame_count: 0,
+                bitrate_bps: bitrate,
             })
         }
     }
@@ -198,6 +204,23 @@ impl VideoEncoder for MfH264Encoder {
 
     fn backend(&self) -> &'static str {
         "mediafoundation"
+    }
+
+    fn base_bitrate(&self) -> u32 {
+        self.bitrate_bps
+    }
+
+    /// ICodecAPI 会话中改平均码率（部分 GPU MFT 忽略，无害）
+    fn set_target(&mut self, _quality: u8, bitrate_bps: u32) {
+        if bitrate_bps == 0 {
+            return;
+        }
+        self.bitrate_bps = bitrate_bps;
+        if let Some(api) = &self.codec_api {
+            unsafe {
+                let _ = api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &ui4_variant(bitrate_bps));
+            }
+        }
     }
 
     fn encode(&mut self, frame: &Frame, force_key: bool) -> Option<EncodedFrame> {

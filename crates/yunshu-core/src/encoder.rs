@@ -45,6 +45,13 @@ pub trait VideoEncoder: Send {
     fn codec(&self) -> u8;
     /// 编码后端标识（日志/诊断）：如 "videotoolbox"、"openh264"、"jpeg"
     fn backend(&self) -> &'static str;
+    /// H.264 基准码率（bps）；0 = 不适用（JPEG/未知），RTT 自适应据此缩放
+    fn base_bitrate(&self) -> u32 {
+        0
+    }
+    /// 画质/码率目标调整（RTT 自适应结算时调用）：
+    /// JPEG 用 quality，H.264 用 bitrate_bps；失败静默（保持当前目标）
+    fn set_target(&mut self, _quality: u8, _bitrate_bps: u32) {}
 }
 
 /// JPEG 编码器（一期路径，每帧独立可解，天然"全是关键帧"）
@@ -59,6 +66,10 @@ impl VideoEncoder for JpegVideoEncoder {
     fn backend(&self) -> &'static str {
         "jpeg"
     }
+    /// JPEG 的自适应目标就是质量值（此前 quality 冻结在创建时，settle 调整无效）
+    fn set_target(&mut self, quality: u8, _bitrate_bps: u32) {
+        self.quality = quality.clamp(30, 95);
+    }
     fn encode(&mut self, frame: &Frame, _force_key: bool) -> Option<EncodedFrame> {
         crate::remote::encode_jpeg(frame, self.quality).map(|data| EncodedFrame {
             data,
@@ -70,10 +81,13 @@ impl VideoEncoder for JpegVideoEncoder {
 /// H.264 编码器（openh264，Annex-B；SPS/PPS 随 IDR 内联）
 pub struct H264VideoEncoder {
     enc: OpenH264,
+    width: u32,
+    height: u32,
+    fps: u32,
     frame_count: u64,
     /// 周期性 IDR 兜底（拥塞强推关键帧之外的可解码锚点）
     key_interval: u64,
-    #[allow(dead_code)] // 诊断用
+    /// 当前码率（set_target 可动态调整，变化 >20% 重建编码器）
     bitrate_bps: u32,
 }
 
@@ -83,6 +97,10 @@ impl H264VideoEncoder {
         // 屏幕内容约 0.3 bit/px/帧：1080p@20 ≈ 5 Mbps，4K@30 ≈ 25M（钳到 16M）
         let bitrate =
             ((pixels * fps.max(1) as u64 * 3) / 10 / 8).clamp(1_500_000, 16_000_000) as u32;
+        Self::with_bitrate(width, height, fps, bitrate)
+    }
+
+    fn with_bitrate(width: u32, height: u32, fps: u32, bitrate: u32) -> Option<Self> {
         let key_interval = 100; // 5s @20fps
         let config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(bitrate))
@@ -96,6 +114,9 @@ impl H264VideoEncoder {
         let enc = OpenH264::with_api_config(openh264::OpenH264API::from_source(), config).ok()?;
         Some(Self {
             enc,
+            width,
+            height,
+            fps,
             frame_count: 0,
             key_interval,
             bitrate_bps: bitrate,
@@ -109,6 +130,25 @@ impl VideoEncoder for H264VideoEncoder {
     }
     fn backend(&self) -> &'static str {
         "openh264"
+    }
+    fn base_bitrate(&self) -> u32 {
+        self.bitrate_bps
+    }
+    /// openh264 无法在线改参：码率变化 >20% 时重建编码器（frame_count 归零
+    /// 使下一帧自动强推 IDR，观看端无缝接上新流）
+    fn set_target(&mut self, _quality: u8, bitrate_bps: u32) {
+        if bitrate_bps == 0 || self.bitrate_bps == 0 {
+            return;
+        }
+        let drift = (bitrate_bps as f32 / self.bitrate_bps as f32 - 1.0).abs();
+        if drift < 0.2 {
+            return;
+        }
+        if let Some(rebuilt) = Self::with_bitrate(self.width, self.height, self.fps, bitrate_bps) {
+            self.enc = rebuilt.enc;
+            self.bitrate_bps = rebuilt.bitrate_bps;
+            self.frame_count = 0;
+        }
     }
     fn encode(&mut self, frame: &Frame, force_key: bool) -> Option<EncodedFrame> {
         if force_key || self.frame_count.is_multiple_of(self.key_interval) {
