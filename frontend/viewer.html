@@ -8,6 +8,20 @@
     #screen { display: block; width: 100vw; height: 100vh; cursor: default; outline: none; }
     /* 远程软光标活动时隐藏本地光标，避免双指针 */
     #screen.remote-cursor { cursor: none; }
+    /* 工具栏自动隐藏：收起为右上角小药丸（状态 + fps），悬停展开 */
+    .overlay { transition: transform .25s ease, opacity .25s ease; }
+    .overlay.collapsed { transform: translateY(-140%); opacity: 0; pointer-events: none; }
+    #toolbar-pill {
+      position: fixed; top: 10px; right: 12px; z-index: 10;
+      display: none; align-items: center; gap: 6px;
+      padding: 4px 10px; border-radius: 999px;
+      background: rgba(10, 14, 13, 0.72); color: #e7ece9;
+      font: 12px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+      backdrop-filter: blur(6px); user-select: none; cursor: pointer;
+      opacity: 0; transition: opacity .25s ease;
+    }
+    #toolbar-pill.show { display: flex; opacity: 1; }
+    .overlay button.active { color: #22c55e; border-color: rgba(34,197,94,.5); }
     .overlay {
       position: fixed; top: 10px; right: 12px; z-index: 10;
       display: flex; align-items: center; gap: 8px;
@@ -48,6 +62,10 @@
 </head>
 <body>
   <canvas id="screen" tabindex="0"></canvas>
+  <div id="toolbar-pill" title="展开工具栏">
+    <span class="dot" id="pill-dot"></span>
+    <span id="pill-text">–</span>
+  </div>
   <div class="overlay" id="overlay" style="display:none">
     <span class="dot" id="dot"></span>
     <span id="status">连接中…</span>
@@ -65,6 +83,7 @@
       <option value="1920">1080p</option>
       <option value="1280">720p</option>
     </select>
+    <button id="pin-toolbar" title="固定工具栏（取消自动隐藏）">📌</button>
     <button id="sendfile" title="向对方电脑传文件（也可直接拖文件进窗口）">传文件</button>
     <button id="fullscreen" title="全屏（F11 也可）">全屏</button>
     <button class="danger" id="disconnect">断开</button>

@@ -19,6 +19,42 @@ const qualitySel = document.getElementById('quality')
 const resolutionSel = document.getElementById('resolution')
 const monitorSel = document.getElementById('monitor')
 const fullscreenBtn = document.getElementById('fullscreen')
+const pill = document.getElementById('toolbar-pill')
+const pillDot = document.getElementById('pill-dot')
+const pillText = document.getElementById('pill-text')
+const pinBtn = document.getElementById('pin-toolbar')
+
+/* 工具栏自动隐藏：3 秒无悬停收起为小药丸，悬停展开；📌 固定后不收起 */
+const AUTOHIDE_KEY = 'yunshu_viewer_toolbar_autohide'
+let toolbarPinned = localStorage.getItem(AUTOHIDE_KEY) === '0'
+let collapseTimer = null
+
+function setToolbarCollapsed(collapsed) {
+  if (toolbarPinned) collapsed = false
+  overlay.classList.toggle('collapsed', collapsed)
+  pill.classList.toggle('show', collapsed)
+}
+function scheduleToolbarCollapse() {
+  clearTimeout(collapseTimer)
+  if (toolbarPinned) return
+  collapseTimer = setTimeout(() => setToolbarCollapsed(true), 3000)
+}
+pill.addEventListener('pointerenter', () => setToolbarCollapsed(false))
+pill.addEventListener('click', () => setToolbarCollapsed(false))
+overlay.addEventListener('pointerenter', () => clearTimeout(collapseTimer))
+overlay.addEventListener('pointerleave', scheduleToolbarCollapse)
+pinBtn.addEventListener('click', () => {
+  toolbarPinned = !toolbarPinned
+  localStorage.setItem(AUTOHIDE_KEY, toolbarPinned ? '1' : '0')
+  pinBtn.classList.toggle('active', toolbarPinned)
+  pinBtn.title = toolbarPinned ? '已固定（点击恢复自动隐藏）' : '固定工具栏（取消自动隐藏）'
+  if (toolbarPinned) {
+    clearTimeout(collapseTimer)
+    setToolbarCollapsed(false)
+  } else {
+    scheduleToolbarCollapse()
+  }
+})
 
 let ws = null
 let closedByUs = false
@@ -149,6 +185,9 @@ setInterval(() => {
   const dimLabel = imgW && imgH ? ` · ${imgW}×${imgH}` : ''
   statusEl.textContent =
     ws && ws.readyState === 1 ? `${peerName} · ${frameCount} fps · ${currentCodec === 1 ? 'H.264' : 'JPEG'}${dimLabel}${zoomLabel}` : '未连接'
+  // 收起药丸同步：fps + 连接状态点
+  pillText.textContent = `${frameCount} fps`
+  pillDot.className = dot.className
   frameCount = 0
   // 远程软光标 2 秒无更新（只看模式/旧版本对端）→ 清除并恢复本地光标
   if (remoteCursor && performance.now() - remoteCursor.ts > 2000) {
@@ -388,6 +427,8 @@ async function main() {
   imgH = info.height
   hint.textContent = `${info.name} · Ctrl+滚轮缩放 · Ctrl/Cmd+V 粘贴本机剪贴板 · F11 全屏 · 拖文件进窗口回传`
   overlay.style.display = ''
+  pinBtn.classList.toggle('active', toolbarPinned)
+  scheduleToolbarCollapse()
   fillMonitors([]) // hello 消息到达后再填充
 
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
