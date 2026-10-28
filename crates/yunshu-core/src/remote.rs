@@ -1774,6 +1774,8 @@ fn remote_file_finish(st: &Arc<AppState>, id: &str, ok: bool, sha: Option<&str>)
     }
     // 落盘：按相对路径改名进最终目录（逐段 sanitize 防穿越）
     let mut fail: Option<String> = None;
+    // 单文件批次记录实际落盘路径（传输行「打开所在文件夹」直接选中该文件）
+    let mut single_path: Option<std::path::PathBuf> = None;
     for (i, f) in s.files.iter().enumerate() {
         let Some(dest) = crate::server::safe_join(&s.dest_root, &f.name) else {
             fail = Some(format!("非法路径 {}", f.name));
@@ -1803,6 +1805,9 @@ fn remote_file_finish(st: &Arc<AppState>, id: &str, ok: bool, sha: Option<&str>)
             fail = Some(format!("落盘失败: {e}"));
             break;
         }
+        if s.files.len() == 1 {
+            single_path = Some(final_path);
+        }
     }
     if let Some(reason) = fail {
         tracing::error!("远程回传落盘失败：{reason}");
@@ -1816,7 +1821,7 @@ fn remote_file_finish(st: &Arc<AppState>, id: &str, ok: bool, sha: Option<&str>)
         s.got,
         Some(s.got),
         crate::TransferStatus::Done,
-        Some(s.dest_root.clone()),
+        Some(single_path.unwrap_or_else(|| s.dest_root.clone())),
     );
     st.emit(CoreEvent::Toast {
         text: format!("收到远程回传（{} 项）", s.files.len()),

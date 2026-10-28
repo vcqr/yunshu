@@ -271,36 +271,170 @@ fn set_save_dir(state: tauri::State<AppState>, batch: String, dir: Option<String
     });
 }
 
-/// 打开文件所在文件夹：Windows 资源管理器选中文件，macOS 在 Finder 中显示，Linux 打开所在目录
+/// 打开文件所在文件夹：Windows 资源管理器选中文件，macOS 在 Finder 中显示，Linux 打开所在目录。
+/// 路径已不存在（保存目录被移动/文件被清理）时向上回退到最近存在的祖先目录；
+/// 整条链都不存在才报错，且错误信息附上原始路径便于诊断。
 #[tauri::command]
 fn open_folder(path: String) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("路径为空".into());
+    }
+    let target = std::path::PathBuf::from(&path);
+    let Some(existing) = nearest_existing(&target) else {
+        return Err(format!("路径不存在：{path}"));
+    };
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("explorer")
-            .arg(format!("/select,{path}"))
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        return Ok(());
+        // 首选：进程内 Shell API（打开父目录并选中目标，不创建子进程）。
+        // 本应用进程内 CreateProcessW 会因环境异常失败（os error 50，独立
+        // 探针进程均正常），Shell API 完全绕开子进程创建。
+        if shell_open_and_select(&target, &existing).is_err() {
+            // 回退：WINDIR 绝对路径定位 explorer.exe（不依赖 PATH 解析）
+            let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+            let explorer = std::path::Path::new(&windir).join("explorer.exe");
+            let prog = if explorer.exists() {
+                explorer
+            } else {
+                std::path::PathBuf::from("explorer")
+            };
+            let mut cmd = std::process::Command::new(&prog);
+            cmd.arg(format!("/select,{}", existing.display()));
+            if let Ok(exe) = std::env::current_exe()
+                && let Some(dir) = exe.parent()
+                && dir.exists()
+            {
+                cmd.current_dir(dir);
+            }
+            cmd.spawn()
+                .map_err(|e| format!("启动资源管理器失败：{e}（路径：{path}）"))?;
+        }
+        Ok(())
     }
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
-            .args(["-R", &path])
+            .args(["-R", &existing.to_string_lossy()])
             .spawn()
-            .map_err(|e| e.to_string())?;
-        return Ok(());
+            .map_err(|e| format!("启动 Finder 失败：{e}（路径：{path}）"))?;
+        Ok(())
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let dir = std::path::Path::new(&path)
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from(&path));
+        // xdg-open 没有「选中」语义，退而打开所在目录
+        let dir = if existing.is_dir() {
+            existing
+        } else {
+            existing
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or(existing)
+        };
         std::process::Command::new("xdg-open")
-            .arg(dir)
+            .arg(&dir)
             .spawn()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("打开目录失败：{e}（路径：{path}）"))?;
         Ok(())
+    }
+}
+
+/// 自下而上找最近存在的祖先（含自身）；连盘符/根都不存在时返回 None
+fn nearest_existing(p: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cur = Some(p.to_path_buf());
+    while let Some(c) = cur {
+        if c.exists() {
+            return Some(c);
+        }
+        cur = c.parent().map(|x| x.to_path_buf());
+    }
+    None
+}
+
+/// 进程内打开文件夹并选中目标（Shell API，不创建子进程）。
+/// 目标存在 → 打开其父目录并选中；目标不存在 → 打开最近存在的祖先目录。
+#[cfg(target_os = "windows")]
+fn shell_open_and_select(
+    target: &std::path::Path,
+    existing: &std::path::Path,
+) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Com::{
+        CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{ILFindLastID, SHOpenFolderAndSelectItems, SHParseDisplayName};
+
+    fn wide(p: &std::path::Path) -> Vec<u16> {
+        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // RPC_E_CHANGED_MODE：线程已初始化为其他套间，直接复用，不配对释放
+        let com_initialized = hr.is_ok();
+
+        let result = (|| -> Result<(), String> {
+            let (folder, item) = if target.exists() {
+                (
+                    target.parent().unwrap_or(target).to_path_buf(),
+                    Some(target.to_path_buf()),
+                )
+            } else {
+                (existing.to_path_buf(), None)
+            };
+
+            let folder_w = wide(&folder);
+            let mut pidl_folder = std::ptr::null_mut();
+            SHParseDisplayName(PCWSTR(folder_w.as_ptr()), None, &mut pidl_folder, 0, None)
+                .map_err(|e| format!("解析目录失败：{e}"))?;
+            if pidl_folder.is_null() {
+                return Err("解析目录失败：空 PIDL".into());
+            }
+
+            let select = match item {
+                Some(t) => {
+                    let item_w = wide(&t);
+                    let mut pidl_item = std::ptr::null_mut();
+                    if let Err(e) =
+                        SHParseDisplayName(PCWSTR(item_w.as_ptr()), None, &mut pidl_item, 0, None)
+                    {
+                        CoTaskMemFree(Some(pidl_folder.cast()));
+                        return Err(format!("解析文件失败：{e}"));
+                    }
+                    // apidl 须为相对父目录的 ITEMIDLIST：取完整 PIDL 最后一段
+                    let rel = ILFindLastID(pidl_item);
+                    let items = [rel as *const _];
+                    let r = SHOpenFolderAndSelectItems(pidl_folder, Some(&items), 0);
+                    CoTaskMemFree(Some(pidl_item.cast()));
+                    r
+                }
+                None => SHOpenFolderAndSelectItems(pidl_folder, None, 0),
+            };
+            CoTaskMemFree(Some(pidl_folder.cast()));
+            select.map_err(|e| format!("打开文件夹失败：{e}"))
+        })();
+
+        if com_initialized {
+            CoUninitialize();
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod open_folder_tests {
+    use super::nearest_existing;
+
+    #[test]
+    fn existing_path_returns_self() {
+        let dir = std::env::temp_dir().join(format!("of-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(nearest_existing(&dir), Some(dir.clone()));
+        // 子路径不存在 → 回退到存在的父目录
+        let child = dir.join("不存在的子目录").join("x.txt");
+        assert_eq!(nearest_existing(&child), Some(dir.clone()));
+        std::fs::remove_dir_all(&dir).unwrap();
+        // 整条链都没了 → 回退到上级（temp 目录存在）
+        assert_eq!(nearest_existing(&dir), Some(std::env::temp_dir()));
     }
 }
 
