@@ -6,7 +6,7 @@
  */
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
-  Eye, EyeOff, FileUp, FolderUp, Laptop, Lock, MessagesSquare, MonitorUp, HandMetal, Plus, Radio,
+  FileUp, FolderUp, Laptop, Lock, MessagesSquare, MonitorUp, HandMetal, Plus, Radio,
   RefreshCw, Satellite, Smartphone, Trash2,
 } from '@lucide/vue'
 import RelayAvatar from './RelayAvatar.vue'
@@ -36,10 +36,6 @@ const filtered = computed(() => {
       (d.machineId || '').toLowerCase().includes(q),
   )
 })
-
-/* --------------------- 本机远程控制凭证（眼睛开关） --------------------- */
-/* 默认打码防肩窥/录屏泄漏；远程控制发起方需要读出本机 ID 与临时密码 */
-const showSecrets = ref(false)
 
 /* ------------------------------ 右键菜单 ------------------------------ */
 
@@ -204,30 +200,6 @@ async function ctxSendFolderPhone() {
         v-if="store.meIp"
         class="shrink-0 font-mono text-[10px] text-muted-foreground"
       >{{ store.meIp }}</span>
-    </div>
-
-    <!-- 本机远程控制凭证：默认打码，点眼睛显示 -->
-    <div class="flex shrink-0 items-center gap-1.5 rounded-lg bg-muted/40 px-2 py-1.5">
-      <div class="min-w-0 flex-1 font-mono text-[10px] leading-tight text-muted-foreground">
-        <p class="truncate">
-          ID
-          <span class="text-foreground">{{ showSecrets ? (store.remoteMachineId || '——') : '••••••••' }}</span>
-        </p>
-        <p class="truncate">
-          密码
-          <span class="text-foreground">{{ showSecrets ? (store.remoteTempPassword || '——') : '••••••••' }}</span>
-        </p>
-      </div>
-      <button
-        type="button"
-        class="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-        :aria-label="showSecrets ? '隐藏机器 ID 与临时密码' : '显示机器 ID 与临时密码'"
-        :title="showSecrets ? '隐藏' : '显示'"
-        @click="showSecrets = !showSecrets"
-      >
-        <EyeOff v-if="showSecrets" class="size-3.5" />
-        <Eye v-else class="size-3.5" />
-      </button>
     </div>
 
     <!-- 会话 -->

@@ -9,6 +9,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { Bird, HandMetal, MonitorUp, ShieldAlert, ShieldCheck, Smartphone } from '@lucide/vue'
 import AppHeader from './components/relay/AppHeader.vue'
 import DeviceSidebar from './components/relay/DeviceSidebar.vue'
+import LocalIdentityCard from './components/relay/LocalIdentityCard.vue'
 import ChatPanel from './components/relay/ChatPanel.vue'
 import TransferPanel from './components/relay/TransferPanel.vue'
 import OfferDialog from './components/relay/OfferDialog.vue'
@@ -198,8 +199,11 @@ onMounted(async () => {
         />
       </aside>
 
-      <!-- 聊天主区（广播/手机/点对点统一由 ChatPanel 渲染） -->
-      <ChatPanel :peer="store.selectedPeer" />
+      <!-- 中栏：本机识别卡（ID/验证码 + 远程协助直连） + 会话主体 -->
+      <div class="flex min-h-0 min-w-0 flex-1 flex-col">
+        <LocalIdentityCard />
+        <ChatPanel :peer="store.selectedPeer" />
+      </div>
 
       <!-- 第三栏：传输任务面板（lg+ 常驻，可收起/展开） -->
       <Transition name="panel">
