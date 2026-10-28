@@ -24,26 +24,26 @@ jobs:
             target: aarch64-apple-darwin
             bundles: "dmg"
             files: |
-              target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+              target/aarch64-apple-darwin/release/bundle/dmg/yunshu_*.dmg
           # macOS x86_64（Intel）
           - platform: macos-15-intel
             target: x86_64-apple-darwin
             bundles: "dmg"
             files: |
-              target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+              target/x86_64-apple-darwin/release/bundle/dmg/yunshu_*.dmg
           # Linux x86_64（X11）
           - platform: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             bundles: "appimage"
             files: |
-              target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+              target/x86_64-unknown-linux-gnu/release/bundle/appimage/yunshu_*.AppImage
           # Windows x86_64（NSIS 安装包 + 免安装便携包）
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: "nsis"
             files: |
-              target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
-              云书_*_windows_x64_portable.zip
+              target/x86_64-pc-windows-msvc/release/bundle/nsis/yunshu_*.exe
+              yunshu_*_windows_x64_portable.zip
 
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 60
@@ -83,11 +83,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
-          # 获取上一个 tag
+          # 首次发布：全部 commit（checkout 的远端名是 origin，用 ^origin/main 排除 LICENSE 初始提交）
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
           if [ -z "$PREV_TAG" ]; then
-            # 首次发布：全部 commit（排除 Initial commit）
-            NOTES=$(git log --no-merges --pretty=format:"- %s" HEAD ^github/main 2>/dev/null || git log --no-merges --pretty=format:"- %s" HEAD)
+            NOTES=$(git log --no-merges --pretty=format:"- %s" HEAD ^origin/main 2>/dev/null || git log --no-merges --pretty=format:"- %s" HEAD)
           else
             NOTES=$(git log --no-merges --pretty=format:"- %s" ${PREV_TAG}..HEAD)
           fi
@@ -133,7 +132,7 @@ jobs:
           $dir = "target/x86_64-pc-windows-msvc/release"
           if (-not (Test-Path "$dir/yunshu.exe")) { throw "yunshu.exe not found in $dir" }
           $version = (Get-Content crates/yunshu-app/tauri.conf.json -Raw | ConvertFrom-Json).version
-          $zip = "云书_${version}_windows_x64_portable.zip"
+          $zip = "yunshu_${version}_windows_x64_portable.zip"
           $stage = "portable-staging/云书"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "$dir/yunshu.exe" -Destination "$stage/云书.exe"
@@ -147,6 +146,20 @@ jobs:
             "设置与接收的文件都在用户目录下，删除本文件夹即可完全卸载。"
           ) | Set-Content -Path "$stage/使用说明.txt" -Encoding utf8
           Compress-Archive -Path "portable-staging/云书" -DestinationPath $zip -Force
+
+      # GitHub 会剥掉 release 资产名里的非 ASCII 字符（云书_0.1.0_x.dmg → _0.1.0_x.dmg），
+      # 上传前统一把打包产物名里的 productName 换成 ASCII 前缀 yunshu
+      - name: rename assets to ascii prefix
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for f in target/*/release/bundle/dmg/云书*.dmg \
+                   target/*/release/bundle/nsis/云书*.exe \
+                   target/*/release/bundle/appimage/云书*.AppImage \
+                   云书_*_windows_x64_portable.zip; do
+            echo "重命名: $f -> ${f//云书/yunshu}"
+            mv "$f" "${f//云书/yunshu}"
+          done
 
       - name: verify artifacts
         shell: bash
@@ -171,6 +184,23 @@ jobs:
           name: yunshu-${{ matrix.target }}
           path: ${{ matrix.files }}
           if-no-files-found: error
+
+      # 清理历史遗留的旧命名资产（GitHub 剥掉了云书前缀变成 _0.1.0_*），避免与新命名重复
+      - name: remove stale release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          AUTH="Authorization: Bearer $GH_TOKEN"
+          BASE="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"
+          release_id=$(curl -sf -H "$AUTH" "$BASE/releases/tags/$GITHUB_REF_NAME" | jq -r '.id // empty') || true
+          [ -n "$release_id" ] || exit 0
+          curl -sf -H "$AUTH" "$BASE/releases/$release_id/assets?per_page=100" \
+            | jq -r '.[] | select(.name | startswith("_")) | "\(.id) \(.name)"' \
+            | while read -r aid aname; do
+                curl -sf -X DELETE -H "$AUTH" "$BASE/releases/assets/$aid" && echo "已删除旧资产: $aname"
+              done || true
 
       - name: create release and upload assets
         if: startsWith(github.ref, 'refs/tags/v')
