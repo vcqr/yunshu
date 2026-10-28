@@ -37,6 +37,17 @@ let currentCodec = 0 // 0=JPEG 1=H.264（以收到的帧为准）
 /* 远程软光标：受控端回传光标位置（GDI 采集不含光标），活动时隐藏本地光标 */
 let remoteCursor = null // { x, y, ts }，归一化坐标
 let cursorDirty = false
+/* 显示缩放：1=适应窗口；>1 放大并自动跟随远程光标 */
+let zoom = 1
+const ZOOM_MAX = 8
+
+function setZoom(z) {
+  const next = Math.min(ZOOM_MAX, Math.max(1, z))
+  if (Math.abs(next - zoom) > 1e-6) {
+    zoom = next
+    cursorDirty = true
+  }
+}
 
 function showMask(text, spinning) {
   mask.classList.add('show')
@@ -54,18 +65,36 @@ function dropFrame() {
   }
 }
 
+/** 视图几何：自适应或按 zoom 放大；放大超窗口时跟随远程光标居中 */
+function viewGeometry() {
+  if (!imgW || !imgH) {
+    return { w: 0, h: 0, x: 0, y: 0 }
+  }
+  const fit = Math.min(canvas.width / imgW, canvas.height / imgH)
+  const scale = fit * zoom
+  const w = imgW * scale
+  const h = imgH * scale
+  let x = (canvas.width - w) / 2
+  let y = (canvas.height - h) / 2
+  if (w > canvas.width || h > canvas.height) {
+    const fx = remoteCursor ? remoteCursor.x : 0.5
+    const fy = remoteCursor ? remoteCursor.y : 0.5
+    x = Math.min(0, Math.max(canvas.width - w, canvas.width / 2 - fx * w))
+    y = Math.min(0, Math.max(canvas.height - h, canvas.height / 2 - fy * h))
+  }
+  return { w, h, x, y }
+}
+
 function redraw() {
   if (!ctx2d) return
   ctx2d.fillStyle = '#0b0f0e'
   ctx2d.fillRect(0, 0, canvas.width, canvas.height)
-  if (latestFrame && imgW && imgH) {
-    const scale = Math.min(canvas.width / imgW, canvas.height / imgH)
-    const w = imgW * scale
-    const h = imgH * scale
-    drawRect = { x: (canvas.width - w) / 2, y: (canvas.height - h) / 2, w, h }
-    ctx2d.imageSmoothingEnabled = true
+  const g = viewGeometry()
+  drawRect = g
+  if (latestFrame && g.w && g.h) {
+    ctx2d.imageSmoothingEnabled = zoom > 1 ? false : true // 放大用近邻保留像素感
     ctx2d.imageSmoothingQuality = 'low'
-    ctx2d.drawImage(latestFrame, drawRect.x, drawRect.y, w, h)
+    ctx2d.drawImage(latestFrame, g.x, g.y, g.w, g.h)
   }
   drawRemoteCursor()
 }
@@ -115,8 +144,9 @@ function layout() {
 
 /* fps 统计（含 0fps 自愈：剪贴板提示等临时文案 1 秒内被覆盖） */
 setInterval(() => {
+  const zoomLabel = zoom > 1 ? ` · ×${zoom.toFixed(1)}` : ''
   statusEl.textContent =
-    ws && ws.readyState === 1 ? `${peerName} · ${frameCount} fps · ${currentCodec === 1 ? 'H.264' : 'JPEG'}` : '未连接'
+    ws && ws.readyState === 1 ? `${peerName} · ${frameCount} fps · ${currentCodec === 1 ? 'H.264' : 'JPEG'}${zoomLabel}` : '未连接'
   frameCount = 0
   // 远程软光标 2 秒无更新（只看模式/旧版本对端）→ 清除并恢复本地光标
   if (remoteCursor && performance.now() - remoteCursor.ts > 2000) {
@@ -231,6 +261,11 @@ canvas.addEventListener('pointerup', (e) => {
 canvas.addEventListener('contextmenu', (e) => e.preventDefault())
 canvas.addEventListener('wheel', (e) => {
   e.preventDefault()
+  // Ctrl+滚轮 = 本地显示缩放；普通滚轮 = 远程滚动
+  if (e.ctrlKey || e.metaKey) {
+    setZoom(zoom * Math.pow(1.1, -e.deltaY / 100))
+    return
+  }
   send({ t: 'wheel', dy: e.deltaY })
 }, { passive: false })
 
@@ -239,6 +274,15 @@ window.addEventListener('keydown', (e) => {
   if (e.key === 'F11') {
     e.preventDefault()
     toggleFullscreen()
+    return
+  }
+  // 显示缩放快捷键（浏览器习惯）：Ctrl+0 适应窗口，Ctrl+= 放大，Ctrl+- 缩小；
+  // 本地消费，不再转发远端
+  if ((e.ctrlKey || e.metaKey) && (e.key === '0' || e.key === '=' || e.key === '-')) {
+    e.preventDefault()
+    if (e.key === '0') setZoom(1)
+    else if (e.key === '=') setZoom(zoom * 1.25)
+    else setZoom(zoom / 1.25)
     return
   }
   e.preventDefault()
@@ -328,7 +372,7 @@ async function main() {
   peerName = info.name
   imgW = info.width
   imgH = info.height
-  hint.textContent = `${info.name} · Ctrl/Cmd+V 粘贴本机剪贴板 · F11 全屏 · 拖文件进窗口回传`
+  hint.textContent = `${info.name} · Ctrl+滚轮缩放 · Ctrl/Cmd+V 粘贴本机剪贴板 · F11 全屏 · 拖文件进窗口回传`
   overlay.style.display = ''
   fillMonitors([]) // hello 消息到达后再填充
 
