@@ -168,7 +168,6 @@ onMounted(async () => {
     <AppHeader
       @open-settings="openSettings"
       @toggle-sidebar="sidebarOpen = true"
-      @go-home="mutations.setSelectedPeer('self')"
     />
 
     <!-- 被控醒目横幅（安全要求：被控状态必须持续可见 + 一键断开） -->
