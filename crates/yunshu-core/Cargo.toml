@@ -30,6 +30,7 @@ enigo = "0.6"
 xcap = "0.9"
 jpeg-encoder = "0.7"
 pbkdf2 = "0.13"
+openh264 = { version = "0.9.9", features = ["source"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56.0"

@@ -123,7 +123,7 @@ pub(crate) type IncomingBatch = (String, Vec<BatchFileState>);
 
 /// 发送侧批次来源
 #[derive(Clone)]
-pub(crate) struct BatchSource {
+pub struct BatchSource {
     /// (绝对路径, 相对名, 大小)
     pub files: Vec<(PathBuf, String, u64)>,
     pub name: String,
@@ -692,6 +692,7 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                     Ok(
                         req @ (UiRequest::RemoteConnect { .. }
                         | UiRequest::RemoteDisconnect
+                        | UiRequest::RemoteSendFiles { .. }
                         | UiRequest::RemoteAssistRequest { .. }
                         | UiRequest::RemoteAssistRespond { .. }
                         | UiRequest::SetRemoteFixedPassword { .. }),
@@ -711,6 +712,7 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
         .route("/pigeon-ws", get(pigeon_ws_handler))
         .route(crate::remote::REMOTE_WS_PATH, get(remote_ws_handler))
         .route(crate::remote::VIEW_WS_PATH, get(remote_view_ws_handler))
+        .route("/view", get(serve_view_page))
         .route("/file/{id}", get(download))
         .route("/upload", post(upload))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024))
@@ -808,6 +810,15 @@ async fn serve_page() -> Response {
     (
         [(header::CACHE_CONTROL, "no-store")],
         Html(include_str!("../assets/phone.html")),
+    )
+        .into_response()
+}
+
+/// 手机「只看不控」页面（观看中设备的屏幕直播，只读凭证鉴权）
+async fn serve_view_page() -> Response {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Html(include_str!("../assets/view.html")),
     )
         .into_response()
 }

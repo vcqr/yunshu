@@ -17,12 +17,15 @@
 use crate::server::AppState;
 use crate::{CoreEvent, UiRequest};
 use futures_util::{SinkExt, StreamExt};
+use sha2::Digest as ShaDigest;
 use snow::TransportState;
 use std::collections::HashMap;
+use std::io::Write as IoWrite;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 pub const REMOTE_WS_PATH: &str = "/remote-ws";
@@ -45,13 +48,24 @@ pub fn fake_screen_enabled() -> bool {
 
 // ---------- 协议 ----------
 
-/// 受控端屏幕信息（采集分辨率 + enigo 绝对坐标空间）
+/// 单台显示器信息（多显示器选择用）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MonitorInfo {
+    pub index: u32,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// 受控端屏幕信息（采集分辨率 + enigo 绝对坐标空间 + 显示器列表）
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScreenInfo {
     pub width: u32,
     pub height: u32,
     pub logical_w: u32,
     pub logical_h: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub monitors: Vec<MonitorInfo>,
 }
 
 /// 远程控制线上消息（加密通道内的 'C' JSON，两端共用）
@@ -83,6 +97,30 @@ pub enum RemoteWire {
     RemotePaste { text: String },
     /// 控制端调画质（max_width 缩放上限 / quality JPEG 质量）
     RemoteQuality { max_width: u32, quality: u8 },
+    /// 控制端 → 受控端：切换编码格式（0=JPEG 1=H.264；观看端能力变化时协商）
+    RemoteUseCodec { codec: u8 },
+    /// 控制端 → 受控端：切换采集显示器（按受控端上报的 index）
+    RemoteSelectMonitor { index: u32 },
+    /// 受控端 → 控制端：屏幕信息更新（显示器切换后）
+    RemoteScreen { screen: ScreenInfo },
+    /// 控制端 → 受控端：文件回传邀请（受控端自动接受，存「远程回传」目录）
+    RemoteFileOffer {
+        id: String,
+        name: String,
+        total_size: u64,
+        files: Vec<crate::protocol::OfferFile>,
+    },
+    /// 受控端 → 控制端：文件回传应答（开始接收）
+    RemoteFileAck { id: String, ok: bool },
+    /// 任一方：文件回传结束（sha 为整批流 SHA-256，接收端校验）
+    RemoteFileEnd {
+        id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sha: Option<String>,
+    },
+    /// 任一方：取消文件回传
+    RemoteFileCancel { id: String },
     /// 任一方结束会话
     RemoteEnd {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +162,13 @@ pub enum RemoteOut {
         seq: u32,
         idx: u16,
         total: u16,
+        codec: u8,
+        data: Vec<u8>,
+    },
+    /// 文件回传数据块（'F' 前缀，uuid16 + offset + data）
+    FileChunk {
+        id: [u8; 16],
+        offset: u64,
         data: Vec<u8>,
     },
 }
@@ -136,6 +181,12 @@ pub enum RemoteIn {
         seq: u32,
         idx: u16,
         total: u16,
+        codec: u8,
+        data: Vec<u8>,
+    },
+    FileChunk {
+        id: [u8; 16],
+        offset: u64,
         data: Vec<u8>,
     },
 }
@@ -162,12 +213,20 @@ pub fn seal_msg(noise: &Mutex<TransportState>, msg: &RemoteOut) -> Result<Vec<u8
             seq,
             idx,
             total,
+            codec,
             data,
         } => {
             plain.push(b'V');
             plain.extend_from_slice(&seq.to_le_bytes());
             plain.extend_from_slice(&idx.to_le_bytes());
             plain.extend_from_slice(&total.to_le_bytes());
+            plain.push(*codec);
+            plain.extend_from_slice(data);
+        }
+        RemoteOut::FileChunk { id, offset, data } => {
+            plain.push(b'F');
+            plain.extend_from_slice(id);
+            plain.extend_from_slice(&offset.to_le_bytes());
             plain.extend_from_slice(data);
         }
     }
@@ -185,15 +244,27 @@ pub fn open_msg(noise: &Mutex<TransportState>, cipher: &[u8]) -> Result<RemoteIn
         Some(b'C') => Ok(RemoteIn::Control(
             serde_json::from_slice(&buf[1..n]).map_err(|e| e.to_string())?,
         )),
-        Some(b'V') if n >= 9 => {
+        Some(b'V') if n >= 10 => {
             let seq = u32::from_le_bytes(buf[1..5].try_into().unwrap());
             let idx = u16::from_le_bytes(buf[5..7].try_into().unwrap());
             let total = u16::from_le_bytes(buf[7..9].try_into().unwrap());
+            let codec = buf[9];
             Ok(RemoteIn::FrameChunk {
                 seq,
                 idx,
                 total,
-                data: buf[9..n].to_vec(),
+                codec,
+                data: buf[10..n].to_vec(),
+            })
+        }
+        Some(b'F') if n >= 25 => {
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&buf[1..17]);
+            let offset = u64::from_le_bytes(buf[17..25].try_into().unwrap());
+            Ok(RemoteIn::FileChunk {
+                id,
+                offset,
+                data: buf[25..n].to_vec(),
             })
         }
         _ => Err("未知消息前缀".into()),
@@ -201,19 +272,28 @@ pub fn open_msg(noise: &Mutex<TransportState>, cipher: &[u8]) -> Result<RemoteIn
 }
 
 /// 视频帧分块重组：发送端可能因链路拥塞整帧丢弃，收到新 seq 的 idx=0 即重建缓冲，
-/// 未完成的旧帧随之作废。
+/// 未完成的旧帧随之作废。返回 (codec, 完整帧数据)。
 #[derive(Default)]
 struct FrameAssembler {
     seq: u32,
     total: u16,
+    codec: u8,
     buf: Vec<u8>,
     got: Vec<bool>,
 }
 impl FrameAssembler {
-    fn feed(&mut self, seq: u32, idx: u16, total: u16, data: &[u8]) -> Option<Vec<u8>> {
+    fn feed(
+        &mut self,
+        seq: u32,
+        idx: u16,
+        total: u16,
+        codec: u8,
+        data: &[u8],
+    ) -> Option<(u8, Vec<u8>)> {
         if idx == 0 {
             self.seq = seq;
             self.total = total;
+            self.codec = codec;
             self.buf = Vec::with_capacity(total as usize * CHUNK_SIZE);
             self.got = vec![false; total as usize];
         } else if seq != self.seq || total != self.total {
@@ -225,7 +305,7 @@ impl FrameAssembler {
         }
         self.got[i] = true;
         self.buf.extend_from_slice(data);
-        (self.got.iter().all(|&g| g)).then(|| std::mem::take(&mut self.buf))
+        (self.got.iter().all(|&g| g)).then(|| (self.codec, std::mem::take(&mut self.buf)))
     }
 }
 
@@ -391,8 +471,9 @@ impl RemoteAuthState {
 pub struct QualityParams {
     /// 采集画面最长边缩放上限（0 = 原始分辨率）
     pub max_width: u32,
+    /// JPEG 质量基线（自适应在 40..=80 间浮动，H.264 下仅作参考）
     pub quality: u8,
-    /// 目标帧间隔
+    /// 目标帧间隔（自适应在 40..=80ms 间浮动）
     pub interval_ms: u64,
 }
 
@@ -406,6 +487,15 @@ impl Default for QualityParams {
     }
 }
 
+/// 画质档位（观看端下拉）：名称 → (max_width, quality 基线)
+pub fn quality_tier(tier: u32) -> (u32, u8) {
+    match tier {
+        720 => (720, 55),
+        1080 => (1080, 65),
+        _ => (1920, 75),
+    }
+}
+
 // ---------- 屏幕采集 ----------
 
 pub struct Frame {
@@ -414,45 +504,78 @@ pub struct Frame {
     pub rgba: Vec<u8>,
 }
 
-/// 屏幕源抽象：真实采集用 xcap，测试注入合成帧（为二期硬编/多显示器留路）
+/// 屏幕源抽象：真实采集用 xcap，测试注入合成帧（编码器 trait 见 encoder.rs）
 pub trait ScreenSource: Send {
     /// enigo 绝对坐标空间的屏幕边界（macOS 逻辑点 / Windows 物理像素）
     fn input_bounds(&self) -> (u32, u32);
     fn capture(&mut self) -> Option<Frame>;
+    /// 显示器列表（多显示器选择）
+    fn monitors(&self) -> Vec<MonitorInfo>;
+    /// 切换采集显示器；返回是否成功
+    fn set_monitor(&mut self, index: u32) -> bool;
 }
 
 pub struct XcapSource {
-    monitor: xcap::Monitor,
+    monitors: Vec<xcap::Monitor>,
+    current: usize,
 }
 
 impl XcapSource {
     /// 主屏；取不到主屏时退回第一个显示器
     pub fn new() -> Option<Self> {
         let monitors = xcap::Monitor::all().ok()?;
-        let monitor = monitors
+        if monitors.is_empty() {
+            return None;
+        }
+        let current = monitors
             .iter()
-            .find(|m| m.is_primary().unwrap_or(false))
-            .or_else(|| monitors.first())?
-            .clone();
-        Some(XcapSource { monitor })
+            .position(|m| m.is_primary().unwrap_or(false))
+            .unwrap_or(0);
+        Some(XcapSource { monitors, current })
     }
 }
 
 impl ScreenSource for XcapSource {
     fn input_bounds(&self) -> (u32, u32) {
-        match (self.monitor.width(), self.monitor.height()) {
+        let Some(m) = self.monitors.get(self.current) else {
+            return (0, 0);
+        };
+        match (m.width(), m.height()) {
             (Ok(w), Ok(h)) if w > 0 && h > 0 => (w, h),
             _ => (0, 0),
         }
     }
 
     fn capture(&mut self) -> Option<Frame> {
-        let img = self.monitor.capture_image().ok()?;
+        let img = self.monitors.get(self.current)?.capture_image().ok()?;
         Some(Frame {
             width: img.width(),
             height: img.height(),
             rgba: img.into_raw(),
         })
+    }
+
+    fn monitors(&self) -> Vec<MonitorInfo> {
+        self.monitors
+            .iter()
+            .enumerate()
+            .map(|(i, m)| MonitorInfo {
+                index: i as u32,
+                name: m.name().unwrap_or_else(|_| format!("显示器 {}", i + 1)),
+                width: m.width().unwrap_or(0),
+                height: m.height().unwrap_or(0),
+            })
+            .collect()
+    }
+
+    fn set_monitor(&mut self, index: u32) -> bool {
+        let i = index as usize;
+        if i < self.monitors.len() {
+            self.current = i;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -498,6 +621,17 @@ impl ScreenSource for FakeSource {
             height: self.height,
             rgba,
         })
+    }
+    fn monitors(&self) -> Vec<MonitorInfo> {
+        vec![MonitorInfo {
+            index: 0,
+            name: "合成屏幕".into(),
+            width: self.width,
+            height: self.height,
+        }]
+    }
+    fn set_monitor(&mut self, _index: u32) -> bool {
+        false // 合成源只有一块屏
     }
 }
 
@@ -638,8 +772,9 @@ fn map_button(btn: u8) -> enigo::Button {
     }
 }
 
-/// 注入线程：Enigo 生命周期绑定在线程内（跨平台 Send 保证不齐），会话结束随 Sender drop 退出
-fn spawn_input_thread(bounds: (u32, u32)) -> std::sync::mpsc::Sender<InputCmd> {
+/// 注入线程：Enigo 生命周期绑定在线程内（跨平台 Send 保证不齐），会话结束随 Sender drop 退出。
+/// bounds 为共享引用：显示器切换后由采集线程更新，移动事件实时读取。
+fn spawn_input_thread(bounds: Arc<Mutex<(u32, u32)>>) -> std::sync::mpsc::Sender<InputCmd> {
     let (tx, rx) = std::sync::mpsc::channel::<InputCmd>();
     let fake = fake_screen_enabled();
     std::thread::Builder::new()
@@ -657,10 +792,13 @@ fn spawn_input_thread(bounds: (u32, u32)) -> std::sync::mpsc::Sender<InputCmd> {
                     return;
                 }
             };
-            let (bw, bh) = (bounds.0.max(1) as f64, bounds.1.max(1) as f64);
             for cmd in rx {
                 let r: Result<(), _> = match cmd {
                     InputCmd::Move { x, y } => {
+                        let (bw, bh) = {
+                            let (w, h) = *bounds.lock().unwrap();
+                            (w.max(1) as f64, h.max(1) as f64)
+                        };
                         let px = (x.clamp(0.0, 1.0) * bw) as i32;
                         let py = (y.clamp(0.0, 1.0) * bh) as i32;
                         enigo.move_mouse(px, py, enigo::Coordinate::Abs)
@@ -730,17 +868,73 @@ pub struct ControlledSession {
 pub struct ViewingSession {
     pub peer_id: String,
     pub name: String,
+    /// 主观看凭证（观看窗口；可发输入）
     pub token: String,
+    /// 只读观看凭证（手机「只看不控」页面）
+    pub view_token: String,
     pub closed: Arc<AtomicBool>,
     pub out: tokio::sync::mpsc::Sender<RemoteOut>,
     pub bridge: tokio::sync::broadcast::Sender<BridgeMsg>,
+    /// 当前视频编码（0=JPEG 1=H.264）
+    pub codec: AtomicU8,
+    /// 已接入观看端的解码能力：conn_id → 支持的最高 codec（0=仅 JPEG 1=H.264）
+    pub viewer_caps: Mutex<HashMap<u64, u8>>,
 }
 
-/// 本地观看桥消息：帧（二进制）或 JSON（文本）
+impl ViewingSession {
+    /// 依据所有已接入观看端的能力重算期望 codec：全员支持 H.264 且至少一名观众才启用
+    fn desired_codec(&self) -> u8 {
+        let caps = self.viewer_caps.lock().unwrap();
+        if !caps.is_empty() && caps.values().all(|&c| c >= crate::encoder::CODEC_H264) {
+            crate::encoder::CODEC_H264
+        } else {
+            crate::encoder::CODEC_JPEG
+        }
+    }
+
+    /// 能力变化后重算并下发切换（返回是否切换）
+    fn recompute_codec(&self) -> u8 {
+        let want = self.desired_codec();
+        let cur = self.codec.load(Ordering::Relaxed);
+        if want != cur {
+            self.codec.store(want, Ordering::Relaxed);
+            let _ = self
+                .out
+                .try_send(RemoteOut::Control(RemoteWire::RemoteUseCodec {
+                    codec: want,
+                }));
+            let _ = self.bridge.send(BridgeMsg::Json(
+                serde_json::json!({
+                    "t": "codec",
+                    "codec": crate::encoder::codec_name(want),
+                })
+                .to_string(),
+            ));
+        }
+        want
+    }
+}
+
+/// 本地观看桥消息：帧（二进制，带 codec）或 JSON（文本）
 #[derive(Debug, Clone)]
 pub enum BridgeMsg {
-    Frame(Vec<u8>),
+    Frame { codec: u8, data: Vec<u8> },
     Json(String),
+}
+
+/// 受控端正在接收的文件回传：id → 组装状态
+pub struct RemoteRecvState {
+    pub row_id: String,
+    /// 半成品目录（收完即删）
+    pub dir: std::path::PathBuf,
+    /// 最终落盘目录（远程回传/<批次名或文件名>/）
+    pub dest_root: std::path::PathBuf,
+    pub files: Vec<crate::protocol::OfferFile>,
+    pub index: usize,
+    pub written: u64,
+    pub got: u64,
+    pub file: Option<std::fs::File>,
+    pub running_hash: Option<sha2::Sha256>,
 }
 
 /// 远程控制共享状态（AppState.remote）
@@ -750,6 +944,12 @@ pub struct RemoteState {
     pub viewing: Option<ViewingSession>,
     /// 反向协助：待处理的请求方（飞鸽 peer_id）
     pub assist_pending: Option<String>,
+    /// 受控端正在接收的文件回传
+    pub recv_files: Mutex<HashMap<String, RemoteRecvState>>,
+    /// 控制端已发出邀请、待受控端 Ack 的回传批次
+    pub send_offers: Mutex<HashMap<String, crate::server::BatchSource>>,
+    /// 控制端正在推送的回传批次：id → 取消标记
+    pub send_cancel: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl RemoteState {
@@ -759,6 +959,9 @@ impl RemoteState {
             controlled: None,
             viewing: None,
             assist_pending: None,
+            recv_files: Mutex::new(HashMap::new()),
+            send_offers: Mutex::new(HashMap::new()),
+            send_cancel: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -955,7 +1158,7 @@ pub async fn handle_remote_socket(
             return;
         }
     };
-    let bounds = source.input_bounds();
+    let bounds = Arc::new(Mutex::new(source.input_bounds()));
     let Some(probe) = source.capture() else {
         let reason = "屏幕采集失败（macOS 需在系统设置授予「屏幕录制」权限后重启）".to_string();
         let frame = seal_msg(
@@ -971,11 +1174,17 @@ pub async fn handle_remote_socket(
     };
     let params = Arc::new(Mutex::new(QualityParams::default()));
     let first = scale_frame(&probe, params.lock().unwrap().max_width);
+    let (lw, lh) = {
+        let b = bounds.lock().unwrap();
+        (b.0, b.1)
+    };
+    let monitors = source.monitors();
     let screen = ScreenInfo {
         width: first.width,
         height: first.height,
-        logical_w: bounds.0,
-        logical_h: bounds.1,
+        logical_w: lw,
+        logical_h: lh,
+        monitors,
     };
     let frame = match seal_msg(
         &noise,
@@ -1012,21 +1221,58 @@ pub async fn handle_remote_socket(
     });
 
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<RemoteOut>(256);
-    let input_tx = spawn_input_thread(bounds);
+    let input_tx = spawn_input_thread(bounds.clone());
+    // 会话级编码格式（观看端能力协商后经 RemoteUseCodec 更新）；显示器切换请求
+    let codec_flag = Arc::new(std::sync::atomic::AtomicU8::new(crate::encoder::CODEC_JPEG));
+    let monitor_switch = Arc::new(Mutex::new(None::<u32>));
 
-    // ---- 采集线程：截屏 → 缩放 → JPEG → 分块投递（慢链路丢帧保实时）----
+    // ---- 采集线程：截屏 → 缩放 → 编码（JPEG/H.264）→ 分块投递 ----
+    // 自适应：按编码耗时与通道丢帧在 quality 40..=80 / interval 40..=80ms 间浮动；
+    // 拥塞丢帧后强推关键帧，保证观看端尽快恢复可解码流。
     {
         let cap_killed = killed.clone();
         let cap_params = params.clone();
+        let cap_codec = codec_flag.clone();
+        let cap_monitor = monitor_switch.clone();
+        let cap_bounds = bounds.clone();
         let (cap_tx, cap_rx) = std::sync::mpsc::sync_channel::<RemoteOut>(64);
         let capture_thread = std::thread::Builder::new()
             .name("remote-capture".into())
             .spawn(move || {
                 let mut last_hash = 0u64;
                 let mut seq = 0u32;
+                let mut encoder: Option<Box<dyn crate::encoder::VideoEncoder>> = None;
+                let mut enc_width = 0u32;
+                let mut enc_height = 0u32;
+                let mut force_next = false; // 拥塞丢帧后下一帧强推关键帧
+                // 自适应统计窗口（每 20 帧结算一次）
+                let mut stat_drops = 0u32;
+                let mut stat_frames = 0u32;
+                let mut stat_encode_ms = 0u64;
+                let mut stable_cycles = 0u32;
                 loop {
                     if cap_killed.load(Ordering::Relaxed) {
                         break;
+                    }
+                    // 显示器切换请求（控制端下发）
+                    if let Some(index) = cap_monitor.lock().unwrap().take()
+                        && source.set_monitor(index)
+                    {
+                        *cap_bounds.lock().unwrap() = source.input_bounds();
+                        let (w, h) = *cap_bounds.lock().unwrap();
+                        let new_screen = ScreenInfo {
+                            width: 0,
+                            height: 0,
+                            logical_w: w,
+                            logical_h: h,
+                            monitors: source.monitors(),
+                        };
+                        // 编码器随分辨率重建
+                        encoder = None;
+                        let _ = cap_tx.try_send(RemoteOut::Control(RemoteWire::RemoteScreen {
+                            screen: new_screen,
+                        }));
+                        tracing::info!("远程控制切换到显示器 #{index}");
                     }
                     let t0 = Instant::now();
                     let (max_side, quality, interval) = {
@@ -1036,29 +1282,95 @@ pub async fn handle_remote_socket(
                     if let Some(f) = source.capture() {
                         let scaled = scale_frame(&f, max_side);
                         let hash = fnv_hash(&scaled.rgba);
-                        if hash != last_hash
-                            && let Some(jpeg) = encode_jpeg(&scaled, quality)
-                        {
-                            seq = seq.wrapping_add(1);
-                            let total = jpeg.len().div_ceil(CHUNK_SIZE) as u16;
-                            let mut sent_any = false;
-                            for (i, part) in jpeg.chunks(CHUNK_SIZE).enumerate() {
-                                let msg = RemoteOut::FrameChunk {
-                                    seq,
-                                    idx: i as u16,
-                                    total,
-                                    data: part.to_vec(),
-                                };
-                                match cap_tx.try_send(msg) {
-                                    Ok(()) => sent_any = true,
-                                    Err(_) => break, // 通道满：丢掉当前帧剩余分块，等下一帧
+                        if hash != last_hash {
+                            // 编码器惰性创建/随 codec 与分辨率变化重建
+                            let want_codec = cap_codec.load(Ordering::Relaxed);
+                            let need_rebuild = match encoder.as_ref() {
+                                None => true,
+                                Some(e) => {
+                                    e.codec() != want_codec
+                                        || enc_width != scaled.width
+                                        || enc_height != scaled.height
+                                }
+                            };
+                            if need_rebuild {
+                                encoder = crate::encoder::make_encoder(
+                                    want_codec,
+                                    scaled.width,
+                                    scaled.height,
+                                    (1000 / interval.max(1)) as u32,
+                                    quality,
+                                );
+                                enc_width = scaled.width;
+                                enc_height = scaled.height;
+                                if encoder.is_none() {
+                                    // H.264 初始化失败 → 回退 JPEG
+                                    tracing::warn!("H.264 编码器创建失败，本会话回退 JPEG");
+                                    cap_codec.store(crate::encoder::CODEC_JPEG, Ordering::Relaxed);
+                                    encoder = crate::encoder::make_encoder(
+                                        crate::encoder::CODEC_JPEG,
+                                        scaled.width,
+                                        scaled.height,
+                                        (1000 / interval.max(1)) as u32,
+                                        quality,
+                                    );
                                 }
                             }
-                            if sent_any {
-                                last_hash = hash;
-                            } else {
-                                // 整帧被丢：指纹回退，下次仍尝试发送
-                                last_hash = hash.wrapping_add(1);
+                            let te = Instant::now();
+                            let encoded =
+                                encoder.as_mut().and_then(|e| e.encode(&scaled, force_next));
+                            stat_encode_ms += te.elapsed().as_millis() as u64;
+                            force_next = false;
+                            if let Some(ef) = encoded {
+                                stat_frames += 1;
+                                seq = seq.wrapping_add(1);
+                                let total = ef.data.len().div_ceil(CHUNK_SIZE) as u16;
+                                let mut sent_any = false;
+                                for (i, part) in ef.data.chunks(CHUNK_SIZE).enumerate() {
+                                    let msg = RemoteOut::FrameChunk {
+                                        seq,
+                                        idx: i as u16,
+                                        total,
+                                        codec: want_codec,
+                                        data: part.to_vec(),
+                                    };
+                                    match cap_tx.try_send(msg) {
+                                        Ok(()) => sent_any = true,
+                                        Err(_) => {
+                                            stat_drops += 1;
+                                            break; // 通道满：丢掉当前帧剩余分块，等下一帧
+                                        }
+                                    }
+                                }
+                                if sent_any {
+                                    last_hash = hash;
+                                } else {
+                                    // 整帧被丢：指纹回退 + 下帧强推关键帧（观看端尽快恢复）
+                                    last_hash = hash.wrapping_add(1);
+                                    force_next = true;
+                                }
+                            }
+                            // ---- 自适应（每 20 帧结算）----
+                            if stat_frames >= 20 {
+                                let avg_ms = stat_encode_ms / stat_frames.max(1) as u64;
+                                let mut p = cap_params.lock().unwrap();
+                                if stat_drops > 0 || avg_ms * 10 > p.interval_ms * 9 {
+                                    // 压力：降画质、拉长间隔
+                                    p.quality = p.quality.saturating_sub(10).max(40);
+                                    p.interval_ms = (p.interval_ms + 10).min(80);
+                                    stable_cycles = 0;
+                                } else {
+                                    stable_cycles += 1;
+                                    if stable_cycles >= 3 {
+                                        // 持续无压力：逐步回升
+                                        p.quality = (p.quality + 5).min(80);
+                                        p.interval_ms = p.interval_ms.saturating_sub(10).max(40);
+                                        stable_cycles = 0;
+                                    }
+                                }
+                                stat_drops = 0;
+                                stat_frames = 0;
+                                stat_encode_ms = 0;
                             }
                         }
                     }
@@ -1136,6 +1448,17 @@ pub async fn handle_remote_socket(
                         let mut p = params.lock().unwrap();
                         p.max_width = max_width.clamp(480, 3840);
                         p.quality = quality.clamp(30, 95);
+                        p.interval_ms = 50; // 档位切换后自适应重新起步
+                    }
+                    Ok(RemoteIn::Control(RemoteWire::RemoteUseCodec { codec })) => {
+                        if codec == crate::encoder::CODEC_JPEG
+                            || codec == crate::encoder::CODEC_H264
+                        {
+                            codec_flag.store(codec, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(RemoteIn::Control(RemoteWire::RemoteSelectMonitor { index })) => {
+                        *monitor_switch.lock().unwrap() = Some(index);
                     }
                     Ok(RemoteIn::Control(RemoteWire::RemoteClipboard { text })) => {
                         if text.len() <= CLIPBOARD_MAX {
@@ -1144,6 +1467,18 @@ pub async fn handle_remote_socket(
                     }
                     Ok(RemoteIn::Control(RemoteWire::RemotePaste { text })) => {
                         let _ = input_tx.send(InputCmd::Paste { text });
+                    }
+                    Ok(RemoteIn::Control(RemoteWire::RemoteFileOffer { id, name, total_size, files })) => {
+                        on_remote_file_offer(&st, &id, &name, total_size, files, &controller_machine, &out_tx);
+                    }
+                    Ok(RemoteIn::Control(RemoteWire::RemoteFileEnd { id, ok, sha })) => {
+                        remote_file_finish(&st, &id, ok, sha.as_deref());
+                    }
+                    Ok(RemoteIn::Control(RemoteWire::RemoteFileCancel { id })) => {
+                        remote_file_abort(&st, &id, true);
+                    }
+                    Ok(RemoteIn::FileChunk { id, offset, data }) => {
+                        remote_file_chunk(&st, id, offset, &data).await;
                     }
                     Ok(RemoteIn::Control(RemoteWire::RemoteEnd { reason })) => {
                         end_reason = reason.unwrap_or_else(|| "对方结束了会话".into());
@@ -1188,6 +1523,26 @@ pub async fn handle_remote_socket(
 
     let _ = sink.close().await;
     drop(input_tx); // 注入线程退出（Enigo drop 自动释放按住的修饰键）
+    // 文件回传半成品清理（无断点续传设计，会话结束即丢弃）
+    {
+        let states: Vec<RemoteRecvState> = st
+            .remote
+            .lock()
+            .unwrap()
+            .recv_files
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, s)| s)
+            .collect();
+        for mut s in states {
+            if let Some(f) = s.file.as_mut() {
+                let _ = f.flush();
+            }
+            s.file = None;
+            let _ = std::fs::remove_dir_all(&s.dir);
+        }
+    }
     end_session(
         &st,
         killed,
@@ -1214,6 +1569,448 @@ fn apply_input(tx: &std::sync::mpsc::Sender<InputCmd>, ev: InputEvent) -> Result
         },
     };
     tx.send(cmd).map_err(|_| "注入线程已退出".to_string())
+}
+
+// ---------- 文件回传：受控端（接收方） ----------
+
+/// 受控端：收到控制端发来的文件邀请 → 自动接受（会话授权即包含内容通道），
+/// 存「保存目录/远程回传/<批次名>/」，整批流 SHA-256 校验。
+fn on_remote_file_offer(
+    st: &Arc<AppState>,
+    id: &str,
+    name: &str,
+    total_size: u64,
+    files: Vec<crate::protocol::OfferFile>,
+    controller_machine: &str,
+    out_tx: &tokio::sync::mpsc::Sender<RemoteOut>,
+) {
+    let id8 = id[..8.min(id.len())].to_string();
+    let dir = st
+        .cfg
+        .save_dir
+        .join("远程回传")
+        .join(format!(".parts-{id8}"));
+    // 单文件直接放「远程回传/文件名」，多文件放「远程回传/批次名/相对路径」
+    let dest_root = if files.len() == 1 {
+        st.cfg.save_dir.join("远程回传")
+    } else {
+        st.cfg
+            .save_dir
+            .join("远程回传")
+            .join(crate::server::sanitize_name(name))
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::error!("创建远程回传目录失败 {dir:?}: {e}");
+        let _ = out_tx.try_send(RemoteOut::Control(RemoteWire::RemoteFileAck {
+            id: id.into(),
+            ok: false,
+        }));
+        return;
+    }
+    let row_id = uuid::Uuid::new_v4().simple().to_string();
+    let entries: Vec<crate::FileEntry> = files
+        .iter()
+        .map(|f| crate::FileEntry {
+            name: f.name.clone(),
+            size: f.size,
+        })
+        .collect();
+    st.new_transfer(crate::TransferInfo::batch(
+        row_id.clone(),
+        crate::Direction::FromPhone,
+        name.to_string(),
+        total_size,
+        entries,
+        Some(controller_machine.to_string()),
+    ));
+    st.remote.lock().unwrap().recv_files.lock().unwrap().insert(
+        id.to_string(),
+        RemoteRecvState {
+            row_id,
+            dir,
+            dest_root,
+            files,
+            index: 0,
+            written: 0,
+            got: 0,
+            file: None,
+            running_hash: Some(sha2::Sha256::default()),
+        },
+    );
+    tracing::info!("远程回传：「{name}」开始接收");
+    let _ = out_tx.try_send(RemoteOut::Control(RemoteWire::RemoteFileAck {
+        id: id.into(),
+        ok: true,
+    }));
+}
+
+/// 受控端：写文件数据块（流偏移自校验，越位忽略、落后重写）
+async fn remote_file_chunk(st: &Arc<AppState>, id: [u8; 16], offset: u64, data: &[u8]) {
+    let key = uuid::Uuid::from_bytes(id).simple().to_string();
+    let failure: Option<(String, String)> = 'blk: {
+        let remote_guard = st.remote.lock().unwrap();
+        let mut states = remote_guard.recv_files.lock().unwrap();
+        let Some(s) = states.get_mut(&key) else {
+            break 'blk None;
+        };
+        if offset > s.got {
+            tracing::warn!("远程回传：越位数据块（{offset} > {}），忽略", s.got);
+            break 'blk None;
+        }
+        if offset < s.got {
+            tracing::warn!("远程回传：落后数据块（{offset} < {}），忽略", s.got);
+            break 'blk None;
+        }
+        // 惰性打开当前文件
+        if s.file.is_none() {
+            if s.index >= s.files.len() {
+                break 'blk None;
+            }
+            let part = s.dir.join(format!("{}.part", s.index));
+            let Ok(f) = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&part)
+            else {
+                tracing::error!("远程回传：打开半成品失败 {part:?}");
+                break 'blk Some((key, s.row_id.clone()));
+            };
+            s.file = Some(f);
+        }
+        if let Err(e) = s.file.as_mut().expect("file").write_all(data) {
+            tracing::error!("远程回传：写入失败: {e}");
+            break 'blk Some((key, s.row_id.clone()));
+        }
+        if let Some(h) = s.running_hash.as_mut() {
+            h.update(data);
+        }
+        s.written += data.len() as u64;
+        s.got += data.len() as u64;
+        let cur_total: u64 = s.files.iter().map(|f| f.size).sum();
+        let row_id = s.row_id.clone();
+        let done_file = s.written >= s.files[s.index].size;
+        if done_file {
+            s.file = None; // 落盘关闭
+            s.index += 1;
+        }
+        let transferred = s.got;
+        drop(states);
+        st.progress_throttled(&row_id, transferred, false);
+        let _ = cur_total;
+        break 'blk None;
+    };
+    if let Some((key, row_id)) = failure {
+        remote_file_abort(st, &key, false);
+        st.update_transfer(&row_id, 0, None, crate::TransferStatus::Failed, None);
+    }
+}
+
+/// 受控端：文件回传收尾（校验 + 落盘改名）
+fn remote_file_finish(st: &Arc<AppState>, id: &str, ok: bool, sha: Option<&str>) {
+    let state = st
+        .remote
+        .lock()
+        .unwrap()
+        .recv_files
+        .lock()
+        .unwrap()
+        .remove(id);
+    let Some(mut s) = state else { return };
+    s.file = None;
+    if !ok {
+        let _ = std::fs::remove_dir_all(&s.dir);
+        st.update_transfer(&s.row_id, s.got, None, crate::TransferStatus::Failed, None);
+        st.emit(CoreEvent::Toast {
+            text: "远程回传传输中断，已清理半成品".into(),
+        });
+        return;
+    }
+    // 完整性：全部文件写满（index 走完清单）+ 整批 SHA-256 一致
+    let stream_sha = s
+        .running_hash
+        .take()
+        .map(|h| crate::pigeon::sha_hex(&h.finalize()))
+        .unwrap_or_default();
+    if s.index != s.files.len() || sha.is_some_and(|x| x != stream_sha) {
+        let _ = std::fs::remove_dir_all(&s.dir);
+        st.update_transfer(&s.row_id, s.got, None, crate::TransferStatus::Failed, None);
+        tracing::error!(
+            "远程回传：校验失败（got={} sha={}）",
+            s.got,
+            sha.unwrap_or("")
+        );
+        st.emit(CoreEvent::Toast {
+            text: "远程回传校验失败，已清理".into(),
+        });
+        return;
+    }
+    // 落盘：按相对路径改名进最终目录（逐段 sanitize 防穿越）
+    let mut fail: Option<String> = None;
+    for (i, f) in s.files.iter().enumerate() {
+        let Some(dest) = crate::server::safe_join(&s.dest_root, &f.name) else {
+            fail = Some(format!("非法路径 {}", f.name));
+            break;
+        };
+        if let Some(parent) = dest.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            fail = Some(format!("创建目录失败: {e}"));
+            break;
+        }
+        let part = s.dir.join(format!("{i}.part"));
+        if !part.exists()
+            && let Err(e) = std::fs::write(&part, b"")
+        {
+            fail = Some(format!("补写空文件失败: {e}"));
+            break;
+        }
+        let final_path = crate::server::unique_path(
+            dest.parent().unwrap_or(&s.dest_root),
+            dest.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+                .as_str(),
+        );
+        if let Err(e) = std::fs::rename(&part, &final_path) {
+            fail = Some(format!("落盘失败: {e}"));
+            break;
+        }
+    }
+    if let Some(reason) = fail {
+        tracing::error!("远程回传落盘失败：{reason}");
+        let _ = std::fs::remove_dir_all(&s.dir);
+        st.update_transfer(&s.row_id, s.got, None, crate::TransferStatus::Failed, None);
+        return;
+    }
+    let _ = std::fs::remove_dir_all(&s.dir);
+    st.update_transfer(
+        &s.row_id,
+        s.got,
+        Some(s.got),
+        crate::TransferStatus::Done,
+        Some(s.dest_root.clone()),
+    );
+    st.emit(CoreEvent::Toast {
+        text: format!("收到远程回传（{} 项）", s.files.len()),
+    });
+    tracing::info!("远程回传批次 {id} 落盘完成（{} 项）", s.files.len());
+}
+
+/// 受控端：中止文件回传（对端取消或写盘失败）
+fn remote_file_abort(st: &Arc<AppState>, id: &str, notify_ui: bool) {
+    let state = st
+        .remote
+        .lock()
+        .unwrap()
+        .recv_files
+        .lock()
+        .unwrap()
+        .remove(id);
+    if let Some(mut s) = state {
+        s.file = None;
+        let _ = std::fs::remove_dir_all(&s.dir);
+        st.update_transfer(
+            &s.row_id,
+            s.got,
+            None,
+            crate::TransferStatus::Cancelled,
+            None,
+        );
+        if notify_ui {
+            st.emit(CoreEvent::Toast {
+                text: "对方取消了远程回传".into(),
+            });
+        }
+    }
+}
+
+// ---------- 文件回传：控制端（发送方） ----------
+
+/// 控制端：向受控端推送文件（观看会话中；观看窗口拖拽/按钮触发）
+pub fn start_remote_file_send(st: &Arc<AppState>, paths: Vec<std::path::PathBuf>) {
+    let peer = {
+        let remote = st.remote.lock().unwrap();
+        match remote.viewing.as_ref() {
+            Some(v) => v.peer_id.clone(),
+            None => {
+                st.emit(CoreEvent::Toast {
+                    text: "没有进行中的远程控制会话".into(),
+                });
+                return;
+            }
+        }
+    };
+    let (id, src) = match crate::server::build_batch_source(&paths) {
+        Ok(v) => v,
+        Err(e) => {
+            st.emit(CoreEvent::Toast {
+                text: format!("发送失败：{e}"),
+            });
+            return;
+        }
+    };
+    let entries: Vec<crate::FileEntry> = src
+        .files
+        .iter()
+        .map(|(_, rel, size)| crate::FileEntry {
+            name: rel.clone(),
+            size: *size,
+        })
+        .collect();
+    st.new_transfer(crate::TransferInfo::batch(
+        id.clone(),
+        crate::Direction::ToPhone,
+        src.name.clone(),
+        src.total_size,
+        entries,
+        Some(peer),
+    ));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let offer = RemoteWire::RemoteFileOffer {
+        id: id.clone(),
+        name: src.name.clone(),
+        total_size: src.total_size,
+        files: src
+            .files
+            .iter()
+            .map(|(_, rel, size)| crate::protocol::OfferFile {
+                name: rel.clone(),
+                size: *size,
+            })
+            .collect(),
+    };
+    // 登记 + 发送邀请（原子段内完成，失败即回滚登记）
+    let sent = {
+        let remote = st.remote.lock().unwrap();
+        let ok = remote
+            .viewing
+            .as_ref()
+            .map(|v| v.out.try_send(RemoteOut::Control(offer)).is_ok())
+            .unwrap_or(false);
+        if ok {
+            remote
+                .send_offers
+                .lock()
+                .unwrap()
+                .insert(id.clone(), src.clone());
+            remote
+                .send_cancel
+                .lock()
+                .unwrap()
+                .insert(id.clone(), cancel);
+        }
+        ok
+    };
+    if !sent {
+        let remote = st.remote.lock().unwrap();
+        remote.send_offers.lock().unwrap().remove(&id);
+        remote.send_cancel.lock().unwrap().remove(&id);
+        st.emit(CoreEvent::Toast {
+            text: "发送失败：连接已断开".into(),
+        });
+    }
+}
+
+/// 控制端：受控端 Ack 后开始推块
+fn start_remote_file_push(st: &Arc<AppState>, id: String, src: crate::server::BatchSource) {
+    let st = st.clone();
+    let (out, cancel) = {
+        let out = st
+            .remote
+            .lock()
+            .unwrap()
+            .viewing
+            .as_ref()
+            .map(|v| v.out.clone());
+        let cancel = st
+            .remote
+            .lock()
+            .unwrap()
+            .send_cancel
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned();
+        (out, cancel)
+    };
+    let Some(out) = out else { return };
+    let Ok(uuid) = uuid::Uuid::parse_str(&id) else {
+        return;
+    };
+    let id16 = *uuid.as_bytes();
+    let total = src.total_size;
+    st.update_transfer(&id, 0, Some(total), crate::TransferStatus::Active, None);
+    let rt = st.rt_handle.clone();
+    rt.spawn(async move {
+        let mut sent = 0u64;
+        let mut hasher = sha2::Sha256::new();
+        'files: for (path, _rel, _size) in &src.files {
+            let Ok(mut f) = tokio::fs::File::open(path).await else {
+                st.update_transfer(&id, sent, Some(total), crate::TransferStatus::Failed, None);
+                break;
+            };
+            let mut buf = vec![0u8; CHUNK_SIZE];
+            loop {
+                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    break 'files;
+                }
+                match f.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        hasher.update(&buf[..n]);
+                        if out
+                            .send(RemoteOut::FileChunk {
+                                id: id16,
+                                offset: sent,
+                                data: buf[..n].to_vec(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            st.update_transfer(
+                                &id,
+                                sent,
+                                Some(total),
+                                crate::TransferStatus::Failed,
+                                None,
+                            );
+                            return;
+                        }
+                        sent += n as u64;
+                        st.progress_throttled(&id, sent, false);
+                    }
+                    Err(_) => {
+                        st.update_transfer(
+                            &id,
+                            sent,
+                            Some(total),
+                            crate::TransferStatus::Failed,
+                            None,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        let sha = crate::pigeon::sha_hex(&hasher.finalize());
+        let _ = out
+            .send(RemoteOut::Control(RemoteWire::RemoteFileEnd {
+                id: id.clone(),
+                ok: true,
+                sha: Some(sha),
+            }))
+            .await;
+        st.remote
+            .lock()
+            .unwrap()
+            .send_cancel
+            .lock()
+            .unwrap()
+            .remove(&id);
+        st.update_transfer(&id, sent, Some(total), crate::TransferStatus::Done, None);
+        tracing::info!("远程回传「{}」推送完成（{} 字节）", src.name, sent);
+    });
 }
 
 // ---------- 控制端（发起方） ----------
@@ -1344,7 +2141,9 @@ async fn remote_connect_inner(
     );
 
     // ---- 观看会话登记 + 本地桥 ----
+    // 初始编码 JPEG（安全默认）；观看端就绪后按能力协商升级 H.264
     let token = uuid::Uuid::new_v4().simple().to_string();
+    let view_token = uuid::Uuid::new_v4().simple().to_string();
     let closed = Arc::new(AtomicBool::new(false));
     let (bridge_tx, _) = tokio::sync::broadcast::channel::<BridgeMsg>(48);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<RemoteOut>(256);
@@ -1352,22 +2151,33 @@ async fn remote_connect_inner(
         peer_id: machine.to_string(),
         name: pc_name.clone(),
         token: token.clone(),
+        view_token: view_token.clone(),
         closed: closed.clone(),
         out: out_tx.clone(),
         bridge: bridge_tx.clone(),
+        codec: AtomicU8::new(crate::encoder::CODEC_JPEG),
+        viewer_caps: Mutex::new(HashMap::new()),
     });
     st.emit(CoreEvent::RemoteViewReady {
         peer_id: machine.to_string(),
         name: pc_name.clone(),
         token: token.clone(),
+        view_token: view_token.clone(),
         port: st.cfg.port,
         width: screen.width,
         height: screen.height,
     });
 
-    // 首条桥消息：hello（观看页据此初始化画布比例）
+    // 首条桥消息：hello（观看页据此初始化画布比例与显示器列表）
     let _ = bridge_tx.send(BridgeMsg::Json(
-        serde_json::json!({ "t": "hello", "name": pc_name, "width": screen.width, "height": screen.height }).to_string(),
+        serde_json::json!({
+            "t": "hello",
+            "name": pc_name,
+            "width": screen.width,
+            "height": screen.height,
+            "monitors": screen.monitors,
+        })
+        .to_string(),
     ));
 
     // ---- 主循环：收帧转发观看桥 / 发输入 ----
@@ -1377,9 +2187,9 @@ async fn remote_connect_inner(
         tokio::select! {
             msg = stream.next() => match msg {
                 Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(b))) => match open_msg(&noise, &b) {
-                    Ok(RemoteIn::FrameChunk { seq, idx, total, data }) => {
-                        if let Some(jpeg) = assembler.feed(seq, idx, total, &data) {
-                            let _ = bridge_tx.send(BridgeMsg::Frame(jpeg));
+                    Ok(RemoteIn::FrameChunk { seq, idx, total, codec, data }) => {
+                        if let Some((frame_codec, payload)) = assembler.feed(seq, idx, total, codec, &data) {
+                            let _ = bridge_tx.send(BridgeMsg::Frame { codec: frame_codec, data: payload });
                         }
                     }
                     Ok(RemoteIn::Control(RemoteWire::RemoteClipboard { text })) => {
@@ -1389,6 +2199,43 @@ async fn remote_connect_inner(
                         let _ = bridge_tx.send(BridgeMsg::Json(
                             serde_json::json!({"t": "clipboard", "len": text.chars().count()}).to_string(),
                         ));
+                    }
+                    Ok(RemoteIn::Control(RemoteWire::RemoteScreen { screen })) => {
+                        // 显示器切换后屏幕信息更新
+                        let _ = bridge_tx.send(BridgeMsg::Json(
+                            serde_json::json!({
+                                "t": "screen",
+                                "width": screen.width,
+                                "height": screen.height,
+                                "monitors": screen.monitors,
+                            })
+                            .to_string(),
+                        ));
+                    }
+                    Ok(RemoteIn::Control(RemoteWire::RemoteFileAck { id, ok })) => {
+                        let src = st.remote.lock().unwrap().send_offers.lock().unwrap().remove(&id);
+                        match (ok, src) {
+                            (true, Some(src)) => start_remote_file_push(st, id, src),
+                            (false, _) => {
+                                st.remote.lock().unwrap().send_cancel.lock().unwrap().remove(&id);
+                                st.update_transfer(&id, 0, None, crate::TransferStatus::Refused, None);
+                                st.emit(CoreEvent::Toast { text: "对方拒绝了文件回传".into() });
+                            }
+                            (true, None) => {}
+                        }
+                    }
+                    Ok(RemoteIn::Control(RemoteWire::RemoteFileEnd { id, ok, .. })) => {
+                        if !ok {
+                            st.update_transfer(&id, 0, None, crate::TransferStatus::Failed, None);
+                            st.emit(CoreEvent::Toast { text: "对方接收远程回传失败".into() });
+                        }
+                    }
+                    Ok(RemoteIn::Control(RemoteWire::RemoteFileCancel { id })) => {
+                        let remote = st.remote.lock().unwrap();
+                        if let Some(flag) = remote.send_cancel.lock().unwrap().get(&id) {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                        remote.send_offers.lock().unwrap().remove(&id);
                     }
                     Ok(RemoteIn::Control(RemoteWire::RemoteEnd { reason })) => {
                         end_reason = reason.unwrap_or_else(|| "对方结束了会话".into());
@@ -1441,10 +2288,35 @@ async fn remote_connect_inner(
     // ---- 清理 ----
     closed.store(true, Ordering::Relaxed);
     let _ = sink.close().await;
-    st.remote.lock().unwrap().viewing = None;
+    {
+        let mut remote = st.remote.lock().unwrap();
+        remote.viewing = None;
+        remote.send_offers.lock().unwrap().clear();
+        remote.send_cancel.lock().unwrap().clear();
+    }
     let _ = bridge_tx.send(BridgeMsg::Json(
         serde_json::json!({"t": "end", "reason": end_reason}).to_string(),
     ));
+    // 未完成的回传行收尾
+    {
+        let pending: Vec<String> = st
+            .transfers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| {
+                t.peer.as_deref() == Some(machine)
+                    && matches!(
+                        t.status,
+                        crate::TransferStatus::Waiting | crate::TransferStatus::Active
+                    )
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        for id in pending {
+            st.update_transfer(&id, 0, None, crate::TransferStatus::Cancelled, None);
+        }
+    }
     st.emit(CoreEvent::RemoteSessionEnded {
         peer_id: machine.to_string(),
         name: pc_name,
@@ -1455,6 +2327,9 @@ async fn remote_connect_inner(
 }
 
 // ---------- 本地观看桥（/remote-view-ws，token 鉴权） ----------
+//
+// 主凭证（观看窗口）：可发输入，断开即结束会话；
+// 只读凭证（手机「只看不控」）：只收帧，断开不影响会话。
 
 pub async fn handle_view_socket(
     st: Arc<AppState>,
@@ -1463,26 +2338,46 @@ pub async fn handle_view_socket(
 ) {
     use axum::extract::ws::Message;
 
+    // token 匹配主凭证 → 完整观看；匹配只读凭证 → 只看不控
     let session = {
         let remote = st.remote.lock().unwrap();
-        match remote
-            .viewing
-            .as_ref()
-            .filter(|v| Some(v.token.as_str()) == token.as_deref())
-        {
-            Some(v) => (v.out.clone(), v.bridge.subscribe(), v.token.clone()),
-            None => return,
-        }
+        let Some(view) = remote.viewing.as_ref() else {
+            return;
+        };
+        let readonly = if Some(view.token.as_str()) == token.as_deref() {
+            false
+        } else if Some(view.view_token.as_str()) == token.as_deref() {
+            true
+        } else {
+            return;
+        };
+        let conn_id = rand::random::<u64>();
+        // 只读观众（手机页）固定按仅 JPEG 登记：其存在会把流压回 JPEG，保证可解码
+        view.viewer_caps
+            .lock()
+            .unwrap()
+            .insert(conn_id, crate::encoder::CODEC_JPEG);
+        view.recompute_codec();
+        (
+            view.out.clone(),
+            view.bridge.subscribe(),
+            readonly,
+            conn_id,
+            view.codec.load(Ordering::Relaxed),
+        )
     };
-    let (out_tx, mut bridge_rx, session_token) = session;
+    let (out_tx, mut bridge_rx, readonly, conn_id, cur_codec) = session;
 
     let (mut sink, mut stream) = socket.split();
-    // 观看桥写入任务
+    // 观看桥写入任务：帧二进制（首字节 codec）+ JSON 文本
     let writer = tokio::spawn(async move {
         loop {
             match bridge_rx.recv().await {
-                Ok(BridgeMsg::Frame(data)) => {
-                    if sink.send(Message::Binary(data.into())).await.is_err() {
+                Ok(BridgeMsg::Frame { codec, data }) => {
+                    let mut payload = Vec::with_capacity(data.len() + 1);
+                    payload.push(codec);
+                    payload.extend_from_slice(&data);
+                    if sink.send(Message::Binary(payload.into())).await.is_err() {
                         break;
                     }
                 }
@@ -1496,37 +2391,70 @@ pub async fn handle_view_socket(
             }
         }
     });
+    // 告知观看端当前 codec（经桥转投一次，绕过已被 writer 持有的 sink）
+    {
+        let codec_json =
+            serde_json::json!({"t": "codec", "codec": crate::encoder::codec_name(cur_codec)})
+                .to_string();
+        if let Some(view) = st.remote.lock().unwrap().viewing.as_ref() {
+            let _ = view.bridge.send(BridgeMsg::Json(codec_json));
+        }
+    }
 
-    // 观看页上行：输入/画质/粘贴/结束
+    // 观看页上行：输入/画质/显示器/能力上报/粘贴/结束（只读连接忽略控制类消息）
     while let Some(Ok(msg)) = stream.next().await {
         let Message::Text(text) = msg else { continue };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
         match v.get("t").and_then(|t| t.as_str()) {
-            Some("input") => {
+            Some("input") if !readonly => {
                 if let Ok(ev) = serde_json::from_value::<InputEvent>(v) {
                     let _ = out_tx.try_send(RemoteOut::Control(RemoteWire::RemoteInput { ev }));
                 }
             }
-            Some("clip_paste") => {
+            Some("clip_paste") if !readonly => {
                 if let Some(text) = crate::clipboard::read_text()
                     && text.len() <= CLIPBOARD_MAX
                 {
                     let _ = out_tx.try_send(RemoteOut::Control(RemoteWire::RemotePaste { text }));
                 }
             }
-            Some("quality") => {
-                let max_width = v.get("max_width").and_then(|x| x.as_u64()).unwrap_or(1920) as u32;
-                let quality = v.get("quality").and_then(|x| x.as_u64()).unwrap_or(70) as u8;
+            Some("quality") if !readonly => {
+                let tier = v.get("tier").and_then(|x| x.as_u64()).unwrap_or(1920);
+                let (max_width, quality) = quality_tier(tier as u32);
                 let _ = out_tx.try_send(RemoteOut::Control(RemoteWire::RemoteQuality {
                     max_width,
                     quality,
                 }));
             }
-            Some("end") => {
+            Some("monitor") if !readonly => {
+                if let Some(index) = v.get("index").and_then(|x| x.as_u64()) {
+                    let _ = out_tx.try_send(RemoteOut::Control(RemoteWire::RemoteSelectMonitor {
+                        index: index as u32,
+                    }));
+                }
+            }
+            Some("caps") if !readonly => {
+                // 观看页上报解码能力：{"t":"caps","h264":true|false}
+                let h264 = v.get("h264").and_then(|x| x.as_bool()).unwrap_or(false);
+                let remote = st.remote.lock().unwrap();
+                let Some(view) = remote.viewing.as_ref() else {
+                    continue;
+                };
+                view.viewer_caps.lock().unwrap().insert(
+                    conn_id,
+                    if h264 {
+                        crate::encoder::CODEC_H264
+                    } else {
+                        crate::encoder::CODEC_JPEG
+                    },
+                );
+                view.recompute_codec();
+            }
+            Some("end") if !readonly => {
                 if let Some(view) = st.remote.lock().unwrap().viewing.as_ref()
-                    && view.token == session_token
+                    && view.token == token.as_deref().unwrap_or_default()
                 {
                     view.closed.store(true, Ordering::Relaxed);
                 }
@@ -1535,10 +2463,14 @@ pub async fn handle_view_socket(
         }
     }
     writer.abort();
-    // 观看页关闭 = 会话结束
-    if let Some(view) = st.remote.lock().unwrap().viewing.as_ref()
-        && view.token == session_token
-    {
+    // 注销能力并重算 codec；主观看页关闭 = 会话结束
+    let mut remote = st.remote.lock().unwrap();
+    let Some(view) = remote.viewing.as_mut() else {
+        return;
+    };
+    view.viewer_caps.lock().unwrap().remove(&conn_id);
+    view.recompute_codec();
+    if !readonly && view.token == token.as_deref().unwrap_or_default() {
         view.closed.store(true, Ordering::Relaxed);
     }
 }
@@ -1623,6 +2555,9 @@ pub fn handle_ui_request(st: &Arc<AppState>, req: UiRequest) {
                     text: "当前没有远程控制会话".into(),
                 });
             }
+        }
+        UiRequest::RemoteSendFiles { paths } => {
+            start_remote_file_send(st, paths);
         }
         UiRequest::RemoteAssistRequest { peer_id } => {
             let ok = crate::pigeon::try_push(
@@ -1755,22 +2690,19 @@ mod tests {
     fn frame_assembler_reassembles_and_drops_stale() {
         let mut a = FrameAssembler::default();
         // 空组装器收到非首块 → 残尾丢弃
-        assert!(a.feed(7, 1, 3, b"bb").is_none());
-        assert!(a.feed(7, 0, 3, b"aa").is_none());
-        assert!(a.feed(7, 2, 3, b"cc").is_none());
+        assert!(a.feed(7, 1, 3, 0, b"bb").is_none());
+        assert!(a.feed(7, 0, 3, 0, b"aa").is_none());
+        assert!(a.feed(7, 2, 3, 0, b"cc").is_none());
         // 重复 idx=0 → 重建缓冲
-        assert!(a.feed(7, 0, 3, b"aa").is_none());
-        assert!(a.feed(7, 1, 3, b"bb").is_none());
-        // 三块齐 → 出完整帧
-        assert_eq!(
-            a.feed(7, 2, 3, b"cc").as_deref(),
-            Some(b"aabbcc".as_slice())
-        );
+        assert!(a.feed(7, 0, 3, 0, b"aa").is_none());
+        assert!(a.feed(7, 1, 3, 0, b"bb").is_none());
+        // 三块齐 → 出完整帧（带 codec）
+        assert_eq!(a.feed(7, 2, 3, 0, b"cc"), Some((0u8, b"aabbcc".to_vec())));
         // 新 seq 的 idx=0 重建
-        assert!(a.feed(8, 0, 2, b"xx").is_none());
-        assert_eq!(a.feed(8, 1, 2, b"yy").as_deref(), Some(b"xxyy".as_slice()));
+        assert!(a.feed(8, 0, 2, 1, b"xx").is_none());
+        assert_eq!(a.feed(8, 1, 2, 1, b"yy"), Some((1u8, b"xxyy".to_vec())));
         // 旧 seq 残尾丢弃
-        assert!(a.feed(7, 1, 3, b"zz").is_none());
+        assert!(a.feed(7, 1, 3, 0, b"zz").is_none());
     }
 
     #[test]

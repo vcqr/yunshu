@@ -3,6 +3,9 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(windows)]
+mod win_service;
+
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
@@ -408,6 +411,65 @@ fn remote_disconnect(state: tauri::State<AppState>) {
     let _ = state.ui_tx.send(UiRequest::RemoteDisconnect);
 }
 
+/// 观看窗口内向受控端推送文件（文件回传）
+#[tauri::command]
+fn remote_send_files(state: tauri::State<AppState>, paths: Vec<String>) {
+    let paths: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
+    let _ = state.ui_tx.send(UiRequest::RemoteSendFiles { paths });
+}
+
+/// 以系统服务方式自启（Windows：提权安装；其余平台不支持）
+#[tauri::command]
+fn service_install() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let script = format!(
+            "Start-Process -Verb RunAs -FilePath '{}' -ArgumentList 'service','install' -Wait",
+            exe.display()
+        );
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("服务安装未完成（需要管理员授权）".into())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err("系统服务自启仅支持 Windows（macOS 请用「开机自启」）".into())
+    }
+}
+
+/// 卸载系统服务（Windows：提权卸载）
+#[tauri::command]
+fn service_uninstall() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let script = format!(
+            "Start-Process -Verb RunAs -FilePath '{}' -ArgumentList 'service','uninstall' -Wait",
+            exe.display()
+        );
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("服务卸载未完成（需要管理员授权）".into())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err("系统服务自启仅支持 Windows".into())
+    }
+}
+
 #[tauri::command]
 fn remote_assist_request(state: tauri::State<AppState>, peer_id: String) {
     let _ = state.ui_tx.send(UiRequest::RemoteAssistRequest { peer_id });
@@ -517,6 +579,11 @@ static DEFAULT_ICON: std::sync::OnceLock<tauri::image::Image<'static>> = std::sy
 struct TrayHandle(Mutex<Option<tauri::tray::TrayIcon>>);
 
 fn main() {
+    // Windows 服务模式：yunshu.exe service install|uninstall|run（见 win_service.rs）
+    #[cfg(windows)]
+    if win_service::try_dispatch() {
+        return;
+    }
     // CLI 覆盖（单机双实例测试用）：yunshu.exe --port 8001 --name testa
     // 覆盖只影响本次运行，不写入 config.toml
     let mut args = std::env::args().skip(1);
@@ -564,6 +631,7 @@ fn main() {
                             peer_id,
                             name,
                             token,
+                            view_token: _,
                             port,
                             width,
                             height,
@@ -699,6 +767,9 @@ fn main() {
             set_dnd,
             remote_connect,
             remote_disconnect,
+            remote_send_files,
+            service_install,
+            service_uninstall,
             remote_assist_request,
             remote_assist_respond,
             get_view_info

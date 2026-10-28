@@ -103,11 +103,32 @@ bot 参数：第 1 个为 bot→app 推送批次的测试大小（默认 1MB）�
    - **临时密码**：对方「设置 → 远程控制」里展示的 6 位数字（每次启动重新生成）
    - **固定密码**：对方设置里配置的长期密码（无人值守场景，配合开机自启）
    - **一次性密码**：由「请求协助」流程自动生成回传，无需人工输入
-3. 观看窗口内直接操作；顶栏可切画质（流畅 720 / 高清 1080 / 超清 1920）、全屏、断开
+3. 观看窗口内直接操作；顶栏可切画质（流畅 720 / 高清 1080 / 超清 1920）、
+   切显示器（多屏下拉）、传文件（按钮或直接把文件拖进窗口）、全屏、断开
 
-被控端始终醒目可见：托盘图标变红、tooltip 显示控制方名称、托盘菜单「断开远程控制」、主窗口红色横幅，均可一键断开。
+**视频编码自适应**：默认 H.264（Baseline，SPS/PPS 随关键帧内联），观看端通过 WebCodecs
+硬解（WebView2 / Safari 16.4+ 均支持）；观看端不支持 WebCodecs 或出错自动回退 JPEG。
+编码器抽象成 trait（openh264 软编全平台一致，MediaFoundation/VideoToolbox 硬编可按
+trait 接入），画面不变跳帧、链路拥塞丢帧后自动强推关键帧，并按编码耗时/丢帧率在
+质量 40-80、帧率 12-25fps 间自适应。
+
+**手机只看不控**：观看会话中主窗口出现「手机观看」按钮，扫码即可在手机浏览器查看
+受控屏幕（只读凭证独立于控制凭证，接入后视频自动降为 JPEG 保证兼容）。
+
+**文件回传**：观看会话中可把本机文件推给受控电脑，自动接收并校验整批 SHA-256，
+存「保存目录/远程回传/」，两端都有进度卡片。
+
+被控端始终醒目可见：托盘图标变红、tooltip 显示控制方名称、托盘菜单「断开远程控制」、
+主窗口红色横幅，均可一键断开。
 
 **机器 ID** 是静态密钥指纹前 8 位 hex（跨重启稳定），在「设置 → 远程控制」里查看。凭机器 ID + 密码即可控制，密码在 Noise 加密通道内传输，连续输错 5 次锁定 10 分钟。
+
+**无人值守自启**：
+- Windows：设置里「开机自启」为注册表 Run 键（登录后启动）；「系统服务自启」安装
+  SYSTEM 服务（管理员授权），开机即启动并在用户登录后自动在会话内拉起云书
+  （agent 崩溃 30 秒自动重启）。
+- macOS：设置里「开机自启」写入 `~/Library/LaunchAgents/com.yunshu.desktop.plist`
+  （登录后启动）。配合固定密码即实现无人值守。
 
 平台权限（一期范围：登录后场景）：
 
@@ -115,7 +136,7 @@ bot 参数：第 1 个为 bot→app 推送批次的测试大小（默认 1MB）�
 |---|---|---|---|
 | macOS | 需「屏幕录制」授权 | 需「辅助功能」授权 | 系统设置 → 隐私与安全性；开发期 ad-hoc 签名每次重编译后可能需重新授权 |
 | Windows | 无需 | 无需 | 用户态看不到 UAC 弹窗/锁屏/安全桌面 |
-| Linux | 未支持（二期） | 未支持 | — |
+| Linux X11 | 无需 | 无需（XTEST） | Wayland 采集走 portal、注入需额外授权，以实际可用为准 |
 
 排障：`cargo run -p yunshu-core --example xcap_smoke` 可单独验证采集权限与编码链路。
 
@@ -143,21 +164,24 @@ netsh advfirewall firewall add rule name="yunshu-disc"  dir=in action=allow prot
 - 手机浏览器剪贴板 API 需要 HTTPS 安全上下文，因此手机→电脑发文本用页面内粘贴的降级方案；电脑→手机的文本用"展示 + 手动复制"
 - 手机上传暂不支持断点续传（PC↔PC 批次传输已支持）
 - 手机端同一时间只允许一台设备连接
-- 远程控制一期只控主屏、仅登录后场景（看不到 UAC/锁屏），多人协作观看、Linux 支持在二期
+- 远程控制仅登录后场景（看不到 UAC/锁屏/安全桌面）；Windows 服务化可在登录前拉起
+  会话代理，但锁屏画面本身仍不可见
+- 远程控制 H.264 当前为 openh264 软编（屏幕内容优化），MediaFoundation / VideoToolbox
+  硬编可按 encoder trait 接入
+- macOS 免登录（LaunchDaemon + 锁屏可见）受登录窗口上下文 TCC 限制，不做
 
 ## 技术栈
 
 Rust workspace：
 
-- `crates/yunshu-core` — axum（HTTP + WebSocket）、配对状态机、传输管理、飞鸽（Noise XX 加密直连）、远程控制（xcap 采集 + jpeg-encoder 编码 + enigo 注入）、arboard 剪贴板
-- `crates/yunshu-app` — Tauri 2 壳（窗口/托盘/命令桥），前端 Vue 3 + Tailwind（`frontend/`）
+- `crates/yunshu-core` — axum（HTTP + WebSocket）、配对状态机、传输管理、飞鸽（Noise XX 加密直连）、远程控制（xcap 采集 + openh264/jpeg-encoder 编码 + enigo 注入 + WebCodecs 解码）、arboard 剪贴板
+- `crates/yunshu-app` — Tauri 2 壳（窗口/托盘/命令桥 + Windows 服务化），前端 Vue 3 + Tailwind（`frontend/`）
 - `crates/pigeonbot` — 无头飞鸽测试节点（e2e）
 
 线程模型：tokio runtime 跑在后台线程，Tauri 占主线程，`std::sync::mpsc` 双向桥接事件与 UI 请求。
 
-## 后续计划（远程控制二期/三期）
+## 后续计划
 
-- H.264 硬编（MediaFoundation / VideoToolbox）+ WebCodecs 解码，带宽 5-15 Mbps
-- 多显示器选择、画质自适应（按 RTT/丢帧调整）
-- Linux X11 支持；手机浏览器「只看不控」
-- Windows 服务化（免登录、UAC 可见）、macOS LaunchDaemon、文件回传
+- H.264 硬编落地（MediaFoundation / VideoToolbox，encoder trait 已就绪）
+- 观看端多路同看、会话录制
+- 远程控制画质按 RTT 精细自适应（当前按编码耗时/丢帧）

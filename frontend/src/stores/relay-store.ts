@@ -41,6 +41,8 @@ export interface RelayState {
   remoteMachineId: string | null
   /** 远程控制：本机正在被控（受控端醒目横幅） */
   remoteControlled: { peer_id: string; name: string } | null
+  /** 远程控制：本机正在观看对方（供手机「只看不控」扫码接入） */
+  remoteViewing: { name: string; view_token: string; port: number; ip: string } | null
   /** 远程控制：发起连接的密码输入弹窗 */
   controlDialog: { machine_id: string; name: string } | null
   /** 远程控制：待处理的反向协助请求队列 */
@@ -72,6 +74,7 @@ export const store = reactive<RelayState>({
   remoteTempPassword: null,
   remoteMachineId: null,
   remoteControlled: null,
+  remoteViewing: null,
   controlDialog: null,
   assistRequests: [],
 })
@@ -149,6 +152,7 @@ export const mutations = {
   setRemoteTempPassword(pw: string | null) { store.remoteTempPassword = pw },
   setRemoteMachineId(id: string | null) { store.remoteMachineId = id },
   setRemoteControlled(c: { peer_id: string; name: string } | null) { store.remoteControlled = c },
+  setRemoteViewing(v: { name: string; view_token: string; port: number; ip: string } | null) { store.remoteViewing = v },
   openControlDialog(machineId: string, name: string) { store.controlDialog = { machine_id: machineId, name } },
   closeControlDialog() { store.controlDialog = null },
   enqueueAssist(req: { peer_id: string; name: string }) {

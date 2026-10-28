@@ -1,6 +1,7 @@
 //! 云书核心：HTTP/WS 服务、配对、传输、飞鸽（PC↔PC）。不依赖任何 UI。
 
 pub mod clipboard;
+pub mod encoder;
 pub mod pairing;
 pub mod pigeon;
 pub mod protocol;
@@ -222,11 +223,12 @@ pub enum CoreEvent {
         peer_id: String,
         name: String,
     },
-    /// 远程控制：连接成功，可打开观看窗口（token 为本地观看桥接入凭证）
+    /// 远程控制：连接成功，可打开观看窗口（token 为主观看凭证，view_token 为手机只读凭证）
     RemoteViewReady {
         peer_id: String,
         name: String,
         token: String,
+        view_token: String,
         port: u16,
         width: u32,
         height: u32,
@@ -322,6 +324,10 @@ pub enum UiRequest {
     },
     /// 断开当前远程控制会话（观看或被控，任一方）
     RemoteDisconnect,
+    /// 远程控制会话中向受控端推送文件（文件回传）
+    RemoteSendFiles {
+        paths: Vec<PathBuf>,
+    },
     /// 通过飞鸽链路请求对方协助（对方同意后回一次性密码）
     RemoteAssistRequest {
         peer_id: String,

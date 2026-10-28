@@ -239,9 +239,13 @@ async function apply(ev: any) {
       toast.info(`正在连接「${ev.name}」的远程控制…`)
       break
     case 'remote_view_ready':
-      // 观看窗口由 Rust 侧自动打开；这里只提示
+      // 观看窗口由 Rust 侧自动打开；这里登记手机「只看不控」入口信息
       toast.success(`已连上「${ev.name}」的远程控制`)
       mutations.closeControlDialog()
+      {
+        const ip = store.meIp || (store.serverAddr || '').split(':')[0] || ''
+        mutations.setRemoteViewing({ name: ev.name, view_token: ev.view_token, port: ev.port, ip })
+      }
       break
     case 'remote_connect_failed':
       toast.error(`远程控制连接失败：${ev.reason || '未知原因'}`)
@@ -258,6 +262,7 @@ async function apply(ev: any) {
         mutations.setRemoteControlled(null)
         toast.info(`远程控制会话已结束（${ev.reason || '对端断开'}）`)
       } else if (ev.side === 'controller') {
+        mutations.setRemoteViewing(null)
         toast.info(`与「${ev.name}」的远程观看已结束`)
       }
       break

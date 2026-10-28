@@ -6,7 +6,7 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { Bird, HandMetal, MonitorUp, ShieldAlert, ShieldCheck } from '@lucide/vue'
+import { Bird, HandMetal, MonitorUp, ShieldAlert, ShieldCheck, Smartphone } from '@lucide/vue'
 import AppHeader from './components/relay/AppHeader.vue'
 import DeviceSidebar from './components/relay/DeviceSidebar.vue'
 import ChatPanel from './components/relay/ChatPanel.vue'
@@ -127,6 +127,19 @@ function closeControlDialog() {
 }
 const currentAssist = computed(() => store.assistRequests[0] ?? null)
 
+/* --------------------------- 手机观看（只看不控） --------------------------- */
+const showPhoneView = ref(false)
+const phoneViewQr = ref('')
+const phoneViewUrl = ref('')
+async function openPhoneView() {
+  const v = store.remoteViewing
+  if (!v || !v.ip) return
+  phoneViewUrl.value = `http://${v.ip}:${v.port}/view?t=${v.view_token}`
+  const QR = await import('qrcode')
+  phoneViewQr.value = await QR.toDataURL(phoneViewUrl.value, { width: 220, margin: 1 })
+  showPhoneView.value = true
+}
+
 /* ------------------------------ 生命周期 ------------------------------ */
 onMounted(async () => {
   restoreTransferPanelPref()
@@ -208,6 +221,29 @@ onMounted(async () => {
 
     <!-- 接收请求队列弹窗 -->
     <OfferDialog />
+
+    <!-- 手机观看入口（正在观看对方屏幕时显示） -->
+    <button
+      v-if="store.remoteViewing && !showPhoneView"
+      class="fixed bottom-10 left-4 z-40 flex items-center gap-1.5 rounded-full bg-slate-800/90 px-3.5 py-2 text-xs font-medium text-white shadow-lg backdrop-blur hover:bg-slate-700"
+      @click="openPhoneView"
+    >
+      <Smartphone class="size-3.5" />
+      手机观看
+    </button>
+
+    <!-- 手机观看二维码弹窗 -->
+    <div v-if="showPhoneView" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45" @click.self="showPhoneView = false">
+      <div class="bg-card w-full max-w-sm rounded-xl border p-5 text-center shadow-xl">
+        <p class="mb-1 text-sm font-semibold">手机观看「{{ store.remoteViewing?.name }}」</p>
+        <p class="mb-3 text-xs text-muted-foreground">同一局域网的手机扫码即可只看不控</p>
+        <img v-if="phoneViewQr" :src="phoneViewQr" alt="手机观看二维码" class="mx-auto rounded-lg border" />
+        <p class="mt-3 break-all rounded-lg border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">{{ phoneViewUrl }}</p>
+        <div class="mt-4 flex justify-end">
+          <button class="rounded-lg border px-4 py-2 text-sm hover:bg-accent" @click="showPhoneView = false">关闭</button>
+        </div>
+      </div>
+    </div>
 
     <!-- 远程协助请求（反向协助） -->
     <div v-if="currentAssist" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45" @click.self="relayActions.assistRespond(currentAssist.peer_id, false)">

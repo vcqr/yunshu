@@ -163,7 +163,7 @@ async fn remote_control_auth_stream_and_lockout() {
     };
     tokio::spawn(yunshu_core::server::serve(cfg, event_tx, ui_rx));
 
-    // std → tokio 事件桥
+    // std → tokio 事件桥（eprintln 留痕：stderr 无缓冲，便于死锁排查）
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<CoreEvent>();
     std::thread::spawn(move || {
         for ev in event_rx {
@@ -286,7 +286,8 @@ async fn remote_control_auth_stream_and_lockout() {
         assert_eq!(v["screen"]["logical_w"], 320, "{v}");
 
         // 收视频帧分块 → 重组 → JPEG SOI 校验
-        let jpeg = collect_frame(&mut ws, &noise).await;
+        let (codec, jpeg) = collect_frame(&mut ws, &noise).await;
+        assert_eq!(codec, 0, "初始编码应为 JPEG");
         assert!(jpeg.len() > 100, "JPEG 帧太小: {} 字节", jpeg.len());
         assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "应为 JPEG SOI 开头");
         assert_eq!(&jpeg[jpeg.len() - 2..], &[0xFF, 0xD9], "应为 JPEG EOI 结尾");
@@ -349,23 +350,35 @@ async fn remote_control_auth_stream_and_lockout() {
                 password: temp2.clone(),
             })
             .unwrap();
-        // 实例 1（控制端）：连接成功事件
+        // 实例 1（控制端）：连接成功事件（失败则带原因快速失败）
+        let mut main_token = String::new();
+        let mut view_token = String::new();
         loop {
             let ev = timeout(Duration::from_secs(20), ev_rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
-            if let CoreEvent::RemoteViewReady {
-                peer_id,
-                token,
-                port,
-                ..
-            } = ev
-            {
-                assert_eq!(peer_id, "cafe5678");
-                assert_eq!(port, PORT, "观看桥端口应为本机 HTTP 端口");
-                assert!(!token.is_empty());
-                break;
+            match ev {
+                CoreEvent::RemoteViewReady {
+                    peer_id,
+                    token,
+                    view_token: vt,
+                    port,
+                    ..
+                } => {
+                    assert_eq!(peer_id, "cafe5678");
+                    assert_eq!(port, PORT, "观看桥端口应为本机 HTTP 端口");
+                    assert!(!token.is_empty());
+                    assert_eq!(token.len(), 32, "主凭证 32 位 hex");
+                    assert_ne!(token, vt, "只读凭证应与主凭证不同");
+                    main_token = token;
+                    view_token = vt;
+                    break;
+                }
+                CoreEvent::RemoteConnectFailed { reason, .. } => {
+                    panic!("远程连接失败：{reason}");
+                }
+                _ => {}
             }
         }
         // 实例 2（受控端）：会话开始
@@ -380,6 +393,125 @@ async fn remote_control_auth_stream_and_lockout() {
                 break;
             }
         }
+
+        // ---- ⑤ 编码协商：观看桥接入 + 上报 H.264 能力 → 受控端切 H.264 → 收 Annex-B 帧 → openh264 解码回环 ----
+        {
+            let (mut bridge, _) = tokio_tungstenite::connect_async(format!(
+                "ws://127.0.0.1:{PORT}/remote-view-ws?token={main_token}"
+            ))
+            .await
+            .unwrap();
+            bridge
+                .send(Message::text(
+                    serde_json::json!({"t": "caps", "h264": true}).to_string(),
+                ))
+                .await
+                .unwrap();
+            // 收帧直到 H.264 关键帧（切换后首个 IDR），Annex-B 起始码 + openh264 解码出 320x200
+            let mut decoder = openh264::decoder::Decoder::new().unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let mut decoded_ok = false;
+            while tokio::time::Instant::now() < deadline {
+                let msg = timeout(Duration::from_secs(10), bridge.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let Message::Binary(bin) = msg else { continue };
+                assert!(bin.len() > 2, "帧载荷过短");
+                if bin[0] != 1 {
+                    continue; // 切换前的 JPEG 帧
+                }
+                let payload = &bin[1..];
+                assert_eq!(&payload[..4], &[0, 0, 0, 1], "H.264 应为 Annex-B 起始码");
+                if let Ok(Some(yuv)) = decoder.decode(payload) {
+                    let (w, h) = openh264::formats::YUVSource::dimensions(&yuv);
+                    assert_eq!((w, h), (320, 200), "H.264 解码回环分辨率");
+                    decoded_ok = true;
+                    break;
+                }
+            }
+            assert!(decoded_ok, "20 秒内未解出 H.264 帧");
+            let _ = bridge.close(None).await;
+        }
+
+        // ---- ⑥ 文件回传：控制端 → 受控端（自动接受 → 分块 → SHA-256 校验 → 落盘）----
+        {
+            let dir =
+                std::env::temp_dir().join(format!("yunshu-push-{}", uuid::Uuid::new_v4().simple()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("回传测试.bin");
+            let data: Vec<u8> = (0..500_000u32).map(|i| (i % 253) as u8).collect();
+            std::fs::write(&path, &data).unwrap();
+            ui_tx
+                .send(UiRequest::RemoteSendFiles {
+                    paths: vec![path.clone()],
+                })
+                .unwrap();
+            // 受控端：批次完成事件
+            let mut done = false;
+            loop {
+                let ev = timeout(Duration::from_secs(20), ev2_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let CoreEvent::TransferUpdate { t } = ev {
+                    // 受控端行的 peer 是控制端真实机器 ID（④ 段经 remote_connect 连入），
+                    // 以批次名 + 状态判定
+                    if t.name == "回传测试.bin" && t.status == yunshu_core::TransferStatus::Done
+                    {
+                        assert_eq!(t.transferred, data.len() as u64, "受控端应收满 500KB");
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            assert!(done);
+            // 控制端：发送行完成
+            loop {
+                let ev = timeout(Duration::from_secs(10), ev_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let CoreEvent::TransferUpdate { t } = ev {
+                    if t.direction == yunshu_core::Direction::ToPhone
+                        && t.peer.as_deref() == Some("cafe5678")
+                        && t.status == yunshu_core::TransferStatus::Done
+                    {
+                        assert_eq!(t.transferred, data.len() as u64);
+                        break;
+                    }
+                }
+            }
+            // 磁盘内容逐字节校验（存「远程回传/<id8>/」目录）
+            let base = std::env::temp_dir().join("远程回传");
+            let mut found = None;
+            for _ in 0..30 {
+                let direct = base.join("回传测试.bin");
+                if direct.exists() {
+                    found = Some(direct);
+                    break;
+                }
+                if let Ok(entries) = std::fs::read_dir(&base) {
+                    for e in entries.flatten() {
+                        let inner = e.path().join("回传测试.bin");
+                        if inner.exists() {
+                            found = Some(inner);
+                            break;
+                        }
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            let found = found.expect("远程回传文件未落盘");
+            assert_eq!(std::fs::read(&found).unwrap(), data, "回传内容逐字节一致");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
         // 断开：两端都应收尾
         ui_tx.send(UiRequest::RemoteDisconnect).unwrap();
         loop {
@@ -453,14 +585,15 @@ async fn connect_remote_at(
     (ws, Arc::new(Mutex::new(hs.into_transport_mode().unwrap())))
 }
 
-/// 从 WS 读取视频帧分块并重组出一个完整 JPEG
+/// 从 WS 读取视频帧分块并重组出一个完整帧（返回 codec 与数据）
 async fn collect_frame(
     ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     noise: &Arc<Mutex<TransportState>>,
-) -> Vec<u8> {
+) -> (u8, Vec<u8>) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut seq = 0u32;
     let mut total = 0u16;
+    let mut frame_codec = 0u8;
     let mut got: Vec<bool> = Vec::new();
     let mut buf_all = Vec::new();
     let mut got_count = 0usize;
@@ -484,9 +617,11 @@ async fn collect_frame(
         let s = u32::from_le_bytes(plain[1..5].try_into().unwrap());
         let idx = u16::from_le_bytes(plain[5..7].try_into().unwrap());
         let t = u16::from_le_bytes(plain[7..9].try_into().unwrap());
+        let codec = plain[9];
         if idx == 0 {
             seq = s;
             total = t;
+            frame_codec = codec;
             got = vec![false; t as usize];
             buf_all.clear();
             got_count = 0;
@@ -497,10 +632,10 @@ async fn collect_frame(
         if i < got.len() && !got[i] {
             got[i] = true;
             got_count += 1;
-            buf_all.extend_from_slice(&plain[9..n]);
+            buf_all.extend_from_slice(&plain[10..n]);
         }
         if got_count == got.len() && !got.is_empty() {
-            return buf_all;
+            return (frame_codec, buf_all);
         }
     }
 }

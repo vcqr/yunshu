@@ -107,8 +107,64 @@ impl Settings {
         }
     }
 
-    /// 非 Windows 平台暂未实现开机自启
-    #[cfg(not(windows))]
+    /// macOS：写/删 ~/Library/LaunchAgents/com.yunshu.desktop.plist（登录后自启，配合固定密码实现无人值守）。
+    /// 调研文档权限矩阵结论：macOS 无人值守 = 登录项 + 一次性 TCC 授权即可；
+    /// 免登录的 LaunchDaemon 受登录窗口上下文的 TCC 限制，不做。
+    #[cfg(target_os = "macos")]
+    pub fn apply_autostart(enable: bool) -> Result<(), String> {
+        let home = dirs::home_dir().ok_or("无法定位用户目录")?;
+        let agents = home.join("Library/LaunchAgents");
+        std::fs::create_dir_all(&agents).map_err(|e| e.to_string())?;
+        let plist = agents.join("com.yunshu.desktop.plist");
+        if !enable {
+            match std::fs::remove_file(&plist) {
+                Ok(()) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+            }
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &plist.to_string_lossy()])
+                .output();
+            return Ok(());
+        }
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let label = "com.yunshu.desktop";
+        let content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
+"#,
+            exe.to_string_lossy()
+        );
+        std::fs::write(&plist, content).map_err(|e| e.to_string())?;
+        let out = std::process::Command::new("launchctl")
+            .args(["load", &plist.to_string_lossy()])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!(
+                "launchctl load 失败：{}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Linux：暂未实现开机自启
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     pub fn apply_autostart(_enable: bool) -> Result<(), String> {
         Err("开机自启暂不支持当前平台".into())
     }

@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<title>云书 · 屏幕查看</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0f0e; overscroll-behavior: none; }
+  #screen { display: block; width: 100vw; height: 100vh; }
+  .bar {
+    position: fixed; top: env(safe-area-inset-top, 0); left: 0; right: 0; z-index: 5;
+    display: flex; align-items: center; gap: 8px; padding: calc(6px + env(safe-area-inset-top, 0px)) 14px 6px;
+    background: rgba(10,14,13,.7); color: #e7ece9; backdrop-filter: blur(6px);
+    font: 12px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; flex-shrink: 0; }
+  .dot.off { background: #ef4444; }
+  .bar span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tag { margin-left: auto; color: #9fb0a8; flex-shrink: 0; }
+  .mask {
+    position: fixed; inset: 0; z-index: 9; display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 12px; background: rgba(8,10,9,.92); color: #e7ece9;
+    font: 14px/1.8 -apple-system, "PingFang SC", sans-serif; text-align: center; padding: 0 24px;
+  }
+  .mask.hide { display: none; }
+  .spin { width: 30px; height: 30px; border-radius: 50%; border: 3px solid rgba(255,255,255,.15); border-top-color: #22c55e; animation: s .9s linear infinite; }
+  @keyframes s { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<div class="bar">
+  <span class="dot" id="dot"></span>
+  <span id="status">连接中…</span>
+  <span class="tag">只看不控</span>
+</div>
+<div class="mask" id="mask"><div class="spin" id="spin"></div><div id="maskText">正在连接屏幕直播…</div></div>
+<script>
+(function () {
+  var token = new URLSearchParams(location.search).get('t') || '';
+  var canvas = document.getElementById('screen');
+  var ctx = canvas.getContext('2d');
+  var dot = document.getElementById('dot');
+  var statusEl = document.getElementById('status');
+  var mask = document.getElementById('mask');
+  var maskText = document.getElementById('maskText');
+  var spin = document.getElementById('spin');
+  var latest = null, imgW = 0, imgH = 0, frames = 0, seqUs = 0;
+
+  function showMask(text, spinning) {
+    mask.classList.remove('hide'); maskText.textContent = text; spin.style.display = spinning ? '' : 'none';
+  }
+  function hideMask() { mask.classList.add('hide'); }
+
+  function draw() {
+    if (latest && imgW && imgH) {
+      var w = canvas.width, h = canvas.height;
+      ctx.fillStyle = '#0b0f0e'; ctx.fillRect(0, 0, w, h);
+      var sc = Math.min(w / imgW, h / imgH);
+      var dw = imgW * sc, dh = imgH * sc;
+      ctx.imageSmoothingQuality = 'low';
+      ctx.drawImage(latest, (w - dw) / 2, (h - dh) / 2, dw, dh);
+    }
+    requestAnimationFrame(draw);
+  }
+  function resize() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(innerWidth * dpr);
+    canvas.height = Math.round(innerHeight * dpr);
+  }
+
+  setInterval(function () {
+    if (dot.className.indexOf('off') < 0) statusEl.textContent = '正在查看 · ' + frames + ' fps';
+    frames = 0;
+  }, 1000);
+
+  var ended = false;
+  function connect() {
+    var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    var ws = new WebSocket(proto + '://' + location.host + '/remote-view-ws?token=' + encodeURIComponent(token));
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = function () { hideMask(); dot.className = 'dot'; };
+    ws.onmessage = function (ev) {
+      if (ev.data instanceof ArrayBuffer) {
+        var u8 = new Uint8Array(ev.data);
+        if (u8.length < 3 || u8[0] !== 0) return; // 手机页只解 JPEG（首字节 codec=0）
+        frames++;
+        var blob = new Blob([u8.subarray(1)], { type: 'image/jpeg' });
+        if (window.createImageBitmap) {
+          createImageBitmap(blob).then(function (bmp) {
+            if (latest) latest.close && latest.close();
+            latest = bmp; imgW = bmp.width; imgH = bmp.height;
+          }).catch(function () {});
+        } else {
+          var img = new Image();
+          var url = URL.createObjectURL(blob);
+          img.onload = function () {
+            if (latest) latest.close && latest.close();
+            latest = img; imgW = img.width; imgH = img.height;
+            setTimeout(function () { URL.revokeObjectURL(url); }, 200);
+          };
+          img.src = url;
+        }
+      } else {
+        try {
+          var m = JSON.parse(ev.data);
+          if (m.t === 'end') {
+            ended = true;
+            dot.className = 'dot off';
+            showMask('屏幕直播已结束：' + (m.reason || '会话关闭'), false);
+            ws.close();
+          }
+        } catch (e) {}
+      }
+    };
+    ws.onclose = function () {
+      if (ended) return;
+      dot.className = 'dot off';
+      showMask('连接已断开，正在重连…', true);
+      setTimeout(connect, 2500); // 自动重连（手机锁屏唤醒后恢复）
+    };
+  }
+
+  resize();
+  addEventListener('resize', resize);
+  requestAnimationFrame(draw);
+  showMask('正在连接屏幕直播…', true);
+  connect();
+})();
+</script>
+</body>
+</html>

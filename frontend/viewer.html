@@ -49,11 +49,13 @@
   <div class="overlay" id="overlay" style="display:none">
     <span class="dot" id="dot"></span>
     <span id="status">连接中…</span>
+    <select id="monitor" title="显示器" style="display:none"></select>
     <select id="quality" title="画质">
+      <option value="720">流畅</option>
       <option value="1080">高清</option>
       <option value="1920" selected>超清</option>
-      <option value="720">流畅</option>
     </select>
+    <button id="sendfile" title="向对方电脑传文件（也可直接拖文件进窗口）">传文件</button>
     <button id="fullscreen" title="全屏（F11 也可）">全屏</button>
     <button class="danger" id="disconnect">断开</button>
   </div>
