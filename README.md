@@ -99,6 +99,34 @@ bot 参数：第 1 个为 bot→app 推送批次的测试大小（默认 1MB）�
 
 纯逻辑单元测试不依赖网络：`cargo test`。
 
+## 无头节点（CLI / AI agent）
+
+`crates/yunshu-cli` 把同一套 yunshu-core 跑成无头进程，一个二进制两种身份：直接运行是交互式终端；`--mcp` 以 MCP stdio server 运行（官方 Rust SDK rmcp），供 Claude Desktop / Claude Code 等 AI agent 调用。
+
+```bash
+cargo build --release -p yunshu-cli
+
+./target/release/yunshu-cli                 # 交互式终端：peers / send / sendfile / trust / accept / quit
+./target/release/yunshu-cli --mcp           # MCP stdio server（工具：pigeon_list_peers / pigeon_send_text / pigeon_send_files）
+```
+
+常用参数：`--home <目录>`（配置目录，默认 `~/.yunshu-cli`，与桌面实例身份隔离——独立机器 ID、端口与信任表；指到 `~/.yunshu` 可刻意共用身份）、`--port`、`--name`、`--no-dnd`（首次信任新设备时先关防打扰）、`--stealth`。覆盖只影响本次运行。
+
+MCP 客户端配置（如 Claude Desktop 的 claude_desktop_config.json）：
+
+```json
+{
+  "mcpServers": {
+    "yunshu": {
+      "command": "/path/to/yunshu-cli",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+安全默认：信任新设备、接受来件批次这两道人工门刻意不做 MCP 工具——agent 无法替你信任一台设备或接收文件；需要时在交互终端人工决策（后续计划：经 MCP elicitation 转给客户端人工批准）。
+
 ## 远程控制
 
 1. 双方启动云书（同一局域网），主机列表会显示对方（悬停设备行点显示器图标，或右键 →「远程控制…」）
@@ -181,6 +209,7 @@ Rust workspace：
 - `crates/yunshu-core` — axum（HTTP + WebSocket）、配对状态机、传输管理、飞鸽（Noise XX 加密直连）、远程控制（xcap 采集 + openh264/jpeg-encoder 编码 + enigo 注入 + WebCodecs 解码）、arboard 剪贴板
 - `crates/yunshu-app` — Tauri 2 壳（窗口/托盘/命令桥 + Windows 服务化），前端 Vue 3 + Tailwind（`frontend/`）
 - `crates/pigeonbot` — 无头飞鸽测试节点（e2e）
+- `crates/yunshu-cli` — 无头节点：交互式终端 + MCP stdio server（AI agent 接入）
 
 线程模型：tokio runtime 跑在后台线程，Tauri 占主线程，`std::sync::mpsc` 双向桥接事件与 UI 请求。
 
@@ -188,3 +217,4 @@ Rust workspace：
 
 - H.264 Windows 硬编（MediaFoundation）真机验证
 - 观看端多路同看、会话录制
+- yunshu-cli：MCP 工具面铺满（信任/来件确认走 elicitation、传输进度通知）

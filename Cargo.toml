@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/yunshu-core", "crates/pigeonbot", "crates/yunshu-app"]
+members = ["crates/yunshu-core", "crates/pigeonbot", "crates/yunshu-app", "crates/yunshu-cli"]
 
 [workspace.package]
 version = "0.1.1"

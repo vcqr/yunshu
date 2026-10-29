@@ -372,8 +372,19 @@ pub struct CoreConfig {
     pub stealth_mode: bool,
 }
 
+/// 配置目录覆盖（无头 CLI / 多实例场景）：设置后 config_dir() 返回该目录，
+/// 本进程内所有设置/密钥/信任表都落在这里。必须在加载设置或密钥之前调用。
+static CONFIG_DIR_OVERRIDE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_config_dir(dir: std::path::PathBuf) {
+    let _ = CONFIG_DIR_OVERRIDE.set(dir);
+}
+
 /// 配置目录：~/.yunshu（跨平台一致、直观可寻：身份密钥/信任表/设置/证书都在这里）
 pub fn config_dir() -> Option<std::path::PathBuf> {
+    if let Some(d) = CONFIG_DIR_OVERRIDE.get() {
+        return Some(d.clone());
+    }
     dirs::home_dir().map(|h| h.join(".yunshu"))
 }
 
