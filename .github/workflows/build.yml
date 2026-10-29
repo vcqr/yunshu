@@ -181,7 +181,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "$dir/yunshu.exe" -Destination "$stage/Yunshu.exe"
           # 无头节点（MCP server）随便携包内置：免安装包自包含定位
-          Copy-Item "$dir/yunshu-cli.exe" -Destination "$stage/Yunshu/yunshu-cli.exe"
+          # （平铺在 Yunshu.exe 旁边；Copy-Item 不创建中间目录，不能写到未建的子目录）
+          Copy-Item "$dir/yunshu-cli.exe" -Destination "$stage/yunshu-cli.exe"
           @(
             "Yunshu $version 便携版（免安装）"
             ""
