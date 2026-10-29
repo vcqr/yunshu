@@ -4,7 +4,7 @@
  * 桌面软件式布局：紧凑标题栏 / 设备侧栏(md+) / 聊天主区 / 传输面板(lg+ 第三栏) / 底部状态栏
  * 云书已有功能：手机扫码配对（会话内视图）、TOFU 信任确认、设置、打开所在文件夹
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { Bird, HandMetal, MonitorUp, ShieldAlert, ShieldCheck, Smartphone } from '@lucide/vue'
 import AppHeader from './components/relay/AppHeader.vue'
@@ -70,6 +70,7 @@ async function openSettings() {
     mutations.setRemoteMachineId(s.machine_id || null)
   }
   showSettings.value = true
+  void refreshWx()
 }
 async function browseSaveDir() {
   const { open } = await import('@tauri-apps/plugin-dialog')
@@ -111,6 +112,101 @@ async function clearFixedPassword() {
     toast.error(`清除失败：${String(e)}`)
   }
 }
+
+/* --------------------------- 微信通道（扫码登录个人微信机器人） --------------------------- */
+const wxStatus = ref<any>(null)
+const wxLogin = ref<any>(null)
+const wxQrData = ref('')
+const wxVerifyCode = ref('')
+let wxPollTimer: ReturnType<typeof setInterval> | null = null
+
+async function renderWxQr(url: string) {
+  const QR = await import('qrcode')
+  wxQrData.value = await QR.toDataURL(url, { width: 220, margin: 1 })
+}
+
+/** 拉微信状态；若后端正处在登录流程中（重开设置窗时），恢复二维码视图与轮询 */
+async function refreshWx() {
+  wxStatus.value = await invoke<any>('weixin_status').catch(() => null)
+  if (wxStatus.value?.logged_in) {
+    const list = await invoke<any[]>('weixin_inbox', { limit: 5 }).catch(() => [])
+    const seen = new Set(store.weixinInbound.map((m) => `${m.at_ms}|${m.from}`))
+    for (const m of list) {
+      if (!seen.has(`${m.at_ms}|${m.from}`)) mutations.addWeixinInbound(m)
+    }
+  }
+  const lv = await invoke<any>('weixin_login_status').catch(() => null)
+  if (lv && ['waiting', 'scanned', 'need_verifycode'].includes(lv.status)) {
+    wxLogin.value = lv
+    if (lv.qr_url && !wxQrData.value) void renderWxQr(lv.qr_url)
+    if (!wxPollTimer) wxPollTimer = setInterval(wxPollOnce, 1500)
+  }
+}
+
+async function wxLoginStart() {
+  const v = await invoke<any>('weixin_login_start').catch((e) => {
+    toast.error(String(e))
+    return null
+  })
+  if (!v) return
+  wxLogin.value = v
+  wxVerifyCode.value = ''
+  wxQrData.value = ''
+  if (v.qr_url) void renderWxQr(v.qr_url)
+  if (!wxPollTimer) wxPollTimer = setInterval(wxPollOnce, 1500)
+}
+
+async function wxPollOnce() {
+  const v = await invoke<any>('weixin_login_status').catch(() => null)
+  if (!v) return
+  wxLogin.value = v
+  const st = v.status as string
+  if (st === 'confirmed' || st === 'binded') {
+    wxStopWxPoll()
+    wxLogin.value = null
+    wxQrData.value = ''
+    await refreshWx()
+    toast.success('微信已连接')
+  } else if (st === 'failed') {
+    wxStopWxPoll()
+    wxQrData.value = ''
+  }
+}
+
+function wxStopWxPoll() {
+  if (wxPollTimer) {
+    clearInterval(wxPollTimer)
+    wxPollTimer = null
+  }
+}
+
+/** need_verifycode：提交手机微信上显示的配对数字 */
+async function wxSubmitCode() {
+  const code = wxVerifyCode.value.trim()
+  if (!code) return
+  await invoke('weixin_login_submit_code', { code }).catch((e) => toast.error(String(e)))
+}
+
+function wxCancelLogin() {
+  invoke('weixin_login_cancel')
+  wxStopWxPoll()
+  wxLogin.value = null
+  wxQrData.value = ''
+}
+
+async function wxLogout() {
+  await invoke('weixin_logout').catch((e) => toast.error(String(e)))
+  wxStopWxPoll()
+  wxLogin.value = null
+  wxQrData.value = ''
+  await refreshWx()
+  toast.success('已退出微信登录')
+}
+
+/* 设置弹窗关闭即停轮询（登录任务在后端继续，重开可恢复视图） */
+watch(showSettings, (v) => {
+  if (!v) wxStopWxPoll()
+})
 
 /* --------------------------- 远程控制弹窗 --------------------------- */
 const controlForm = ref({ password: '', connecting: false })
@@ -432,6 +528,64 @@ onMounted(async () => {
             <p class="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
               其他云书凭「机器 ID + 密码」即可控制本机（密码正确即授权）。macOS 需授予「屏幕录制」与「辅助功能」权限。
             </p>
+          </div>
+
+          <div class="mt-2 border-t pt-3">
+            <p class="mb-2 text-xs font-semibold text-foreground">微信通道</p>
+            <!-- 登录中：二维码 / 配对数字 / 取消 -->
+            <div v-if="wxLogin" class="grid justify-items-center gap-2">
+              <img v-if="wxQrData" :src="wxQrData" alt="微信登录二维码" class="size-44 rounded-lg border bg-white p-1.5" />
+              <p class="text-center text-xs text-muted-foreground">{{ wxLogin.message || '请用手机微信扫描二维码' }}</p>
+              <div v-if="wxLogin.status === 'need_verifycode'" class="flex w-full gap-2">
+                <input
+                  v-model="wxVerifyCode"
+                  inputmode="numeric"
+                  maxlength="8"
+                  placeholder="输入手机微信上显示的配对数字"
+                  class="h-9 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                />
+                <button class="h-9 shrink-0 rounded-lg bg-emerald-600 px-3 text-sm font-medium text-white hover:bg-emerald-700" @click="wxSubmitCode">确认</button>
+              </div>
+              <button class="h-8 rounded-lg border px-3 text-xs hover:bg-accent" @click="wxCancelLogin">取消登录</button>
+            </div>
+            <!-- 已登录：状态 + 最近收到 -->
+            <div v-else-if="wxStatus?.logged_in" class="grid gap-2">
+              <div class="flex items-start justify-between gap-2">
+                <div class="min-w-0 text-xs leading-relaxed text-muted-foreground">
+                  <p class="font-medium text-foreground">✓ 已连接微信</p>
+                  <p>轮询：{{ wxStatus.polling ? '运行中' : wxStatus.paused_remaining_ms > 0 ? '冷却中（约 ' + Math.ceil(wxStatus.paused_remaining_ms / 60000) + ' 分钟，重新扫码可解除）' : '已停止' }}</p>
+                  <p v-if="wxStatus.last_error" class="text-red-500">最近错误：{{ wxStatus.last_error }}</p>
+                  <p>收到的媒体自动存到「保存目录/微信/」</p>
+                </div>
+                <button class="h-8 shrink-0 rounded-lg border px-3 text-xs text-red-600 hover:bg-red-500/10 dark:text-red-400" @click="wxLogout">退出登录</button>
+              </div>
+              <div v-if="store.weixinInbound.length" class="grid gap-1 rounded-lg bg-muted/40 p-2">
+                <p class="text-[11px] font-medium text-muted-foreground">最近收到</p>
+                <p
+                  v-for="(m, i) in [...store.weixinInbound].slice(-4).reverse()"
+                  :key="i"
+                  class="truncate text-[11px] text-muted-foreground"
+                  :title="m.saved_path || m.text"
+                >
+                  ← {{ m.text }}
+                </p>
+              </div>
+              <p class="text-[11px] leading-relaxed text-muted-foreground">
+                微信里收到的消息与文件会实时转发到云书；电脑上的内容可用 yunshu-cli（wx … 命令）或 AI agent 的 weixin_* 工具发到你的微信。
+              </p>
+            </div>
+            <!-- 未登录 -->
+            <template v-else>
+              <button
+                class="h-9 w-full rounded-lg border border-emerald-600/40 bg-emerald-600/10 text-sm font-medium text-emerald-700 hover:bg-emerald-600/20 dark:text-emerald-400"
+                @click="wxLoginStart"
+              >
+                扫码登录微信
+              </button>
+              <p class="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
+                用手机微信扫码绑定个人微信机器人：此后微信里收到的消息与文件实时转到云书（文件自动解密落盘）；电脑上的内容也能通过 CLI/AI agent 发回你的微信。
+              </p>
+            </template>
           </div>
         </div>
         <p class="mt-3 text-xs text-muted-foreground">端口、目录修改后需重启云书生效</p>

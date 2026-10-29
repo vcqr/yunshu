@@ -8,6 +8,17 @@ pub mod protocol;
 pub mod remote;
 pub mod server;
 pub mod settings;
+pub mod weixin;
+
+/// 显式选定进程级 rustls CryptoProvider（aws-lc-rs，与 axum-server TLS 一致）。
+/// reqwest(ring) 与 axum-server(aws-lc-rs) 同时在依赖树里时，rustls 0.23 无法
+/// 自动二选一，首次建 TLS 连接会 panic；启动各入口先调用本函数消歧。
+pub fn install_rustls_provider() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -261,6 +272,10 @@ pub enum CoreEvent {
     RemoteAssistRequest {
         peer_id: String,
         name: String,
+    },
+    /// 微信通道：收到个人微信消息（文本，或已下载解密落盘的媒体）
+    WeixinInbound {
+        msg: weixin::WxInboundMsg,
     },
 }
 

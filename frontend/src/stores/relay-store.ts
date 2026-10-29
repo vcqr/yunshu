@@ -49,6 +49,11 @@ export interface RelayState {
   controlDialog: { machine_id: string; name: string } | null
   /** 远程控制：待处理的反向协助请求队列 */
   assistRequests: Array<{ peer_id: string; name: string }>
+  /** 微信通道：最近收到的消息（文本与已落盘媒体，环形 50 条） */
+  weixinInbound: Array<{
+    at_ms: number; from: string; kind: string; text: string
+    file_name?: string; size?: number; saved_path?: string; error?: string
+  }>
 }
 
 export const store = reactive<RelayState>({
@@ -81,6 +86,7 @@ export const store = reactive<RelayState>({
   remoteViewing: null,
   controlDialog: null,
   assistRequests: [],
+  weixinInbound: [],
 })
 
 export const mutations = {
@@ -126,6 +132,10 @@ export const mutations = {
   },
   removeTransfer(id: string) {
     delete store.transfers[id]
+  },
+  addWeixinInbound(m: RelayState['weixinInbound'][number]) {
+    store.weixinInbound.push(m)
+    if (store.weixinInbound.length > 50) store.weixinInbound.shift()
   },
   enqueueTrust(req: { peer_id: string; name: string; fingerprint: string }) {
     if (store.trustRequests.some((r) => r.peer_id === req.peer_id)) return

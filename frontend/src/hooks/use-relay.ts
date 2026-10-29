@@ -192,6 +192,17 @@ async function apply(ev: any) {
       }
       break
     }
+    case 'weixin_inbound': {
+      // 微信通道：收到的消息进设置卡片列表，文本/文件落盘都弹一条轻提示
+      const m = ev.msg
+      mutations.addWeixinInbound(m)
+      if (m.saved_path) {
+        toast.info(`微信收到${m.kind === 'image' ? '图片' : m.kind === 'video' ? '视频' : '文件'}：${m.saved_path}`)
+      } else if (m.text) {
+        toast.info(`微信：${m.text}`)
+      }
+      break
+    }
     case 'toast':
       toast.info(ev.text)
       break

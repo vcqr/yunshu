@@ -55,7 +55,9 @@ python3 .agents/skills/yunshu-cli/scripts/drive.py \
 ./target/release/yunshu-cli --mcp --home /tmp/ys-mcp
 ```
 
-三个工具：`pigeon_list_peers`、`pigeon_send_text`、`pigeon_send_files`（对方需在其端确认接收；`wait_secs` 控制等终态的时长，默认 300，0 只发起不等）。信任/来件确认刻意不是工具——同上，人工门。
+七个工具。飞鸽（PC↔PC，需对方确认）：`pigeon_list_peers`、`pigeon_send_text`、`pigeon_send_files`（`wait_secs` 控制等终态的时长，默认 300，0 只发起不等）。微信通道（个人微信机器人，发给扫码绑定的机主）：`weixin_status`、`weixin_send_text`、`weixin_send_files`、`weixin_inbox`。信任/来件确认刻意不是工具——同上，人工门。
+
+**微信通道首次登录必须在交互终端**：`wx login` 出二维码扫码（MCP 模式扫不了），登录态持久在配置目录 `weixin.json`，之后 `--mcp` 启动自动恢复长轮询；机主给机器人发的消息用 `weixin_inbox` 读取（媒体已自动解密落盘）。
 
 接入 ZCode：`~/.zcode/cli/config.json` 加（workspace 共享则放 `<repo>/.zcode/config.json`）：
 

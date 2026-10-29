@@ -928,6 +928,7 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
 async fn https_config(
     data_dir: &std::path::Path,
 ) -> Result<axum_server::tls_rustls::RustlsConfig, String> {
+    crate::install_rustls_provider();
     use rcgen::{CertificateParams, KeyPair, SanType};
     let _ = std::fs::create_dir_all(data_dir);
     let cert_p = data_dir.join("https_cert.pem");

@@ -35,6 +35,7 @@ fn state_snapshot() -> serde_json::Value {
         "peers": [], "transfers": [], "toasts": [],
         "remote_temp_password": null, "remote_controlled": null,
         "remote_machine_id": null,
+        "weixin_inbox": [],
     })
 }
 
@@ -97,6 +98,16 @@ fn apply_to_cache(cache: &Mutex<serde_json::Value>, ev: &CoreEvent) {
                 arr[pos] = serde_json::to_value(t).unwrap_or_default();
             } else {
                 arr.push(serde_json::to_value(t).unwrap_or_default());
+            }
+        }
+        CoreEvent::WeixinInbound { msg } => {
+            // 最近 50 条环形缓冲，设置弹窗的微信卡片展示
+            let list = obj.entry("weixin_inbox").or_insert(json!([]));
+            let arr = list.as_array_mut().unwrap();
+            arr.push(serde_json::to_value(msg).unwrap_or_default());
+            let len = arr.len();
+            if len > 50 {
+                arr.drain(..len - 50);
             }
         }
         _ => {}
@@ -665,6 +676,47 @@ fn get_view_info(state: tauri::State<AppState>) -> Result<serde_json::Value, Str
     }
 }
 
+// ── 微信通道（扫码登录个人微信机器人；登录态落配置目录 weixin.json）──
+
+#[tauri::command]
+async fn weixin_login_start() -> Result<serde_json::Value, String> {
+    let v = yunshu_core::weixin::login_start().await?;
+    serde_json::to_value(v).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn weixin_login_status() -> Result<serde_json::Value, String> {
+    serde_json::to_value(yunshu_core::weixin::login_view()).map_err(|e| e.to_string())
+}
+
+/// need_verifycode 时提交手机微信上显示的配对数字
+#[tauri::command]
+fn weixin_login_submit_code(code: String) {
+    yunshu_core::weixin::login_submit_code(&code);
+}
+
+#[tauri::command]
+fn weixin_login_cancel() {
+    yunshu_core::weixin::login_cancel();
+}
+
+#[tauri::command]
+fn weixin_logout() -> Result<(), String> {
+    yunshu_core::weixin::logout()
+}
+
+#[tauri::command]
+fn weixin_status() -> Result<serde_json::Value, String> {
+    serde_json::to_value(yunshu_core::weixin::status_view()).map_err(|e| e.to_string())
+}
+
+/// 最近收到的微信消息（文本与已落盘媒体），前端展示用
+#[tauri::command]
+fn weixin_inbox(limit: Option<u32>) -> Result<serde_json::Value, String> {
+    let items = yunshu_core::weixin::inbox_recent(limit.unwrap_or(20).clamp(1, 100) as usize);
+    serde_json::to_value(items).map_err(|e| e.to_string())
+}
+
 /// 打开远程观看窗口（观看页凭 get_view_info 拿接入凭证，凭证不进 URL）
 fn open_viewer_window(app: &tauri::AppHandle, info: &RemoteViewInfo) {
     use tauri::WebviewUrl;
@@ -775,6 +827,8 @@ fn main() {
     }
     let (event_tx, event_rx) = std::sync::mpsc::channel::<CoreEvent>();
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiRequest>();
+    // 微信通道入站消息走 CoreEvent::WeixinInbound 进事件泵（转前端 + 维护缓存）
+    yunshu_core::weixin::set_event_sink(event_tx.clone());
     yunshu_core::run(core_cfg, event_tx, ui_rx);
 
     tauri::Builder::default()
@@ -793,6 +847,10 @@ fn main() {
             }
             let handle = app.handle().clone();
             let cache = app.state::<AppState>().cache.clone();
+            // 微信通道：有凭证则恢复长轮询（跑在 Tauri 自带的 tokio runtime 上，与进程同寿）
+            tauri::async_runtime::spawn(async {
+                yunshu_core::weixin::init_polling();
+            });
             // 核心事件 → 前端（同时维护初始状态快照）
             std::thread::spawn(move || {
                 let mut done_seen: std::collections::HashSet<String> =
@@ -954,7 +1012,14 @@ fn main() {
             service_uninstall,
             remote_assist_request,
             remote_assist_respond,
-            get_view_info
+            get_view_info,
+            weixin_login_start,
+            weixin_login_status,
+            weixin_login_submit_code,
+            weixin_login_cancel,
+            weixin_logout,
+            weixin_status,
+            weixin_inbox
         ])
         .on_window_event(|window, event| {
             match window.label() {

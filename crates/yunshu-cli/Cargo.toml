@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 dirs = "7.0.0"
+qrcode = { version = "0.14", default-features = false }
 rmcp = { version = "3.8", features = ["transport-io"] }
 schemars = "1"
 serde = { workspace = true, features = ["derive"] }

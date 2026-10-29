@@ -39,6 +39,34 @@ pub struct SendFilesParams {
     pub wait_secs: Option<u64>,
 }
 
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct WeixinSendTextParams {
+    /// 接收者 ilink 用户 ID（缺省发给扫码绑定的微信账号；通常留空）
+    #[serde(default)]
+    pub to: Option<String>,
+    /// 要发送的文本（markdown 会被转为纯文本，超 1800 字自动拆多条）
+    pub text: String,
+}
+
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct WeixinSendFilesParams {
+    /// 本地文件路径列表（图片/视频按类型直发，其余作文件附件；单个 ≤100 MiB）
+    pub paths: Vec<String>,
+    /// 说明文字（随第一个文件发送）
+    #[serde(default)]
+    pub caption: Option<String>,
+    /// 接收者 ilink 用户 ID（缺省发给扫码绑定的微信账号）
+    #[serde(default)]
+    pub to: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct WeixinInboxParams {
+    /// 返回条数（默认 20，最多 100）
+    #[serde(default)]
+    pub limit: Option<u64>,
+}
+
 #[derive(Clone)]
 pub struct YunshuMcp {
     shared: Arc<Shared>,
@@ -94,6 +122,65 @@ impl YunshuMcp {
             Ok(v) => fail(v.to_string()),
             Err(e) => fail(e),
         }
+    }
+
+    #[tool(description = "微信通道状态：是否已登录（扫码绑定的个人微信机器人）、长轮询是否运行、默认推送目标、已配对联系人、收件箱条数。未登录时提示用户在 yunshu-cli 交互终端执行 wx login 扫码。")]
+    async fn weixin_status(&self) -> Result<CallToolResult, McpError> {
+        let s = yunshu_core::weixin::status_view();
+        json_result(serde_json::to_value(&s).unwrap_or_default())
+    }
+
+    #[tool(description = "通过个人微信机器人发送文本（收件方是扫码绑定的微信账号）。适合把任务结果、通知发给机主本人。发送失败会返回原因（未登录/token 失效等）。")]
+    async fn weixin_send_text(
+        &self,
+        Parameters(p): Parameters<WeixinSendTextParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match yunshu_core::weixin::send_text(p.to.as_deref(), &p.text).await {
+            Ok(n) => json_result(serde_json::json!({ "ok": true, "messages": n })),
+            Err(e) => fail(e),
+        }
+    }
+
+    #[tool(description = "通过微信发送本地文件/图片/视频给机主（自动按类型分流；逐个上传，返回逐文件结果）。可附说明文字。")]
+    async fn weixin_send_files(
+        &self,
+        Parameters(p): Parameters<WeixinSendFilesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if p.paths.is_empty() {
+            return fail("paths 不能为空".into());
+        }
+        let paths: Vec<PathBuf> = p.paths.into_iter().map(PathBuf::from).collect();
+        for path in &paths {
+            if !path.exists() {
+                return fail(format!("路径不存在：{}", path.display()));
+            }
+        }
+        let results = yunshu_core::weixin::send_files(p.to.as_deref(), &paths, p.caption.as_deref())
+            .await;
+        let items: Vec<serde_json::Value> = results
+            .into_iter()
+            .map(|(path, r)| match r {
+                Ok(desc) => serde_json::json!({ "path": path, "ok": true, "desc": desc }),
+                Err(e) => serde_json::json!({ "path": path, "ok": false, "error": e }),
+            })
+            .collect();
+        let all_ok = items.iter().all(|i| i.get("ok").and_then(|b| b.as_bool()).unwrap_or(false));
+        let v = serde_json::json!({ "ok": all_ok, "files": items });
+        if all_ok {
+            json_result(v)
+        } else {
+            fail(v.to_string())
+        }
+    }
+
+    #[tool(description = "读取微信收件箱：最近收到的文本消息与媒体（媒体已自动下载解密，saved_path 是落盘路径；error 是接收失败原因）。机主给机器人发消息后用本工具读取。")]
+    async fn weixin_inbox(
+        &self,
+        Parameters(p): Parameters<WeixinInboxParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = p.limit.unwrap_or(20).clamp(1, 100) as usize;
+        let items = yunshu_core::weixin::inbox_recent(limit);
+        json_result(serde_json::json!({ "count": items.len(), "messages": items }))
     }
 }
 

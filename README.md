@@ -106,9 +106,11 @@ bot 参数：第 1 个为 bot→app 推送批次的测试大小（默认 1MB）�
 ```bash
 cargo build --release -p yunshu-cli
 
-./target/release/yunshu-cli                 # 交互式终端：peers / send / sendfile / trust / accept / quit
-./target/release/yunshu-cli --mcp           # MCP stdio server（工具：pigeon_list_peers / pigeon_send_text / pigeon_send_files）
+./target/release/yunshu-cli                 # 交互式终端：peers / send / sendfile / trust / accept / wx … / quit
+./target/release/yunshu-cli --mcp           # MCP stdio server（工具：pigeon_* ×3 + weixin_* ×4）
 ```
+
+**微信通道**：`wx login` 扫码登录个人微信机器人（终端出二维码；协议对齐腾讯官方 `openclaw-weixin` 插件），此后收到的消息实时显示、媒体自动解密落盘到「保存目录/微信/」；`wx send` / `wx sendfile` 发文本与文件/图片/视频给机主微信。`--mcp` 下对应 `weixin_status` / `weixin_send_text` / `weixin_send_files` / `weixin_inbox` 四个工具（首次扫码登录需在交互终端完成，登录态持久化，重启自动恢复长轮询）。
 
 不想自己编译的话，GitHub Release 的 `yunshu-cli_<版本>_<平台>.zip` 就是同一份二进制（Windows 便携包内也已内置 `yunshu-cli.exe`），包内附 MCP 接入说明。
 

@@ -359,6 +359,13 @@ pub fn print_event(
             let on = peers.iter().filter(|p| p.connected).count();
             println!("[主机] {} 台，已连接 {on}", peers.len());
         }
+        CoreEvent::WeixinInbound { msg } => {
+            match (&msg.saved_path, &msg.error) {
+                (Some(p), _) => println!("← 微信「{}」{} → {p}", msg.from, msg.text),
+                (None, Some(e)) => println!("← 微信「{}」{}（接收失败：{e}）", msg.from, msg.text),
+                _ => println!("← 微信「{}」{}", msg.from, msg.text),
+            }
+        }
         _ => {}
     }
 }
