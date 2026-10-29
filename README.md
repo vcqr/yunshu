@@ -110,6 +110,8 @@ cargo build --release -p yunshu-cli
 ./target/release/yunshu-cli --mcp           # MCP stdio server（工具：pigeon_list_peers / pigeon_send_text / pigeon_send_files）
 ```
 
+不想自己编译的话，GitHub Release 的 `yunshu-cli_<版本>_<平台>.zip` 就是同一份二进制（Windows 便携包内也已内置 `yunshu-cli.exe`），包内附 MCP 接入说明。
+
 常用参数：`--home <目录>`（配置目录，默认 `~/.yunshu-cli`，与桌面实例身份隔离——独立机器 ID、端口与信任表；指到 `~/.yunshu` 可刻意共用身份）、`--port`、`--name`、`--no-dnd`（首次信任新设备时先关防打扰）、`--stealth`。覆盖只影响本次运行。
 
 MCP 客户端配置（如 Claude Desktop 的 claude_desktop_config.json）：
