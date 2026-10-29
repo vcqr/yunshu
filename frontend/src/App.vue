@@ -1,16 +1,17 @@
 <script setup lang="ts">
 /**
- * 云书 — 主页面（复刻 demo/ui page.tsx）
+ * Yunshu — 主页面（复刻 demo/ui page.tsx）
  * 桌面软件式布局：紧凑标题栏 / 设备侧栏(md+) / 聊天主区 / 传输面板(lg+ 第三栏) / 底部状态栏
- * 云书已有功能：手机扫码配对（会话内视图）、TOFU 信任确认、设置、打开所在文件夹
+ * Yunshu 已有功能：手机扫码配对（会话内视图）、TOFU 信任确认、设置、打开所在文件夹
  */
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { Bird, HandMetal, MonitorUp, ShieldAlert, ShieldCheck, Smartphone } from '@lucide/vue'
+import { Bird, HandMetal, MessageCircle, MonitorUp, Settings2, ShieldAlert, ShieldCheck, Smartphone } from '@lucide/vue'
 import AppHeader from './components/relay/AppHeader.vue'
 import DeviceSidebar from './components/relay/DeviceSidebar.vue'
 import LocalIdentityCard from './components/relay/LocalIdentityCard.vue'
 import ChatPanel from './components/relay/ChatPanel.vue'
+import WeixinPanel from './components/relay/WeixinPanel.vue'
 import TransferPanel from './components/relay/TransferPanel.vue'
 import OfferDialog from './components/relay/OfferDialog.vue'
 import StatusBar from './components/relay/StatusBar.vue'
@@ -29,6 +30,10 @@ function onDrop(e: Event) {
   const peer = store.selectedPeer
   if (!peer || peer === 'broadcast' || peer === 'self') {
     toast.error('先在左侧选择一台设备')
+    return
+  }
+  if (peer === 'weixin') {
+    toast.error('微信会话暂不支持拖拽发送文件')
     return
   }
   const kind = peer === 'phone' ? 'phone' : 'pc'
@@ -51,8 +56,15 @@ function rejectTrust() {
   store.trustRequests = store.trustRequests.filter((r) => r.peer_id !== currentTrust.value!.peer_id)
 }
 
-/* ------------------------------ 设置 ------------------------------ */
+/* ------------------------------ 设置（左右分栏：左标签菜单 + 右面板） ------------------------------ */
 const showSettings = ref(false)
+type SettingsTab = 'general' | 'remote' | 'weixin'
+const settingsTab = ref<SettingsTab>('general')
+const settingsTabs: Array<{ key: SettingsTab; label: string; icon: typeof Settings2 }> = [
+  { key: 'general', label: '常规', icon: Settings2 },
+  { key: 'remote', label: '远程控制', icon: MonitorUp },
+  { key: 'weixin', label: '微信', icon: MessageCircle },
+]
 const settingsForm = ref({
   device_name: '', port: 34256, save_dir: '', autostart: false, dnd_mode: false,
   stealth_mode: false,
@@ -70,7 +82,6 @@ async function openSettings() {
     mutations.setRemoteMachineId(s.machine_id || null)
   }
   showSettings.value = true
-  void refreshWx()
 }
 async function browseSaveDir() {
   const { open } = await import('@tauri-apps/plugin-dialog')
@@ -113,100 +124,7 @@ async function clearFixedPassword() {
   }
 }
 
-/* --------------------------- 微信通道（扫码登录个人微信机器人） --------------------------- */
-const wxStatus = ref<any>(null)
-const wxLogin = ref<any>(null)
-const wxQrData = ref('')
-const wxVerifyCode = ref('')
-let wxPollTimer: ReturnType<typeof setInterval> | null = null
-
-async function renderWxQr(url: string) {
-  const QR = await import('qrcode')
-  wxQrData.value = await QR.toDataURL(url, { width: 220, margin: 1 })
-}
-
-/** 拉微信状态；若后端正处在登录流程中（重开设置窗时），恢复二维码视图与轮询 */
-async function refreshWx() {
-  wxStatus.value = await invoke<any>('weixin_status').catch(() => null)
-  if (wxStatus.value?.logged_in) {
-    const list = await invoke<any[]>('weixin_inbox', { limit: 5 }).catch(() => [])
-    const seen = new Set(store.weixinInbound.map((m) => `${m.at_ms}|${m.from}`))
-    for (const m of list) {
-      if (!seen.has(`${m.at_ms}|${m.from}`)) mutations.addWeixinInbound(m)
-    }
-  }
-  const lv = await invoke<any>('weixin_login_status').catch(() => null)
-  if (lv && ['waiting', 'scanned', 'need_verifycode'].includes(lv.status)) {
-    wxLogin.value = lv
-    if (lv.qr_url && !wxQrData.value) void renderWxQr(lv.qr_url)
-    if (!wxPollTimer) wxPollTimer = setInterval(wxPollOnce, 1500)
-  }
-}
-
-async function wxLoginStart() {
-  const v = await invoke<any>('weixin_login_start').catch((e) => {
-    toast.error(String(e))
-    return null
-  })
-  if (!v) return
-  wxLogin.value = v
-  wxVerifyCode.value = ''
-  wxQrData.value = ''
-  if (v.qr_url) void renderWxQr(v.qr_url)
-  if (!wxPollTimer) wxPollTimer = setInterval(wxPollOnce, 1500)
-}
-
-async function wxPollOnce() {
-  const v = await invoke<any>('weixin_login_status').catch(() => null)
-  if (!v) return
-  wxLogin.value = v
-  const st = v.status as string
-  if (st === 'confirmed' || st === 'binded') {
-    wxStopWxPoll()
-    wxLogin.value = null
-    wxQrData.value = ''
-    await refreshWx()
-    toast.success('微信已连接')
-  } else if (st === 'failed') {
-    wxStopWxPoll()
-    wxQrData.value = ''
-  }
-}
-
-function wxStopWxPoll() {
-  if (wxPollTimer) {
-    clearInterval(wxPollTimer)
-    wxPollTimer = null
-  }
-}
-
-/** need_verifycode：提交手机微信上显示的配对数字 */
-async function wxSubmitCode() {
-  const code = wxVerifyCode.value.trim()
-  if (!code) return
-  await invoke('weixin_login_submit_code', { code }).catch((e) => toast.error(String(e)))
-}
-
-function wxCancelLogin() {
-  invoke('weixin_login_cancel')
-  wxStopWxPoll()
-  wxLogin.value = null
-  wxQrData.value = ''
-}
-
-async function wxLogout() {
-  await invoke('weixin_logout').catch((e) => toast.error(String(e)))
-  wxStopWxPoll()
-  wxLogin.value = null
-  wxQrData.value = ''
-  await refreshWx()
-  toast.success('已退出微信登录')
-}
-
-/* 设置弹窗关闭即停轮询（登录任务在后端继续，重开可恢复视图） */
-watch(showSettings, (v) => {
-  if (!v) wxStopWxPoll()
-})
+/* --------------------------- 微信通道：见 WeixinPanel 组件 --------------------------- */
 
 /* --------------------------- 远程控制弹窗 --------------------------- */
 const controlForm = ref({ password: '', connecting: false })
@@ -301,9 +219,10 @@ onMounted(async () => {
       </aside>
 
       <!-- 中栏：默认「本机识别」首页（机器 ID/验证码 + 远程协助）；
-           选中手机或主机后整个中栏切为会话布局 -->
+           选中手机/主机后切为会话布局；选中「微信」切为微信对话界面 -->
       <div class="flex min-h-0 min-w-0 flex-1 flex-col">
         <LocalIdentityCard v-if="store.selectedPeer === 'self'" />
+        <WeixinPanel v-else-if="store.selectedPeer === 'weixin'" class="bg-card/40" />
         <ChatPanel v-else :peer="store.selectedPeer" />
       </div>
 
@@ -434,164 +353,150 @@ onMounted(async () => {
       </div>
     </div>
 
-    <!-- 设置 -->
-    <div v-if="showSettings" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45" @click.self="showSettings = false">
-      <div class="bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
-        <div class="mb-4 flex items-center gap-2.5">
+    <!-- 设置：左右分栏（左标签菜单 + 右面板） -->
+    <div v-if="showSettings" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45 p-4" @click.self="showSettings = false">
+      <div class="bg-card flex w-full max-w-2xl flex-col overflow-hidden rounded-xl border shadow-xl">
+        <!-- 头部 -->
+        <div class="flex shrink-0 items-center gap-2.5 border-b px-5 py-3.5">
           <div class="flex size-9 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-400 via-emerald-500 to-teal-600 text-white">
             <Bird class="size-5" />
           </div>
-          <div>
+          <div class="min-w-0">
             <p class="text-sm font-semibold">设置</p>
             <p class="text-xs text-muted-foreground">设备名修改后立即对局域网内其他设备生效</p>
           </div>
         </div>
-        <div class="grid gap-2.5">
-          <label class="grid gap-1">
-            <span class="text-xs font-medium text-muted-foreground">设备名</span>
-            <input
-              v-model="settingsForm.device_name"
-              maxlength="24"
-              placeholder="给你的设备起个名字"
-              class="h-9 rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
-            />
-          </label>
-          <label class="grid gap-1">
-            <span class="text-xs font-medium text-muted-foreground">端口</span>
-            <input
-              v-model.number="settingsForm.port"
-              type="number"
-              class="h-9 rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
-            />
-          </label>
-          <label class="grid gap-1">
-            <span class="text-xs font-medium text-muted-foreground">保存目录</span>
-            <div class="flex gap-2">
-              <input
-                v-model="settingsForm.save_dir"
-                class="h-9 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
-              />
-              <button class="h-9 shrink-0 rounded-lg border px-3 text-sm hover:bg-accent" @click="browseSaveDir">浏览…</button>
-            </div>
-          </label>
-          <label class="flex items-center gap-2.5 text-sm">
-            <input v-model="settingsForm.autostart" type="checkbox" class="size-4 accent-emerald-600" />
-            开机自启
-          </label>
-          <label class="flex items-center gap-2.5 text-sm">
-            <input v-model="settingsForm.dnd_mode" type="checkbox" class="size-4 accent-emerald-600" />
-            防打扰（仅已信任设备可连接，广播消息静音；首次启动默认开启）
-          </label>
-          <label class="flex items-center gap-2.5 text-sm">
-            <input v-model="settingsForm.stealth_mode" type="checkbox" class="size-4 accent-emerald-600" />
-            隐身模式（不向局域网广播本机，其他设备的主机列表将移除本机；本机主动发送不受影响）
-          </label>
 
-          <div class="mt-2 border-t pt-3">
-            <p class="mb-2 text-xs font-semibold text-foreground">远程控制</p>
-            <div class="grid grid-cols-2 gap-2.5">
+        <!-- 主体：左标签菜单 + 右面板（窄窗退化为顶部横排标签） -->
+        <div class="flex min-h-0 flex-1 max-md:flex-col">
+          <nav
+            class="w-36 shrink-0 space-y-0.5 border-r p-2 max-md:flex max-md:w-full max-md:space-y-0 max-md:border-b max-md:border-r-0 max-md:p-1.5"
+            aria-label="设置分类"
+          >
+            <button
+              v-for="t in settingsTabs"
+              :key="t.key"
+              type="button"
+              role="tab"
+              :aria-selected="settingsTab === t.key"
+              :class="cn(
+                'flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[13px] transition-colors',
+                'focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none',
+                'max-md:w-auto max-md:flex-1 max-md:justify-center',
+                settingsTab === t.key
+                  ? 'bg-emerald-500/12 font-medium text-emerald-700 dark:text-emerald-300'
+                  : 'text-muted-foreground hover:bg-accent hover:text-foreground'
+              )"
+              @click="settingsTab = t.key"
+            >
+              <component :is="t.icon" class="size-4 shrink-0" />
+              {{ t.label }}
+            </button>
+          </nav>
+
+          <div class="custom-scroll min-h-0 w-full flex-1 overflow-y-auto max-md:max-h-[52dvh]">
+            <!-- 常规 -->
+            <section v-if="settingsTab === 'general'" class="grid gap-3 p-5" aria-label="常规设置">
               <label class="grid gap-1">
-                <span class="text-xs font-medium text-muted-foreground">本机机器 ID</span>
-                <div class="flex h-9 items-center rounded-lg border bg-muted/30 px-3 font-mono text-sm tracking-widest">
-                  {{ settingsForm.machine_id || '——' }}
-                </div>
+                <span class="text-xs font-medium text-muted-foreground">设备名</span>
+                <input
+                  v-model="settingsForm.device_name"
+                  maxlength="24"
+                  placeholder="给你的设备起个名字"
+                  class="h-9 rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                />
               </label>
               <label class="grid gap-1">
-                <span class="text-xs font-medium text-muted-foreground">临时密码（重启更换）</span>
-                <div class="flex h-9 items-center rounded-lg border bg-muted/30 px-3 font-mono text-sm tracking-widest">
-                  {{ store.remoteTempPassword || '——' }}
+                <span class="text-xs font-medium text-muted-foreground">端口</span>
+                <input
+                  v-model.number="settingsForm.port"
+                  type="number"
+                  class="h-9 rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                />
+              </label>
+              <label class="grid gap-1">
+                <span class="text-xs font-medium text-muted-foreground">保存目录</span>
+                <div class="flex gap-2">
+                  <input
+                    v-model="settingsForm.save_dir"
+                    class="h-9 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                  />
+                  <button class="h-9 shrink-0 rounded-lg border px-3 text-sm hover:bg-accent" @click="browseSaveDir">浏览…</button>
                 </div>
               </label>
-            </div>
-            <label class="mt-2.5 grid gap-1">
-              <span class="text-xs font-medium text-muted-foreground">
-                固定密码{{ settingsForm.has_fixed_password ? '（已设置，输入可更换，留空保持不变）' : '（无人值守访问用，重启仍有效）' }}
-              </span>
-              <div class="flex gap-2">
-                <input
-                  v-model="settingsForm.remote_fixed_password"
-                  type="password"
-                  maxlength="32"
-                  :placeholder="settingsForm.has_fixed_password ? '••••••••（留空不变，输入即更换）' : '设置长期固定密码'"
-                  autocomplete="new-password"
-                  class="h-9 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
-                />
-                <button
-                  v-if="settingsForm.has_fixed_password"
-                  class="h-9 shrink-0 rounded-lg border px-3 text-xs text-red-600 hover:bg-red-500/10 dark:text-red-400"
-                  @click="clearFixedPassword"
-                >
-                  清除
-                </button>
+              <div class="mt-1 grid gap-2 border-t pt-3">
+                <label class="flex items-center gap-2.5 text-sm">
+                  <input v-model="settingsForm.autostart" type="checkbox" class="size-4 accent-emerald-600" />
+                  开机自启
+                </label>
+                <label class="flex items-start gap-2.5 text-sm">
+                  <input v-model="settingsForm.dnd_mode" type="checkbox" class="mt-0.5 size-4 accent-emerald-600" />
+                  <span class="min-w-0">防打扰<span class="block text-xs text-muted-foreground">仅已信任设备可连接，广播消息静音；首次启动默认开启</span></span>
+                </label>
+                <label class="flex items-start gap-2.5 text-sm">
+                  <input v-model="settingsForm.stealth_mode" type="checkbox" class="mt-0.5 size-4 accent-emerald-600" />
+                  <span class="min-w-0">隐身模式<span class="block text-xs text-muted-foreground">不向局域网广播本机，其他设备的主机列表将移除本机；本机主动发送不受影响</span></span>
+                </label>
               </div>
-            </label>
-            <p class="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
-              其他云书凭「机器 ID + 密码」即可控制本机（密码正确即授权）。macOS 需授予「屏幕录制」与「辅助功能」权限。
-            </p>
-          </div>
+            </section>
 
-          <div class="mt-2 border-t pt-3">
-            <p class="mb-2 text-xs font-semibold text-foreground">微信通道</p>
-            <!-- 登录中：二维码 / 配对数字 / 取消 -->
-            <div v-if="wxLogin" class="grid justify-items-center gap-2">
-              <img v-if="wxQrData" :src="wxQrData" alt="微信登录二维码" class="size-44 rounded-lg border bg-white p-1.5" />
-              <p class="text-center text-xs text-muted-foreground">{{ wxLogin.message || '请用手机微信扫描二维码' }}</p>
-              <div v-if="wxLogin.status === 'need_verifycode'" class="flex w-full gap-2">
-                <input
-                  v-model="wxVerifyCode"
-                  inputmode="numeric"
-                  maxlength="8"
-                  placeholder="输入手机微信上显示的配对数字"
-                  class="h-9 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
-                />
-                <button class="h-9 shrink-0 rounded-lg bg-emerald-600 px-3 text-sm font-medium text-white hover:bg-emerald-700" @click="wxSubmitCode">确认</button>
+            <!-- 远程控制 -->
+            <section v-else-if="settingsTab === 'remote'" class="grid gap-3 p-5" aria-label="远程控制设置">
+              <div class="grid grid-cols-2 gap-2.5 max-md:grid-cols-1">
+                <label class="grid gap-1">
+                  <span class="text-xs font-medium text-muted-foreground">本机机器 ID</span>
+                  <div class="flex h-9 items-center rounded-lg border bg-muted/30 px-3 font-mono text-sm tracking-widest">
+                    {{ settingsForm.machine_id || '——' }}
+                  </div>
+                </label>
+                <label class="grid gap-1">
+                  <span class="text-xs font-medium text-muted-foreground">临时密码（重启更换）</span>
+                  <div class="flex h-9 items-center rounded-lg border bg-muted/30 px-3 font-mono text-sm tracking-widest">
+                    {{ store.remoteTempPassword || '——' }}
+                  </div>
+                </label>
               </div>
-              <button class="h-8 rounded-lg border px-3 text-xs hover:bg-accent" @click="wxCancelLogin">取消登录</button>
-            </div>
-            <!-- 已登录：状态 + 最近收到 -->
-            <div v-else-if="wxStatus?.logged_in" class="grid gap-2">
-              <div class="flex items-start justify-between gap-2">
-                <div class="min-w-0 text-xs leading-relaxed text-muted-foreground">
-                  <p class="font-medium text-foreground">✓ 已连接微信</p>
-                  <p>轮询：{{ wxStatus.polling ? '运行中' : wxStatus.paused_remaining_ms > 0 ? '冷却中（约 ' + Math.ceil(wxStatus.paused_remaining_ms / 60000) + ' 分钟，重新扫码可解除）' : '已停止' }}</p>
-                  <p v-if="wxStatus.last_error" class="text-red-500">最近错误：{{ wxStatus.last_error }}</p>
-                  <p>收到的媒体自动存到「保存目录/微信/」</p>
+              <label class="grid gap-1">
+                <span class="text-xs font-medium text-muted-foreground">
+                  固定密码{{ settingsForm.has_fixed_password ? '（已设置，输入可更换，留空保持不变）' : '（无人值守访问用，重启仍有效）' }}
+                </span>
+                <div class="flex gap-2">
+                  <input
+                    v-model="settingsForm.remote_fixed_password"
+                    type="password"
+                    maxlength="32"
+                    :placeholder="settingsForm.has_fixed_password ? '••••••••（留空不变，输入即更换）' : '设置长期固定密码'"
+                    autocomplete="new-password"
+                    class="h-9 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                  />
+                  <button
+                    v-if="settingsForm.has_fixed_password"
+                    class="h-9 shrink-0 rounded-lg border px-3 text-xs text-red-600 hover:bg-red-500/10 dark:text-red-400"
+                    @click="clearFixedPassword"
+                  >
+                    清除
+                  </button>
                 </div>
-                <button class="h-8 shrink-0 rounded-lg border px-3 text-xs text-red-600 hover:bg-red-500/10 dark:text-red-400" @click="wxLogout">退出登录</button>
-              </div>
-              <div v-if="store.weixinInbound.length" class="grid gap-1 rounded-lg bg-muted/40 p-2">
-                <p class="text-[11px] font-medium text-muted-foreground">最近收到</p>
-                <p
-                  v-for="(m, i) in [...store.weixinInbound].slice(-4).reverse()"
-                  :key="i"
-                  class="truncate text-[11px] text-muted-foreground"
-                  :title="m.saved_path || m.text"
-                >
-                  ← {{ m.text }}
-                </p>
-              </div>
+              </label>
               <p class="text-[11px] leading-relaxed text-muted-foreground">
-                微信里收到的消息与文件会实时转发到云书；电脑上的内容可用 yunshu-cli（wx … 命令）或 AI agent 的 weixin_* 工具发到你的微信。
+                其他 Yunshu 凭「机器 ID + 密码」即可控制本机（密码正确即授权）。macOS 需授予「屏幕录制」与「辅助功能」权限。
               </p>
-            </div>
-            <!-- 未登录 -->
-            <template v-else>
-              <button
-                class="h-9 w-full rounded-lg border border-emerald-600/40 bg-emerald-600/10 text-sm font-medium text-emerald-700 hover:bg-emerald-600/20 dark:text-emerald-400"
-                @click="wxLoginStart"
-              >
-                扫码登录微信
-              </button>
-              <p class="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
-                用手机微信扫码绑定个人微信机器人：此后微信里收到的消息与文件实时转到云书（文件自动解密落盘）；电脑上的内容也能通过 CLI/AI agent 发回你的微信。
-              </p>
-            </template>
+            </section>
+
+            <!-- 微信：复用主界面的微信会话面板 -->
+            <section v-else class="flex h-full min-h-0 flex-col max-md:h-[52dvh]" aria-label="微信设置">
+              <WeixinPanel />
+            </section>
           </div>
         </div>
-        <p class="mt-3 text-xs text-muted-foreground">端口、目录修改后需重启云书生效</p>
-        <div class="mt-4 flex justify-end gap-2">
-          <button class="rounded-lg border px-4 py-2 text-sm hover:bg-accent" @click="showSettings = false">取消</button>
-          <button class="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700" @click="saveSettings">保存</button>
+
+        <!-- 底部：提示 + 操作 -->
+        <div class="flex shrink-0 items-center justify-between gap-3 border-t px-5 py-3">
+          <p class="min-w-0 text-xs text-muted-foreground">端口、目录修改后需重启 Yunshu 生效</p>
+          <div class="flex shrink-0 gap-2">
+            <button class="rounded-lg border px-4 py-2 text-sm hover:bg-accent" @click="showSettings = false">取消</button>
+            <button class="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700" @click="saveSettings">保存</button>
+          </div>
         </div>
       </div>
     </div>

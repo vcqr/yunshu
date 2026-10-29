@@ -901,7 +901,7 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
 
     match tokio::net::TcpListener::bind(("0.0.0.0", cfg.port)).await {
         Ok(listener) => {
-            tracing::info!("云书服务已启动: http://{addr}");
+            tracing::info!("Yunshu 服务已启动: http://{addr}");
             // ConnectInfo：远程控制按来源 IP 做防爆破锁定
             if let Err(e) = axum::serve(
                 listener,
@@ -1954,7 +1954,7 @@ async fn upload(
 }
 
 fn err_page(code: StatusCode, msg: &str) -> Response {
-    (code, format!("云书：{msg}")).into_response()
+    (code, format!("Yunshu：{msg}")).into_response()
 }
 
 fn json_err(msg: &str) -> Response {

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /**
  * TransferCard：聊天流内嵌传输卡片（发送方 / 接收方双视角）
- * 接收完成的文件可一键打开所在文件夹（云书：接收自动保存）
+ * 接收完成的文件可一键打开所在文件夹（Yunshu：接收自动保存）
  */
 import { computed, ref, watch } from 'vue'
 import {

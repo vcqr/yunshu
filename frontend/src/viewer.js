@@ -418,7 +418,7 @@ monitorSel.addEventListener('change', () => {
 /* ---------- 主流程 ---------- */
 async function main() {
   if (!('__TAURI_INTERNALS__' in window)) {
-    showMask('请在云书应用内打开本窗口', false)
+    showMask('请在 Yunshu 应用内打开本窗口', false)
     return
   }
   let info

@@ -1,5 +1,5 @@
 /**
- * 云书 — 格式化与展示工具（移植自 demo relay-format，图标用 @lucide/vue）
+ * Yunshu — 格式化与展示工具（移植自 demo relay-format，图标用 @lucide/vue）
  */
 import {
   File, FileText, FileImage, FileVideoCamera, FileMusic, FileArchive, FileType, FileCode, Folder,

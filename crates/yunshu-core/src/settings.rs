@@ -40,7 +40,7 @@ impl Default for Settings {
 fn default_save_dir() -> PathBuf {
     dirs::download_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
-        .join("云书")
+        .join("Yunshu")
 }
 
 impl Settings {

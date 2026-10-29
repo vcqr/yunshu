@@ -42,7 +42,7 @@ pub fn try_dispatch() -> bool {
             }
             "install" => {
                 match install() {
-                    Ok(()) => println!("云书服务已安装（开机自启，登录会话内自动拉起）"),
+                    Ok(()) => println!("Yunshu 服务已安装（开机自启，登录会话内自动拉起）"),
                     Err(e) => {
                         eprintln!("安装失败: {e}");
                         std::process::exit(1);
@@ -52,7 +52,7 @@ pub fn try_dispatch() -> bool {
             }
             "uninstall" => {
                 match uninstall() {
-                    Ok(()) => println!("云书服务已卸载"),
+                    Ok(()) => println!("Yunshu 服务已卸载"),
                     Err(e) => {
                         eprintln!("卸载失败: {e}");
                         std::process::exit(1);
@@ -220,7 +220,7 @@ fn install() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     let info = windows_service::service::ServiceInfo {
         name: SERVICE_NAME.into(),
-        display_name: "云书远程控制服务".into(),
+        display_name: "Yunshu 远程控制服务".into(),
         service_type: ServiceType::OWN_PROCESS,
         start_type: windows_service::service::ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,

@@ -847,7 +847,7 @@ pub async fn run_discovery(st: Arc<AppState>) {
             PIGEON_UDP_PORT
         );
         st.emit(CoreEvent::Toast {
-            text: format!("UDP {PIGEON_UDP_PORT} 被占用，飞鸽发现已禁用（可能已有云书实例在运行）"),
+            text: format!("UDP {PIGEON_UDP_PORT} 被占用，飞鸽发现已禁用（可能已有 Yunshu 实例在运行）"),
         });
         return;
     };

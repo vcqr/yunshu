@@ -54,7 +54,7 @@ const percent = computed(() =>
     <!-- 品牌 · 版本 -->
     <span class="flex items-center gap-1.5 font-medium">
       <Bird class="size-3 text-emerald-500" aria-hidden="true" />
-      <span class="hidden sm:inline">云书</span>
+      <span class="hidden sm:inline">Yunshu</span>
       <span v-if="version" class="font-normal tabular-nums text-muted-foreground/70">v{{ version }}</span>
     </span>
 

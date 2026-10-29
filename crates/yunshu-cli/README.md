@@ -1,6 +1,6 @@
-# yunshu-cli — 云书无头节点
+# yunshu-cli — Yunshu 无头节点
 
-云书的命令行形态：内嵌与桌面版同一套核心（yunshu-core），一个二进制两种身份——直接运行是交互式终端，`--mcp` 是 MCP stdio server（供 Claude Desktop / ZCode 等 AI 客户端调用）。
+Yunshu 的命令行形态：内嵌与桌面版同一套核心（yunshu-core），一个二进制两种身份——直接运行是交互式终端，`--mcp` 是 MCP stdio server（供 Claude Desktop / ZCode 等 AI 客户端调用）。
 
 ## 交互式终端
 

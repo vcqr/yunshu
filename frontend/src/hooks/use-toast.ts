@@ -1,5 +1,5 @@
 /**
- * 云书 — 轻量 toast（替代 demo 的 sonner）
+ * Yunshu — 轻量 toast（替代 demo 的 sonner）
  */
 import { reactive } from 'vue'
 

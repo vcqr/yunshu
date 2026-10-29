@@ -118,7 +118,7 @@ function connectPeer() {
           </div>
 
           <p class="mt-4 text-[11px] leading-relaxed text-muted-foreground">
-            其他云书（电脑或手机）凭这两项即可远程控制本机；验证码正确即授权，连续输错将锁定
+            其他 Yunshu（电脑或手机）凭这两项即可远程控制本机；验证码正确即授权，连续输错将锁定
           </p>
         </div>
 

@@ -1,5 +1,5 @@
 /**
- * 云书 — 核心事件桥（替代 demo 的 socket.io 层）
+ * Yunshu — 核心事件桥（替代 demo 的 socket.io 层）
  * core（yunshu_core）事件 → store；relayActions → Tauri invoke
  */
 import { invoke } from '@tauri-apps/api/core'
@@ -132,8 +132,8 @@ function applyPeers(peers: any[]) {
     }
   }
   mutations.setDevices(devices)
-  // 选中设备消失时回到本机识别首页
-  if (selected && selected !== 'self' && selected !== 'phone' && selected !== 'broadcast' &&
+  // 选中设备消失时回到本机识别首页（'self'/'phone'/'weixin'/'broadcast' 为固定视图）
+  if (selected && selected !== 'self' && selected !== 'phone' && selected !== 'weixin' && selected !== 'broadcast' &&
       !devices.some((d) => d.id === selected)) {
     mutations.setSelectedPeer('self')
   }
@@ -193,13 +193,17 @@ async function apply(ev: any) {
       break
     }
     case 'weixin_inbound': {
-      // 微信通道：收到的消息进设置卡片列表，文本/文件落盘都弹一条轻提示
+      // 微信通道：消息进「微信」会话；不在会话时才弹轻提示与未读
       const m = ev.msg
       mutations.addWeixinInbound(m)
-      if (m.saved_path) {
-        toast.info(`微信收到${m.kind === 'image' ? '图片' : m.kind === 'video' ? '视频' : '文件'}：${m.saved_path}`)
-      } else if (m.text) {
-        toast.info(`微信：${m.text}`)
+      mutations.setWeixinLoggedIn(true)
+      if (store.selectedPeer !== 'weixin') {
+        mutations.bumpUnread('weixin')
+        if (m.saved_path) {
+          toast.info(`微信收到${m.kind === 'image' ? '图片' : m.kind === 'video' ? '视频' : '文件'}：${m.saved_path}`)
+        } else if (m.text) {
+          toast.info(`微信：${m.text}`)
+        }
       }
       break
     }
@@ -419,7 +423,7 @@ export const relayActions = {
   /** 发起远程控制（打开密码弹窗） */
   openControlDialog(machineId: string, name: string) {
     if (!machineId) {
-      toast.error('对方云书版本较旧，不支持远程控制')
+      toast.error('对方 Yunshu 版本较旧，不支持远程控制')
       return
     }
     mutations.openControlDialog(machineId, name)
@@ -479,6 +483,11 @@ export async function startRelay() {
     // 非 Tauri 环境（纯浏览器预览）：假装已连接，便于查看界面
     mutations.setConnection('connected')
   }
+
+  // 微信登录态：侧栏「微信」行状态与未读提示依赖它（浏览器预览拿不到则保持未登录）
+  invoke<any>('weixin_status')
+    .then((s) => mutations.setWeixinLoggedIn(!!s?.logged_in))
+    .catch(() => {})
 
   if (!isTauri) return
   // 各监听独立注册互不拖垮：曾因一处注册失败导致整个 startRelay 中断、

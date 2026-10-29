@@ -1,4 +1,4 @@
-//! 云书 Tauri 壳：窗口 + 托盘 + 核心（yunshu-core）桥接。
+//! Yunshu Tauri 壳：窗口 + 托盘 + 核心（yunshu-core）桥接。
 //! 业务全部在 yunshu_core；本壳只做：事件转发（core → 前端）、命令（前端 → core）、托盘与窗口管理。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -717,6 +717,12 @@ fn weixin_inbox(limit: Option<u32>) -> Result<serde_json::Value, String> {
     serde_json::to_value(items).map_err(|e| e.to_string())
 }
 
+/// 发送文本到微信（默认目标：绑定的本人账号或最近活跃的配对用户）
+#[tauri::command]
+async fn weixin_send_text(text: String) -> Result<usize, String> {
+    yunshu_core::weixin::send_text(None, &text).await
+}
+
 /// 打开远程观看窗口（观看页凭 get_view_info 拿接入凭证，凭证不进 URL）
 fn open_viewer_window(app: &tauri::AppHandle, info: &RemoteViewInfo) {
     use tauri::WebviewUrl;
@@ -750,17 +756,17 @@ fn set_tray_controlled(app: &tauri::AppHandle, controlled: bool, who: &str) {
     let Some(tray) = tray.as_ref() else { return };
     if controlled {
         tray.set_icon(Some(red_tray_icon())).ok();
-        tray.set_tooltip(Some(format!("云书 · 正在被 {who} 远程控制")))
+        tray.set_tooltip(Some(format!("Yunshu · 正在被 {who} 远程控制")))
             .ok();
     } else {
         if let Some(icon) = DEFAULT_ICON.get() {
             tray.set_icon(Some(icon.clone())).ok();
         }
-        tray.set_tooltip(Some("云书 · 局域网传书")).ok();
+        tray.set_tooltip(Some("Yunshu · 局域网传书")).ok();
     }
     // 菜单项随会话状态启用/禁用
     use tauri::menu::{Menu, MenuItem};
-    let open = MenuItem::with_id(app, "open", "打开云书", true, None::<&str>);
+    let open = MenuItem::with_id(app, "open", "打开 Yunshu", true, None::<&str>);
     let disconnect = MenuItem::with_id(
         app,
         "remote-disconnect",
@@ -905,7 +911,7 @@ fn main() {
                         let _ = handle
                             .notification()
                             .builder()
-                            .title("云书")
+                            .title("Yunshu")
                             .body(format!("「{}」传输完成", t.name))
                             .show();
                     }
@@ -917,7 +923,7 @@ fn main() {
 
             // 托盘
             use tauri::menu::{Menu, MenuItem};
-            let open = MenuItem::with_id(app, "open", "打开云书", true, None::<&str>)?;
+            let open = MenuItem::with_id(app, "open", "打开 Yunshu", true, None::<&str>)?;
             let disconnect = MenuItem::with_id(
                 app,
                 "remote-disconnect",
@@ -938,7 +944,7 @@ fn main() {
             }
             let tray = tauri::tray::TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("云书 · 局域网传书")
+                .tooltip("Yunshu · 局域网传书")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, ev| match ev.id().as_ref() {
@@ -1019,7 +1025,8 @@ fn main() {
             weixin_login_cancel,
             weixin_logout,
             weixin_status,
-            weixin_inbox
+            weixin_inbox,
+            weixin_send_text
         ])
         .on_window_event(|window, event| {
             match window.label() {
@@ -1045,5 +1052,5 @@ fn main() {
             }
         })
         .run(tauri::generate_context!())
-        .expect("云书运行出错");
+        .expect("Yunshu 运行出错");
 }

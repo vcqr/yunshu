@@ -62,7 +62,7 @@ const transferOpen = ref(false)
     <!-- macOS 惯例：窗口标题栏不放 logo/应用名（应用名在系统菜单栏），Windows/Linux 保留 -->
     <template v-if="!IS_MAC">
       <AppLogo size="sm" />
-      <span class="text-sm font-semibold tracking-tight">云书</span>
+      <span class="text-sm font-semibold tracking-tight">Yunshu</span>
     </template>
 
     <div class="ml-auto flex items-center gap-0.5">

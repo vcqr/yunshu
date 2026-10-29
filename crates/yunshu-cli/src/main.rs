@@ -1,4 +1,4 @@
-//! yunshu-cli：无头云书节点。
+//! yunshu-cli：无头 Yunshu 节点。
 //! 内嵌 yunshu-core（与桌面版同一套核心实现），一个二进制两种身份：
 //!   直接运行   交互式终端（peers/send/sendfile/trust/accept…），信任与来件由人决策
 //!   --mcp      MCP stdio server，把能力暴露为工具供 AI agent 调用
@@ -26,7 +26,7 @@ struct Opts {
 
 fn usage() {
     println!(
-        "yunshu-cli — 无头云书节点\n\
+        "yunshu-cli — 无头 Yunshu 节点\n\
          用法: yunshu-cli [--mcp] [--home <目录>] [--port <端口>] [--name <名称>] [--dnd] [--no-dnd] [--stealth]\n\
          \n\
          直接运行是交互式终端；--mcp 以 MCP stdio server 运行（供 AI agent 调用）。\n\

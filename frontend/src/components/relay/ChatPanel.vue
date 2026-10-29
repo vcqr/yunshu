@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /**
  * ChatPanel：会话主体 — 单行紧凑标题 + 消息流 + 输入区 + 拖拽遮罩
- * 手机未配对时显示扫码配对视图（云书特有）
+ * 手机未配对时显示扫码配对视图（Yunshu 特有）
  */
 import { computed, ref, watch } from 'vue'
 import QRCode from 'qrcode'

@@ -27,7 +27,7 @@ const HELP: &str = "命令：
   quit                         广播下线并退出";
 
 pub fn run(rt: &tokio::runtime::Runtime, shared: Arc<Shared>) {
-    println!("云书无头节点（交互模式）。help 查看命令。");
+    println!("Yunshu 无头节点（交互模式）。help 查看命令。");
     let stdin = std::io::stdin();
     loop {
         print!("yunshu> ");

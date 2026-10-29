@@ -2,11 +2,11 @@
 /**
  * DeviceSidebar：桌面软件式紧凑设备列表
  * 行式条目（h-9）+ 右键上下文菜单（打开会话 / 发送文件 / 发送文件夹 / 断开）
- * 手机（扫码配对）为云书特有的伪设备，与广播会话、飞鸽电脑并列
+ * 手机（扫码配对）为 Yunshu 特有的伪设备，与广播会话、飞鸽电脑并列
  */
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
-  Check, FileUp, FolderUp, Laptop, Lock, MessagesSquare, MonitorUp, HandMetal, Plus, Radio,
+  Check, FileUp, FolderUp, Laptop, Lock, MessageCircle, MessagesSquare, MonitorUp, HandMetal, Plus, Radio,
   RefreshCw, Satellite, Smartphone, Trash2,
 } from '@lucide/vue'
 import RelayAvatar from './RelayAvatar.vue'
@@ -348,6 +348,43 @@ async function ctxSendFolderPhone() {
           class="shrink-0 text-[10px] text-muted-foreground"
         >{{ phoneOnline ? '已配对' : '扫码配对' }}</span>
       </button>
+
+      <!-- 微信（个人微信机器人）：点击切到微信对话界面 -->
+      <button
+        type="button"
+        role="tab"
+        :aria-selected="store.selectedPeer === 'weixin'"
+        :title="store.weixinLoggedIn ? '微信机器人已连接' : '扫码绑定个人微信机器人'"
+        :class="cn(
+          'flex h-10 w-full items-center gap-2.5 rounded-lg px-2 text-left transition-colors md:h-9',
+          'focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none',
+          store.selectedPeer === 'weixin'
+            ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300'
+            : 'hover:bg-accent'
+        )"
+        @click="emit('select', 'weixin')"
+      >
+        <span
+          :class="cn(
+            'flex size-7 shrink-0 items-center justify-center rounded-lg',
+            store.weixinLoggedIn
+              ? 'bg-gradient-to-br from-emerald-400 to-teal-600 text-white'
+              : 'bg-muted text-muted-foreground'
+          )"
+          aria-hidden="true"
+        >
+          <MessageCircle class="size-3.5" />
+        </span>
+        <span
+          class="min-w-0 flex-1 truncate text-[13px]"
+          :class="unreadFor('weixin') > 0 ? 'font-semibold' : 'font-medium'"
+        >微信</span>
+        <UnreadBadge v-if="unreadFor('weixin') > 0" :count="unreadFor('weixin')" />
+        <span
+          v-else
+          class="shrink-0 text-[10px] text-muted-foreground"
+        >{{ store.weixinLoggedIn ? '已连接' : '未登录' }}</span>
+      </button>
     </div>
 
     <!-- 在线设备 -->
@@ -388,7 +425,7 @@ async function ctxSendFolderPhone() {
             <div class="space-y-0.5">
               <p class="text-xs font-medium text-foreground">等待其他设备上线…</p>
               <p class="max-w-[190px] text-[10px] leading-relaxed text-muted-foreground">
-                同一局域网内运行云书的电脑会自动出现在这里
+                同一局域网内运行 Yunshu 的电脑会自动出现在这里
               </p>
             </div>
           </div>
@@ -614,7 +651,7 @@ async function ctxSendFolderPhone() {
             添加主机
           </div>
           <p class="mb-4 text-xs text-muted-foreground">
-            输入同一局域网（或可达网段）内运行云书的电脑地址；双方首次连接需各自确认指纹
+            输入同一局域网（或可达网段）内运行 Yunshu 的电脑地址；双方首次连接需各自确认指纹
           </p>
           <label class="mb-1 block text-xs font-medium text-muted-foreground">对方地址</label>
           <input

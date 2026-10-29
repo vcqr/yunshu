@@ -1,6 +1,6 @@
 ---
 name: yunshu-cli
-description: 操作云书无头节点 yunshu-cli：局域网传文件/发文本/飞鸽主机管理、pigeonbot e2e 联调、把它作为 MCP server 接入 AI 客户端。当用户提到云书 CLI、无头节点、局域网给某台电脑传文件发消息、跑云书 e2e，或要调试 yunshu MCP 工具时使用——即使用户没说"无头"两个字。
+description: 操作 Yunshu 无头节点 yunshu-cli：局域网传文件/发文本/飞鸽主机管理、pigeonbot e2e 联调、把它作为 MCP server 接入 AI 客户端。当用户提到 Yunshu CLI、无头节点、局域网给某台电脑传文件发消息、跑 Yunshu e2e，或要调试 yunshu MCP 工具时使用——即使用户没说"无头"两个字。
 ---
 
 # yunshu-cli 无头节点

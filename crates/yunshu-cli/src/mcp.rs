@@ -1,4 +1,4 @@
-//! MCP stdio server：把云书能力暴露为 MCP 工具，供 AI agent 调用。
+//! MCP stdio server：把 Yunshu 能力暴露为 MCP 工具，供 AI agent 调用。
 //! 安全默认：不提供自动信任/自动接收类工具——信任与来件是人工门，
 //! 需要在交互终端里由人决策（后续可用 MCP elicitation 转给客户端人工批准）。
 
@@ -78,7 +78,7 @@ impl YunshuMcp {
         Self { shared }
     }
 
-    #[tool(description = "列出云书飞鸽（PC↔PC）发现的主机：id、机器ID、名称、ip:端口、连接状态。发送文本/文件前先调用本工具获取 peer_id。")]
+    #[tool(description = "列出 Yunshu 飞鸽（PC↔PC）发现的主机：id、机器ID、名称、ip:端口、连接状态。发送文本/文件前先调用本工具获取 peer_id。")]
     fn pigeon_list_peers(&self) -> Result<CallToolResult, McpError> {
         let peers = self.shared.mirror.lock().unwrap().peers.clone();
         json_result(serde_json::to_value(&peers).unwrap_or_default())
@@ -99,7 +99,7 @@ impl YunshuMcp {
         }
     }
 
-    #[tool(description = "向指定 peer 发送本地文件或文件夹（多个合并为一个批次）。对方需在其云书端确认接收后才开始传输，工具会等待传输终态。")]
+    #[tool(description = "向指定 peer 发送本地文件或文件夹（多个合并为一个批次）。对方需在其 Yunshu 端确认接收后才开始传输，工具会等待传输终态。")]
     async fn pigeon_send_files(
         &self,
         Parameters(p): Parameters<SendFilesParams>,

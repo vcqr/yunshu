@@ -1,4 +1,4 @@
-//! 云书核心：HTTP/WS 服务、配对、传输、飞鸽（PC↔PC）。不依赖任何 UI。
+//! Yunshu 核心：HTTP/WS 服务、配对、传输、飞鸽（PC↔PC）。不依赖任何 UI。
 
 pub mod clipboard;
 pub mod encoder;

@@ -1,5 +1,5 @@
 /**
- * 云书 — 通信数据类型（移植自 demo/ui relay-types，适配本地 core 事件模型）
+ * Yunshu — 通信数据类型（移植自 demo/ui relay-types，适配本地 core 事件模型）
  */
 
 export interface Device {

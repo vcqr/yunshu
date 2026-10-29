@@ -1,5 +1,5 @@
 /**
- * 云书 — 全局状态（移植自 demo relay-store，zustand → Vue reactive）
+ * Yunshu — 全局状态（移植自 demo relay-store，zustand → Vue reactive）
  */
 import { reactive } from 'vue'
 import type { ChatMessage, ConnectionState, Device, Presence, Transfer } from '../lib/relay-types'
@@ -14,7 +14,7 @@ export interface RelayState {
   meIp: string
   connection: ConnectionState
   devices: Device[]           // 飞鸽电脑设备（手机作为伪设备单独处理）
-  selectedPeer: string        // 'self'（本机识别首页）| 'phone' | 'broadcast' 或 deviceId
+  selectedPeer: string        // 'self'（本机识别首页）| 'phone' | 'weixin' | 'broadcast' 或 deviceId
   phoneConnected: boolean     // 手机配对状态
   phoneName: string
   messages: ChatMessage[]
@@ -54,6 +54,10 @@ export interface RelayState {
     at_ms: number; from: string; kind: string; text: string
     file_name?: string; size?: number; saved_path?: string; error?: string
   }>
+  /** 微信通道：本机发出的消息（仅内存，随会话） */
+  weixinOutbound: Array<{ at_ms: number; text: string }>
+  /** 微信通道：机器人是否已扫码登录（侧栏「微信」行状态灯用） */
+  weixinLoggedIn: boolean
 }
 
 export const store = reactive<RelayState>({
@@ -87,6 +91,8 @@ export const store = reactive<RelayState>({
   controlDialog: null,
   assistRequests: [],
   weixinInbound: [],
+  weixinOutbound: [],
+  weixinLoggedIn: false,
 })
 
 export const mutations = {
@@ -137,6 +143,11 @@ export const mutations = {
     store.weixinInbound.push(m)
     if (store.weixinInbound.length > 50) store.weixinInbound.shift()
   },
+  addWeixinOutbound(text: string) {
+    store.weixinOutbound.push({ at_ms: Date.now(), text })
+    if (store.weixinOutbound.length > 50) store.weixinOutbound.shift()
+  },
+  setWeixinLoggedIn(v: boolean) { store.weixinLoggedIn = v },
   enqueueTrust(req: { peer_id: string; name: string; fingerprint: string }) {
     if (store.trustRequests.some((r) => r.peer_id === req.peer_id)) return
     store.trustRequests.push(req)
