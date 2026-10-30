@@ -772,6 +772,31 @@ pub fn peers_event(st: &AppState) -> CoreEvent {
         }
         v
     };
+    // 同一机器身份去重：升级过渡期残留的旧随机 id 条目、手动主机记录里的过期
+    // peer_id，都可能和新条目并存成重复卡片。按 machine_id 合并——优先保留已
+    // 连接的（其 id 在连接表里，聊天/传文件可直接投递），其次保留发现条目
+    // （id 来自最新广播，手动记录可能是过期 id）
+    let mut deduped: Vec<PigeonPeerInfo> = Vec::with_capacity(v.len());
+    for p in v {
+        if p.machine_id.is_empty() {
+            deduped.push(p); // 极旧版本无机器 ID，无从合并
+            continue;
+        }
+        match deduped
+            .iter_mut()
+            .find(|x| x.machine_id == p.machine_id)
+        {
+            Some(existing) => {
+                if (p.connected && !existing.connected)
+                    || (p.connected == existing.connected && existing.manual && !p.manual)
+                {
+                    *existing = p;
+                }
+            }
+            None => deduped.push(p),
+        }
+    }
+    let mut v = deduped;
     v.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
     CoreEvent::PigeonPeers { peers: v }
 }

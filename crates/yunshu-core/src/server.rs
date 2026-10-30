@@ -241,7 +241,10 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
     let data_dir = crate::config_dir().unwrap_or_else(std::env::temp_dir);
     let state = Arc::new(AppState {
         cfg: cfg.clone(),
-        self_id: uuid::Uuid::new_v4().simple().to_string(),
+        // 飞鸽发现身份用稳定机器 ID（静态密钥指纹）：随启动随机会导致对端每次
+        // 重启都生成新条目——旧条目成僵尸（多出重复主机卡片），聊天发往旧 id 报
+        // 「对方已断开」。稳定后同一台机器永远映射到同一个 id
+        self_id: crate::remote::machine_id(),
         data_dir,
         pairing: Mutex::new(Pairing::default()),
         conn: Mutex::new(None),
