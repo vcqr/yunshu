@@ -6,7 +6,7 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { Bird, HandMetal, MessageCircle, MonitorUp, Settings2, ShieldAlert, ShieldCheck, Smartphone } from '@lucide/vue'
+import { Globe, HandMetal, MessageCircle, MonitorUp, Settings2, ShieldAlert, ShieldCheck, Smartphone } from '@lucide/vue'
 import AppHeader from './components/relay/AppHeader.vue'
 import DeviceSidebar from './components/relay/DeviceSidebar.vue'
 import LocalIdentityCard from './components/relay/LocalIdentityCard.vue'
@@ -56,20 +56,30 @@ function rejectTrust() {
   store.trustRequests = store.trustRequests.filter((r) => r.peer_id !== currentTrust.value!.peer_id)
 }
 
-/* ------------------------------ 设置（左右分栏：左标签菜单 + 右面板） ------------------------------ */
+/* ------------------------------ 设置（全屏页面：左标签菜单 + 右内容居中） ------------------------------ */
 const showSettings = ref(false)
-type SettingsTab = 'general' | 'remote' | 'weixin'
+type SettingsTab = 'general' | 'remote' | 'proxy' | 'weixin'
 const settingsTab = ref<SettingsTab>('general')
 const settingsTabs: Array<{ key: SettingsTab; label: string; icon: typeof Settings2 }> = [
   { key: 'general', label: '常规', icon: Settings2 },
   { key: 'remote', label: '远程控制', icon: MonitorUp },
+  { key: 'proxy', label: '代理', icon: Globe },
   { key: 'weixin', label: '微信', icon: MessageCircle },
 ]
 const settingsForm = ref({
   device_name: '', port: 34256, save_dir: '', autostart: false, dnd_mode: false,
   stealth_mode: false,
   machine_id: '', remote_fixed_password: '', has_fixed_password: false,
+  proxy_mode: 'system', proxy_url: '', no_proxy: '',
 })
+
+/* 代理三态：直连 / 跟随系统 / 自定义（企业网络常用） */
+const proxyOptions = [
+  { value: 'direct', label: '直连', desc: '不使用任何代理，直接连接网络' },
+  { value: 'system', label: '跟随系统', desc: '读取操作系统代理设置与环境变量（默认）' },
+  { value: 'custom', label: '自定义', desc: '手动指定代理地址与 NO_PROXY 例外列表' },
+]
+
 async function openSettings() {
   const s = await invoke<any>('get_settings').catch(() => null)
   if (s) {
@@ -78,6 +88,9 @@ async function openSettings() {
       autostart: s.autostart, dnd_mode: s.dnd_mode, stealth_mode: !!s.stealth_mode,
       machine_id: s.machine_id || '',
       remote_fixed_password: '', has_fixed_password: !!s.remote_fixed_password_hash,
+      proxy_mode: ['direct', 'system', 'custom'].includes(s.proxy_mode) ? s.proxy_mode : 'system',
+      proxy_url: s.proxy_url || '',
+      no_proxy: s.no_proxy || '',
     }
     mutations.setRemoteMachineId(s.machine_id || null)
   }
@@ -96,12 +109,13 @@ async function saveSettings() {
       dndMode: s.dnd_mode, stealthMode: s.stealth_mode,
       // 未输入新密码则不动现有固定密码
       remoteFixedPassword: s.remote_fixed_password === '' ? null : s.remote_fixed_password,
+      proxyMode: s.proxy_mode, proxyUrl: s.proxy_url.trim(), noProxy: s.no_proxy.trim(),
     })
     store.meName = s.device_name
     store.dnd = s.dnd_mode
     store.stealth = s.stealth_mode
     if (s.remote_fixed_password !== '') s.has_fixed_password = true
-    toast.success('设置已保存（端口、目录重启后生效）')
+    toast.success('设置已保存（端口、目录、代理重启后生效）')
     showSettings.value = false
   } catch (e) {
     toast.error(`保存失败：${String(e)}`)
@@ -115,6 +129,8 @@ async function clearFixedPassword() {
       saveDir: settingsForm.value.save_dir, autostart: settingsForm.value.autostart,
       dndMode: settingsForm.value.dnd_mode, stealthMode: settingsForm.value.stealth_mode,
       remoteFixedPassword: '',
+      proxyMode: settingsForm.value.proxy_mode, proxyUrl: settingsForm.value.proxy_url.trim(),
+      noProxy: settingsForm.value.no_proxy.trim(),
     })
     settingsForm.value.has_fixed_password = false
     settingsForm.value.remote_fixed_password = ''
@@ -353,50 +369,35 @@ onMounted(async () => {
       </div>
     </div>
 
-    <!-- 设置：左右分栏（左标签菜单 + 右面板） -->
-    <div v-if="showSettings" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45 p-4" @click.self="showSettings = false">
-      <div class="bg-card flex w-full max-w-2xl flex-col overflow-hidden rounded-xl border shadow-xl">
-        <!-- 头部 -->
-        <div class="flex shrink-0 items-center gap-2.5 border-b px-5 py-3.5">
-          <div class="flex size-9 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-400 via-emerald-500 to-teal-600 text-white">
-            <Bird class="size-5" />
-          </div>
-          <div class="min-w-0">
-            <p class="text-sm font-semibold">设置</p>
-            <p class="text-xs text-muted-foreground">设备名修改后立即对局域网内其他设备生效</p>
-          </div>
-        </div>
-
-        <!-- 主体：左标签菜单 + 右面板（窄窗退化为顶部横排标签） -->
-        <div class="flex min-h-0 flex-1 max-md:flex-col">
-          <nav
-            class="w-36 shrink-0 space-y-0.5 border-r p-2 max-md:flex max-md:w-full max-md:space-y-0 max-md:border-b max-md:border-r-0 max-md:p-1.5"
-            aria-label="设置分类"
+    <!-- 设置：全屏页面（左标签菜单 + 右内容居中） -->
+    <div v-if="showSettings" class="fixed inset-x-0 bottom-0 top-11 z-30 flex flex-col bg-background">
+      <!-- 主体：左标签菜单 + 右面板 -->
+      <div class="flex min-h-0 flex-1">
+        <nav class="w-44 shrink-0 space-y-0.5 border-r p-2" aria-label="设置分类">
+          <button
+            v-for="t in settingsTabs"
+            :key="t.key"
+            type="button"
+            role="tab"
+            :aria-selected="settingsTab === t.key"
+            :class="cn(
+              'flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[13px] transition-colors',
+              'focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none',
+              settingsTab === t.key
+                ? 'bg-emerald-500/12 font-medium text-emerald-700 dark:text-emerald-300'
+                : 'text-muted-foreground hover:bg-accent hover:text-foreground'
+            )"
+            @click="settingsTab = t.key"
           >
-            <button
-              v-for="t in settingsTabs"
-              :key="t.key"
-              type="button"
-              role="tab"
-              :aria-selected="settingsTab === t.key"
-              :class="cn(
-                'flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[13px] transition-colors',
-                'focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none',
-                'max-md:w-auto max-md:flex-1 max-md:justify-center',
-                settingsTab === t.key
-                  ? 'bg-emerald-500/12 font-medium text-emerald-700 dark:text-emerald-300'
-                  : 'text-muted-foreground hover:bg-accent hover:text-foreground'
-              )"
-              @click="settingsTab = t.key"
-            >
-              <component :is="t.icon" class="size-4 shrink-0" />
-              {{ t.label }}
-            </button>
-          </nav>
+            <component :is="t.icon" class="size-4 shrink-0" />
+            {{ t.label }}
+          </button>
+        </nav>
 
-          <div class="custom-scroll min-h-0 w-full flex-1 overflow-y-auto max-md:max-h-[52dvh]">
+        <div class="custom-scroll min-h-0 w-full flex-1 overflow-y-auto">
+          <div class="mx-auto w-full max-w-xl px-6 py-6">
             <!-- 常规 -->
-            <section v-if="settingsTab === 'general'" class="grid gap-3 p-5" aria-label="常规设置">
+            <section v-if="settingsTab === 'general'" class="grid gap-3" aria-label="常规设置">
               <label class="grid gap-1">
                 <span class="text-xs font-medium text-muted-foreground">设备名</span>
                 <input
@@ -441,8 +442,8 @@ onMounted(async () => {
             </section>
 
             <!-- 远程控制 -->
-            <section v-else-if="settingsTab === 'remote'" class="grid gap-3 p-5" aria-label="远程控制设置">
-              <div class="grid grid-cols-2 gap-2.5 max-md:grid-cols-1">
+            <section v-else-if="settingsTab === 'remote'" class="grid gap-3" aria-label="远程控制设置">
+              <div class="grid grid-cols-2 gap-2.5">
                 <label class="grid gap-1">
                   <span class="text-xs font-medium text-muted-foreground">本机机器 ID</span>
                   <div class="flex h-9 items-center rounded-lg border bg-muted/30 px-3 font-mono text-sm tracking-widest">
@@ -483,20 +484,65 @@ onMounted(async () => {
               </p>
             </section>
 
-            <!-- 微信：复用主界面的微信会话面板 -->
-            <section v-else class="flex h-full min-h-0 flex-col max-md:h-[52dvh]" aria-label="微信设置">
+            <!-- 代理（企业网络）：直连 / 跟随系统 / 自定义 -->
+            <section v-else-if="settingsTab === 'proxy'" class="grid gap-3" aria-label="代理设置">
+              <p class="text-xs leading-relaxed text-muted-foreground">
+                代理仅作用于微信通道等外网请求；局域网传输与远程控制不经过代理。修改保存后需重启 Yunshu 生效。
+              </p>
+              <div class="grid gap-2">
+                <label
+                  v-for="opt in proxyOptions"
+                  :key="opt.value"
+                  class="flex cursor-pointer items-start gap-2.5 rounded-lg border p-3 text-sm transition-colors"
+                  :class="settingsForm.proxy_mode === opt.value ? 'border-emerald-500/50 bg-emerald-500/5' : 'hover:bg-accent'"
+                >
+                  <input
+                    v-model="settingsForm.proxy_mode"
+                    type="radio"
+                    name="proxy-mode"
+                    :value="opt.value"
+                    class="mt-0.5 size-4 accent-emerald-600"
+                  />
+                  <span class="min-w-0">
+                    <span class="font-medium">{{ opt.label }}</span>
+                    <span class="block text-xs text-muted-foreground">{{ opt.desc }}</span>
+                  </span>
+                </label>
+              </div>
+              <template v-if="settingsForm.proxy_mode === 'custom'">
+                <label class="grid gap-1">
+                  <span class="text-xs font-medium text-muted-foreground">代理地址</span>
+                  <input
+                    v-model="settingsForm.proxy_url"
+                    placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+                    class="h-9 rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                  />
+                </label>
+                <label class="grid gap-1">
+                  <span class="text-xs font-medium text-muted-foreground">NO_PROXY（不走代理的例外，逗号分隔）</span>
+                  <input
+                    v-model="settingsForm.no_proxy"
+                    placeholder="localhost,127.0.0.1,.corp.example.com"
+                    class="h-9 rounded-lg border bg-background px-3 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                  />
+                </label>
+              </template>
+            </section>
+
+            <!-- 微信：复用主界面的微信会话面板（定高，内部自滚动） -->
+            <section v-else class="h-[calc(100dvh-11rem)] min-h-0" aria-label="微信设置">
               <WeixinPanel />
             </section>
           </div>
         </div>
+      </div>
 
-        <!-- 底部：提示 + 操作 -->
-        <div class="flex shrink-0 items-center justify-between gap-3 border-t px-5 py-3">
-          <p class="min-w-0 text-xs text-muted-foreground">端口、目录修改后需重启 Yunshu 生效</p>
-          <div class="flex shrink-0 gap-2">
-            <button class="rounded-lg border px-4 py-2 text-sm hover:bg-accent" @click="showSettings = false">取消</button>
-            <button class="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700" @click="saveSettings">保存</button>
-          </div>
+      <!-- 底部：提示 + 操作 -->
+      <div class="flex h-12 shrink-0 items-center justify-between gap-3 border-t px-5">
+        <p class="min-w-0 text-xs text-muted-foreground">端口、目录、代理修改后需重启 Yunshu 生效</p>
+        <div class="flex shrink-0 gap-2">
+          <button class="rounded-lg border px-4 py-1.5 text-sm hover:bg-accent" @click="showSettings = false">取消</button>
+          <button class="rounded-lg bg-emerald-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-emerald-700" @click="saveSettings">保存</button>
         </div>
       </div>
     </div>

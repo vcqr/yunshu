@@ -383,13 +383,36 @@ fn base_info() -> Value {
 
 fn build_client(timeout: Option<Duration>) -> Result<reqwest::Client, String> {
     crate::install_rustls_provider();
-    let mut builder = reqwest::Client::builder();
+    let mut builder = apply_proxy(reqwest::Client::builder())?;
     if let Some(t) = timeout {
         builder = builder.timeout(t);
     }
     builder
         .build()
         .map_err(|e| format!("HTTP client 构建失败: {e}"))
+}
+
+/// 按设置套用代理（仅微信通道的外网请求；局域网传输不受影响）：
+/// direct=直连；system（默认）=交给 reqwest（启用 system-proxy 特性后读取系统/环境代理）；
+/// custom=显式代理地址 + NO_PROXY 例外。地址无效时直接报错（会体现在微信状态里），不做静默回退。
+fn apply_proxy(builder: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder, String> {
+    let s = crate::settings::Settings::load_or_default();
+    match s.proxy_mode.as_str() {
+        "direct" => Ok(builder.no_proxy()),
+        "custom" => {
+            let url = s.proxy_url.trim();
+            if url.is_empty() {
+                return Ok(builder);
+            }
+            let mut proxy = reqwest::Proxy::all(url).map_err(|_| format!("代理地址无效：{url}"))?;
+            let np = s.no_proxy.trim();
+            if !np.is_empty() {
+                proxy = proxy.no_proxy(reqwest::NoProxy::from_string(np));
+            }
+            Ok(builder.proxy(proxy))
+        }
+        _ => Ok(builder),
+    }
 }
 
 fn api_client() -> Result<reqwest::Client, String> {

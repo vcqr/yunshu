@@ -531,11 +531,21 @@ fn save_settings(
     dnd_mode: bool,
     stealth_mode: bool,
     remote_fixed_password: Option<String>,
+    proxy_mode: Option<String>,
+    proxy_url: Option<String>,
+    no_proxy: Option<String>,
 ) -> Result<(), String> {
     let mut s = yunshu_core::settings::Settings::load_or_default();
     s.device_name = device_name;
     s.port = port;
     s.save_dir = save_dir;
+    // 代理模式合法性兜底：非预期值一律按跟随系统处理
+    s.proxy_mode = match proxy_mode.as_deref().unwrap_or("system") {
+        "direct" | "custom" => proxy_mode.unwrap(),
+        _ => "system".into(),
+    };
+    s.proxy_url = proxy_url.unwrap_or_default();
+    s.no_proxy = no_proxy.unwrap_or_default();
     if s.autostart != autostart {
         yunshu_core::settings::Settings::apply_autostart(autostart)?;
         s.autostart = autostart;

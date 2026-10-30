@@ -33,7 +33,7 @@ jpeg-encoder = "0.7"
 pbkdf2 = "0.13"
 openh264 = { version = "0.9.9", features = ["source"] }
 # ── 微信通道（weixin.rs）：iLink 机器人协议 + 媒体 CDN 加密上传/下载 ──
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "system-proxy"] }
 aes = "0.8"
 md-5 = "0.10"
 base64 = "0.22"
