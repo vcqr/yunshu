@@ -181,12 +181,21 @@ function layout() {
   redraw()
 }
 
-/* fps 统计（含 0fps 自愈：剪贴板提示等临时文案 1 秒内被覆盖） */
+/* fps 统计（含 0fps 自愈：剪贴板提示等临时文案 1 秒内被覆盖）；
+   码率/RTT 同窗口结算：码率按 1s 内收到的帧字节，RTT 取受控端 Ping 携带的 EMA */
+let bytesAcc = 0
+let mbps = 0
+let rttMs = 0
 setInterval(() => {
   const zoomLabel = zoom > 1 ? ` · ×${zoom.toFixed(1)}` : ''
   const dimLabel = imgW && imgH ? ` · ${imgW}×${imgH}` : ''
+  mbps = (bytesAcc * 8) / 1e6
+  bytesAcc = 0
+  const rttLabel = rttMs > 0 ? ` · ${rttMs}ms` : ''
   statusEl.textContent =
-    ws && ws.readyState === 1 ? `${peerName} · ${frameCount} fps · ${currentCodec === 1 ? 'H.264' : 'JPEG'}${dimLabel}${zoomLabel}` : '未连接'
+    ws && ws.readyState === 1
+      ? `${peerName} · ${frameCount} fps · ${mbps.toFixed(1)} Mbps${rttLabel} · ${currentCodec === 1 ? 'H.264' : 'JPEG'}${dimLabel}${zoomLabel}`
+      : '未连接'
   // 收起药丸同步：fps + 连接状态点
   pillText.textContent = `${frameCount} fps`
   pillDot.className = dot.className
@@ -453,6 +462,7 @@ async function main() {
     if (ev.data instanceof ArrayBuffer) {
       const u8 = new Uint8Array(ev.data)
       if (u8.length < 3) return
+      bytesAcc += u8.length
       const codec = u8[0]
       const payload = u8.subarray(1)
       frameCount++
@@ -475,7 +485,9 @@ async function main() {
       try {
         const m = JSON.parse(ev.data)
         if (m.t === 'ping') {
-          // RTT 应答：受控端据此做画质自适应（ts 原样带回 + 窗口内丢帧数）
+          // RTT 应答：受控端据此做画质自适应（ts 原样带回 + 窗口内丢帧数）；
+          // rtt 为受控端 EMA，供状态栏显示端到端延迟（旧对端无此字段）
+          if (typeof m.rtt === 'number' && m.rtt > 0) rttMs = m.rtt
           send({ t: 'pong', ts: m.ts, lost: lostAcc })
           lostAcc = 0
         } else if (m.t === 'clipboard') {

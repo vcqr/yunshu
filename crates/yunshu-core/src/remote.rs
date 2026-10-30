@@ -101,8 +101,13 @@ pub enum RemoteWire {
     RemoteClipboard { text: String },
     /// 控制端 → 受控端：设置对方剪贴板并注入平台粘贴组合键
     RemotePaste { text: String },
-    /// 受控端 → 控制端：RTT 探测（观看端原样回 pong，附丢帧统计）
-    Ping { t: u64 },
+    /// 受控端 → 控制端：RTT 探测（观看端原样回 pong，附丢帧统计；rtt 为本端 EMA，
+    /// 供观看页状态栏显示；旧对端不带此字段按 0 处理）
+    Ping {
+        t: u64,
+        #[serde(default)]
+        rtt: u32,
+    },
     /// 观看端 → 受控端：RTT 应答（t 原样带回）+ 上个窗口观看端丢帧数
     Pong { t: u64, lost: u32 },
     /// 控制端调画质（max_width 缩放上限 / quality JPEG 质量）
@@ -1574,9 +1579,16 @@ pub async fn handle_remote_socket(
                                 } else {
                                     stable_cycles += 1;
                                     if stable_cycles >= 3 {
-                                        // 持续无压力：逐步回升
+                                        // 持续无压力：逐步回升（下限按 codec：H.264 可到 30fps）
+                                        let min_iv = if cap_codec.load(Ordering::Relaxed)
+                                            == crate::encoder::CODEC_H264
+                                        {
+                                            33
+                                        } else {
+                                            40
+                                        };
                                         p.quality = (p.quality + 5).min(80);
-                                        p.interval_ms = p.interval_ms.saturating_sub(8).max(40);
+                                        p.interval_ms = p.interval_ms.saturating_sub(8).max(min_iv);
                                         p.bitrate_scale = (p.bitrate_scale / 0.85).min(1.0);
                                         stable_cycles = 0;
                                     }
@@ -1633,14 +1645,16 @@ pub async fn handle_remote_socket(
                             ));
                         }
                     }
-                    // RTT 探测：每 1s 一个 Ping（观看端原样回 Pong 并附丢帧统计）
+                    // RTT 探测：每 1s 一个 Ping（观看端原样回 Pong 并附丢帧统计）；
+                    // 顺带携带本端 EMA RTT，观看页状态栏展示端到端延迟
                     if last_ping.elapsed() >= Duration::from_millis(1000) {
                         last_ping = Instant::now();
                         let t = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        let _ = cap_out.try_send(RemoteOut::Control(RemoteWire::Ping { t }));
+                        let rtt = cap_params.lock().unwrap().rtt_ms;
+                        let _ = cap_out.try_send(RemoteOut::Control(RemoteWire::Ping { t, rtt }));
                     }
                     let spent = t0.elapsed();
                     let wait = Duration::from_millis(interval)
@@ -1733,6 +1747,12 @@ pub async fn handle_remote_socket(
                             || codec == crate::encoder::CODEC_H264
                         {
                             codec_flag.store(codec, Ordering::Relaxed);
+                            // 切编码即重设节奏：H.264（硬编）编码便宜，直接上 30fps 档；
+                            // JPEG 单线程软编贵，维持 20fps
+                            let mut p = params.lock().unwrap();
+                            p.interval_ms =
+                                if codec == crate::encoder::CODEC_H264 { 33 } else { 50 };
+                            p.bitrate_scale = 1.0;
                         }
                     }
                     Ok(RemoteIn::Control(RemoteWire::RemoteSelectMonitor { index })) => {
@@ -2582,10 +2602,10 @@ async fn remote_connect_inner(
                             serde_json::json!({"t": "cursor", "x": x, "y": y}).to_string(),
                         ));
                     }
-                    Ok(RemoteIn::Control(RemoteWire::Ping { t })) => {
-                        // RTT 探测 → 观看页（原样回 pong，附观看端丢帧统计）
+                    Ok(RemoteIn::Control(RemoteWire::Ping { t, rtt })) => {
+                        // RTT 探测 → 观看页（原样回 pong，附观看端丢帧统计；rtt 供状态栏显示）
                         let _ = bridge_tx.send(BridgeMsg::Json(
-                            serde_json::json!({"t": "ping", "ts": t}).to_string(),
+                            serde_json::json!({"t": "ping", "ts": t, "rtt": rtt}).to_string(),
                         ));
                     }
                     Ok(RemoteIn::Control(RemoteWire::RemoteFileAck { id, ok })) => {
