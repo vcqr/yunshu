@@ -9,7 +9,10 @@
 //! 密码三种模式：临时密码（每次启动随机生成）/ 固定密码（pbkdf2 落盘）/ 一次性密码
 //! （反向协助现场生成，用后即焚）。错误 5 次锁 10 分钟（IP 维度）。
 //!
-//! 采集：xcap 主屏截屏 → 盒滤波缩放 → jpeg-encoder（约 20fps，画面不变跳帧）。
+//! 采集：macOS 走 AVCaptureSession 推送式拉取（晚帧由 AVFoundation 丢弃，
+//! 失败回退同步截屏），其余平台同步截屏 → 盒滤波缩放 → JPEG/H.264 编码
+//! （8-25fps 自适应，画面不变跳帧）。视频帧走「最新者胜」信箱：链路慢时
+//! 旧帧被覆盖而非排队出网，观看端延迟上限约一帧。
 //! 注入：enigo 独立线程（Enigo 不保证 Send，生命周期与会话绑定）。
 //! 坐标协议：输入事件一律传 [0,1] 归一化坐标，受控端映射到 enigo 绝对坐标空间
 //! （macOS 为逻辑点，Windows 为物理像素），天然规避 DPI/分辨率差异。
@@ -22,7 +25,7 @@ use snow::TransportState;
 use std::collections::HashMap;
 use std::io::Write as IoWrite;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
@@ -199,6 +202,14 @@ pub enum RemoteIn {
         offset: u64,
         data: Vec<u8>,
     },
+}
+
+/// 完整编码帧信箱载荷：seq 单调递增。信箱只保留最新一帧（最新者胜），
+/// 主循环取帧后由采集线程继续产出下一帧
+pub struct FrameMsg {
+    pub seq: u32,
+    pub codec: u8,
+    pub data: Vec<u8>,
 }
 
 fn seal_plain(noise: &Mutex<TransportState>, plain: &[u8]) -> Result<Vec<u8>, String> {
@@ -564,9 +575,48 @@ pub trait ScreenSource: Send {
     }
 }
 
+/// macOS 推送式采集引擎：AVCaptureSession 常驻运行，晚帧由 AVFoundation 丢弃；
+/// capture() 以短超时拉取最新帧——rendezvous 通道背压使转换频率跟随采集频率，
+/// 静止画面不出帧时回退同步截屏
+#[cfg(target_vendor = "apple")]
+struct PushCapture {
+    recorder: SendRecorder,
+    rx: std::sync::mpsc::Receiver<xcap::Frame>,
+}
+
+#[cfg(target_vendor = "apple")]
+struct SendRecorder(xcap::VideoRecorder);
+// VideoRecorder 持有 AVCaptureSession（Retained 非 Send），创建后整体随
+// XcapSource move 进采集线程，全程单线程访问
+#[cfg(target_vendor = "apple")]
+unsafe impl Send for SendRecorder {}
+
+#[cfg(target_vendor = "apple")]
+impl PushCapture {
+    fn new(m: &SendMonitor) -> Option<Self> {
+        let (recorder, rx) = m.0.video_recorder().ok()?;
+        // startRunning 阻塞数十至数百 ms：仅会话建立/显示器切换时发生
+        recorder.start().ok()?;
+        Some(PushCapture {
+            recorder: SendRecorder(recorder),
+            rx,
+        })
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+impl Drop for PushCapture {
+    fn drop(&mut self) {
+        self.recorder.0.stop().ok();
+    }
+}
+
 pub struct XcapSource {
     monitors: Vec<SendMonitor>,
     current: usize,
+    /// 推送采集引擎（macOS）；创建失败回退同步截屏
+    #[cfg(target_vendor = "apple")]
+    push: Option<PushCapture>,
 }
 
 /// xcap::Monitor 因内部裸指针未实现 Send，但其字段均为进程级资源 ID
@@ -590,7 +640,20 @@ impl XcapSource {
             .iter()
             .position(|m| m.0.is_primary().unwrap_or(false))
             .unwrap_or(0);
-        Some(XcapSource { monitors, current })
+        #[cfg(target_vendor = "apple")]
+        let push = match PushCapture::new(&monitors[current]) {
+            Some(p) => Some(p),
+            None => {
+                tracing::debug!("推送式屏幕采集不可用，回退同步截屏");
+                None
+            }
+        };
+        Some(XcapSource {
+            monitors,
+            current,
+            #[cfg(target_vendor = "apple")]
+            push,
+        })
     }
 }
 
@@ -606,6 +669,21 @@ impl ScreenSource for XcapSource {
     }
 
     fn capture(&mut self) -> Option<Frame> {
+        #[cfg(target_vendor = "apple")]
+        if let Some(push) = self.push.as_ref() {
+            // 拉取最新帧：delegate 的 rendezvous send 保证拿到的是刚出的一帧；
+            // 超时（画面静止 session 不出帧）回退同步截屏
+            if let Ok(f) = push.rx.recv_timeout(Duration::from_millis(50))
+                && f.width > 0
+                && f.raw.len() == (f.width * f.height * 4) as usize
+            {
+                return Some(Frame {
+                    width: f.width,
+                    height: f.height,
+                    rgba: f.raw,
+                });
+            }
+        }
         let img = self.monitors.get(self.current)?.0.capture_image().ok()?;
         Some(Frame {
             width: img.width(),
@@ -631,6 +709,11 @@ impl ScreenSource for XcapSource {
         let i = index as usize;
         if i < self.monitors.len() {
             self.current = i;
+            // 推送采集随显示器重建（旧 session 由 PushCapture::drop 停止释放）
+            #[cfg(target_vendor = "apple")]
+            {
+                self.push = PushCapture::new(&self.monitors[i]);
+            }
             true
         } else {
             false
@@ -961,6 +1044,8 @@ pub struct ViewingSession {
     pub view_token: String,
     pub closed: Arc<AtomicBool>,
     pub out: tokio::sync::mpsc::Sender<RemoteOut>,
+    /// 文件回传推送通道：与控制消息隔离的 FIFO，大块文件数据不阻塞键鼠/画质
+    pub file_out: tokio::sync::mpsc::Sender<RemoteOut>,
     pub bridge: tokio::sync::broadcast::Sender<BridgeMsg>,
     /// 当前视频编码（0=JPEG 1=H.264）
     pub codec: AtomicU8,
@@ -1307,30 +1392,45 @@ pub async fn handle_remote_socket(
         side: "controlled".into(),
     });
 
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<RemoteOut>(256);
+    // 出站分两路，互不阻塞：
+    // - out_tx 小控制消息（光标/Ping/剪贴板/文件邀请应答等），FIFO
+    // - frame_rx 视频帧「最新者胜」信箱：链路慢时旧帧被覆盖而非排队，
+    //   端到端延迟上限约一帧（多帧 FIFO 积压是延迟劣化的根源）。
+    // 文件回传的发送侧只在控制端（本端只收文件块，走入站流）
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<RemoteOut>(128);
+    let (frame_tx, mut frame_rx) = tokio::sync::watch::channel::<Option<Arc<FrameMsg>>>(None);
+    // 主循环已取走的帧 seq：采集线程据此判断上一帧是否滞留（滞留则跳过采集）
+    let sent_seq = Arc::new(AtomicU32::new(0));
+    // 发送侧窗口统计（主循环累计、采集线程结算消费）：已发帧数 / 每帧发送耗时 ms
+    let send_frames = Arc::new(AtomicU64::new(0));
+    let send_ms = Arc::new(AtomicU64::new(0));
     let input_tx = spawn_input_thread(bounds.clone());
     // 会话级编码格式（观看端能力协商后经 RemoteUseCodec 更新）；显示器切换请求
     let codec_flag = Arc::new(std::sync::atomic::AtomicU8::new(crate::encoder::CODEC_JPEG));
     let monitor_switch = Arc::new(Mutex::new(None::<u32>));
 
-    // ---- 采集线程：截屏 → 缩放 → 编码（JPEG/H.264）→ 分块投递 ----
-    // 自适应：按编码耗时与通道丢帧在 quality 40..=80 / interval 40..=80ms 间浮动；
-    // 拥塞丢帧后强推关键帧，保证观看端尽快恢复可解码流。
+    // ---- 采集线程：截屏 → 缩放 → 编码 → 投递最新帧信箱 ----
+    // 自适应：按编码耗时、发送耗时（链路吞吐的直接反映）与 RTT/观看端丢帧
+    // 分层降质，连续稳定再回升。上一帧未被主循环取走（链路滞后）时跳过采集
+    // 编码——信箱只保最新帧，不为会被覆盖的帧烧 CPU。
     {
         let cap_killed = killed.clone();
         let cap_params = params.clone();
         let cap_codec = codec_flag.clone();
         let cap_monitor = monitor_switch.clone();
         let cap_bounds = bounds.clone();
-        // tokio mpsc：采集线程用 try_send（同步上下文安全），relay 用 recv().await
-        // 正确让出 worker——std 阻塞 recv 在静止画面下会把 worker 扣为人质
-        // （帧间隔可达秒级），饿死同 worker LIFO 槽里的其他任务（观看桥/会话主循环）
-        let (cap_tx, mut cap_rx) = tokio::sync::mpsc::channel::<RemoteOut>(64);
+        let cap_out = out_tx.clone();
+        let cap_frame_tx = frame_tx.clone();
+        let cap_sent_seq = sent_seq.clone();
+        let cap_send_frames = send_frames.clone();
+        let cap_send_ms = send_ms.clone();
         let capture_thread = std::thread::Builder::new()
             .name("remote-capture".into())
             .spawn(move || {
                 let mut last_hash = 0u64;
                 let mut seq = 0u32;
+                // 已投递信箱的最新帧 seq；与主循环上报的已取 seq 不一致 = 滞留
+                let mut queued_seq = 0u32;
                 // 心跳补帧计时：画面静止时周期性补发可解码帧
                 let mut last_sent = Instant::now();
                 // 光标回传状态（观看端软光标）
@@ -1339,9 +1439,7 @@ pub async fn handle_remote_socket(
                 let mut encoder: Option<Box<dyn crate::encoder::VideoEncoder>> = None;
                 let mut enc_width = 0u32;
                 let mut enc_height = 0u32;
-                let mut force_next = false; // 拥塞丢帧后下一帧强推关键帧
                 // 自适应统计窗口（每 20 帧结算一次）
-                let mut stat_drops = 0u32;
                 let mut stat_frames = 0u32;
                 let mut stat_encode_ms = 0u64;
                 let mut stable_cycles = 0u32;
@@ -1369,7 +1467,7 @@ pub async fn handle_remote_socket(
                         };
                         // 编码器随分辨率重建
                         encoder = None;
-                        let _ = cap_tx.try_send(RemoteOut::Control(RemoteWire::RemoteScreen {
+                        let _ = cap_out.try_send(RemoteOut::Control(RemoteWire::RemoteScreen {
                             screen: new_screen,
                         }));
                         tracing::info!("远程控制切换到显示器 #{index}");
@@ -1379,7 +1477,10 @@ pub async fn handle_remote_socket(
                         let p = cap_params.lock().unwrap();
                         (p.max_width, p.quality, p.interval_ms)
                     };
-                    if let Some(f) = source.capture() {
+                    // 上一帧滞留信箱（链路没跟上）：跳过本轮采集编码——
+                    // 端到端永远只发最新帧，也不为会被覆盖的帧烧 CPU
+                    let pending = queued_seq != cap_sent_seq.load(Ordering::Relaxed);
+                    if !pending && let Some(f) = source.capture() {
                         let scaled = scale_frame(&f, max_side);
                         let hash = fnv_hash(&scaled.rgba);
                         // 静止画面每秒补发一帧（H.264 下强制 IDR）：首帧可能早于观看端
@@ -1426,57 +1527,46 @@ pub async fn handle_remote_socket(
                                 }
                             }
                             let te = Instant::now();
-                            let encoded = encoder
-                                .as_mut()
-                                .and_then(|e| e.encode(&scaled, force_next || heartbeat));
+                            let encoded = encoder.as_mut().and_then(|e| e.encode(&scaled, heartbeat));
                             stat_encode_ms += te.elapsed().as_millis() as u64;
-                            force_next = false;
                             if let Some(ef) = encoded {
                                 stat_frames += 1;
                                 seq = seq.wrapping_add(1);
-                                let total = ef.data.len().div_ceil(CHUNK_SIZE) as u16;
-                                let mut sent_any = false;
-                                for (i, part) in ef.data.chunks(CHUNK_SIZE).enumerate() {
-                                    let msg = RemoteOut::FrameChunk {
-                                        seq,
-                                        idx: i as u16,
-                                        total,
-                                        codec: want_codec,
-                                        data: part.to_vec(),
-                                    };
-                                    match cap_tx.try_send(msg) {
-                                        Ok(()) => sent_any = true,
-                                        Err(_) => {
-                                            stat_drops += 1;
-                                            break; // 通道满：丢掉当前帧剩余分块，等下一帧
-                                        }
-                                    }
-                                }
-                                if sent_any {
-                                    last_hash = hash;
-                                    last_sent = Instant::now();
-                                } else {
-                                    // 整帧被丢：指纹回退 + 下帧强推关键帧（观看端尽快恢复）
-                                    last_hash = hash.wrapping_add(1);
-                                    force_next = true;
-                                }
+                                queued_seq = seq;
+                                // 最新者胜：上一帧未被取走时直接覆盖（而非排队出网）
+                                let _ = cap_frame_tx.send(Some(Arc::new(FrameMsg {
+                                    seq,
+                                    codec: want_codec,
+                                    data: ef.data,
+                                })));
+                                last_hash = hash;
+                                last_sent = Instant::now();
                             }
                             // ---- 自适应（每 20 帧结算；输入：RTT / 观看端丢帧 /
-                            // 通道满丢帧 / 编码耗时，分层降质，连续稳定再回升）----
+                            // 发送耗时 / 编码耗时，分层降质，连续稳定再回升）----
                             if stat_frames >= 20 {
                                 let avg_ms = stat_encode_ms / stat_frames.max(1) as u64;
+                                // 每帧发送耗时 = 主循环取帧到写完 WebSocket（含 TCP 背压
+                                // 等待）；超过帧间隔即链路带不动当前码率
+                                let sent = cap_send_frames.swap(0, Ordering::Relaxed);
+                                let s_ms = cap_send_ms.swap(0, Ordering::Relaxed);
+                                let send_ms = s_ms.checked_div(sent).unwrap_or(0);
                                 let mut p = cap_params.lock().unwrap();
                                 let rtt = p.rtt_ms;
                                 let vlost = p.viewer_lost;
                                 p.viewer_lost = 0;
-                                if stat_drops > 0 || vlost > 2 || rtt > 250 {
-                                    // 强降：通道拥塞或观看端明显跟不上
+                                if vlost > 2 || rtt > 250 || send_ms * 5 > interval * 6 {
+                                    // 强降：链路带不动（发送耗时超帧间隔 1.2 倍）或观看端明显跟不上
                                     p.quality = p.quality.saturating_sub(12).max(40);
                                     p.interval_ms = (p.interval_ms + 12).min(120);
                                     p.bitrate_scale = (p.bitrate_scale * 0.7).max(0.3);
                                     stable_cycles = 0;
-                                } else if rtt > 120 || vlost > 0 || avg_ms * 10 > p.interval_ms * 9 {
-                                    // 温和降：RTT 偏高 / 观看端偶发丢帧 / 编码吃紧
+                                } else if rtt > 120
+                                    || vlost > 0
+                                    || send_ms * 5 > interval * 3
+                                    || avg_ms * 10 > p.interval_ms * 9
+                                {
+                                    // 温和降：RTT 偏高 / 观看端偶发丢帧 / 发送或编码吃紧
                                     p.quality = p.quality.saturating_sub(6).max(40);
                                     p.interval_ms = (p.interval_ms + 6).min(120);
                                     p.bitrate_scale = (p.bitrate_scale * 0.85).max(0.3);
@@ -1507,7 +1597,6 @@ pub async fn handle_remote_socket(
                                         last_sent_bps = want;
                                     }
                                 }
-                                stat_drops = 0;
                                 stat_frames = 0;
                                 stat_encode_ms = 0;
                             }
@@ -1518,7 +1607,7 @@ pub async fn handle_remote_socket(
                     let b = source.input_bounds();
                     if b != *cap_bounds.lock().unwrap() {
                         *cap_bounds.lock().unwrap() = b;
-                        let _ = cap_tx.try_send(RemoteOut::Control(RemoteWire::RemoteScreen {
+                        let _ = cap_out.try_send(RemoteOut::Control(RemoteWire::RemoteScreen {
                             screen: ScreenInfo {
                                 width: 0,
                                 height: 0,
@@ -1539,7 +1628,7 @@ pub async fn handle_remote_socket(
                         if moved {
                             last_cursor = Some((cx, cy));
                             last_cursor_sent = Instant::now();
-                            let _ = cap_tx.try_send(RemoteOut::Control(
+                            let _ = cap_out.try_send(RemoteOut::Control(
                                 RemoteWire::RemoteCursor { x: cx, y: cy },
                             ));
                         }
@@ -1551,7 +1640,7 @@ pub async fn handle_remote_socket(
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        let _ = cap_tx.try_send(RemoteOut::Control(RemoteWire::Ping { t }));
+                        let _ = cap_out.try_send(RemoteOut::Control(RemoteWire::Ping { t }));
                     }
                     let spent = t0.elapsed();
                     let wait = Duration::from_millis(interval)
@@ -1573,14 +1662,6 @@ pub async fn handle_remote_socket(
                 return;
             }
         }
-        let out_tx2 = out_tx.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = cap_rx.recv().await {
-                if out_tx2.send(msg).await.is_err() {
-                    break;
-                }
-            }
-        });
     }
 
     // ---- 受控端剪贴板监视：变化即推给控制端 ----
@@ -1614,7 +1695,8 @@ pub async fn handle_remote_socket(
         });
     }
 
-    // ---- 主循环：收（输入/画质/剪贴板/结束）发（帧）----
+    // ---- 主循环：收（输入/画质/剪贴板/结束）发（控制消息/视频帧）----
+    // 控制消息走 FIFO 分支，视频帧走最新帧信箱单独发送
     let mut end_reason = "对端断开".to_string();
     loop {
         tokio::select! {
@@ -1707,6 +1789,48 @@ pub async fn handle_remote_socket(
                     end_reason = "内部通道关闭".into();
                     break;
                 }
+            },
+            frame = frame_rx.changed() => match frame {
+                Ok(()) => {
+                    let Some(fm) = frame_rx.borrow_and_update().clone() else {
+                        continue;
+                    };
+                    // 取帧即上报：采集线程据此解除滞留、继续产出下一帧
+                    sent_seq.store(fm.seq, Ordering::Relaxed);
+                    // 发送耗时计入自适应窗口（含 TCP 背压等待，链路带不动的直接信号）
+                    let t_send = Instant::now();
+                    let total = fm.data.len().div_ceil(CHUNK_SIZE) as u16;
+                    let mut failed = false;
+                    for (i, part) in fm.data.chunks(CHUNK_SIZE).enumerate() {
+                        let chunk = RemoteOut::FrameChunk {
+                            seq: fm.seq,
+                            idx: i as u16,
+                            total,
+                            codec: fm.codec,
+                            data: part.to_vec(),
+                        };
+                        match seal_msg(&noise, &chunk) {
+                            Ok(frame) => {
+                                if sink.send(Message::Binary(frame.into())).await.is_err() {
+                                    end_reason = "发送失败".into();
+                                    failed = true;
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("远程控制加密失败: {e}");
+                                failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    send_frames.fetch_add(1, Ordering::Relaxed);
+                    send_ms.fetch_add(t_send.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    if failed {
+                        break;
+                    }
+                }
+                Err(_) => break, // 信箱关闭：采集线程已退出，走正常收尾
             },
             _ = tokio::time::sleep(Duration::from_millis(200)) => {
                 if killed.load(Ordering::Relaxed) {
@@ -2125,7 +2249,7 @@ fn start_remote_file_push(st: &Arc<AppState>, id: String, src: crate::server::Ba
             .unwrap()
             .viewing
             .as_ref()
-            .map(|v| v.out.clone());
+            .map(|v| v.file_out.clone());
         let cancel = st
             .remote
             .lock()
@@ -2381,7 +2505,10 @@ async fn remote_connect_inner(
     let view_token = uuid::Uuid::new_v4().simple().to_string();
     let closed = Arc::new(AtomicBool::new(false));
     let (bridge_tx, _) = tokio::sync::broadcast::channel::<BridgeMsg>(48);
+    // 出站分两路：out_tx 键鼠/画质等小消息，file_tx 文件回传大块——
+    // 文件推送期间键鼠延迟不受影响
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<RemoteOut>(256);
+    let (file_tx, mut file_rx) = tokio::sync::mpsc::channel::<RemoteOut>(64);
     st.remote.lock().unwrap().viewing = Some(ViewingSession {
         peer_id: machine.to_string(),
         name: pc_name.clone(),
@@ -2389,6 +2516,7 @@ async fn remote_connect_inner(
         view_token: view_token.clone(),
         closed: closed.clone(),
         out: out_tx.clone(),
+        file_out: file_tx.clone(),
         bridge: bridge_tx.clone(),
         codec: AtomicU8::new(crate::encoder::CODEC_JPEG),
         viewer_caps: Mutex::new(HashMap::new()),
@@ -2416,6 +2544,7 @@ async fn remote_connect_inner(
     ));
 
     // ---- 主循环：收帧转发观看桥 / 发输入 ----
+    // 键鼠等小消息与文件回传块各走 FIFO 分支，互不阻塞
     let mut assembler = FrameAssembler::default();
     let mut end_reason = "观看已结束".to_string();
     loop {
@@ -2506,6 +2635,25 @@ async fn remote_connect_inner(
                 }
             },
             out = out_rx.recv() => match out {
+                Some(msg) => match seal_msg(&noise, &msg) {
+                    Ok(frame) => {
+                        if sink.send(tokio_tungstenite::tungstenite::Message::binary(frame)).await.is_err() {
+                            end_reason = "发送失败".into();
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("远程控制加密失败: {e}");
+                        end_reason = "连接异常".into();
+                        break;
+                    }
+                },
+                None => {
+                    end_reason = "内部通道关闭".into();
+                    break;
+                }
+            },
+            file = file_rx.recv() => match file {
                 Some(msg) => match seal_msg(&noise, &msg) {
                     Ok(frame) => {
                         if sink.send(tokio_tungstenite::tungstenite::Message::binary(frame)).await.is_err() {
