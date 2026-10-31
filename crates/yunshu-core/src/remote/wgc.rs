@@ -37,7 +37,7 @@ impl GraphicsCaptureApiHandler for WgcHandler {
         frame: &mut WgcFrame,
         _capture_control: windows_capture::graphics_capture_api::InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        let (w, h) = (frame.width.max(0) as u32, frame.height.max(0) as u32);
+        let (w, h) = (frame.width().max(0) as u32, frame.height().max(0) as u32);
         if w == 0 || h == 0 {
             return Ok(());
         }
