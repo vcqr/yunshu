@@ -539,10 +539,10 @@ fn save_settings(
     s.device_name = device_name;
     s.port = port;
     s.save_dir = save_dir;
-    // 代理模式合法性兜底：非预期值一律按跟随系统处理
-    s.proxy_mode = match proxy_mode.as_deref().unwrap_or("system") {
-        "direct" | "custom" => proxy_mode.unwrap(),
-        _ => "system".into(),
+    // 代理模式合法性兜底：非预期值一律按直连处理（默认直连）
+    s.proxy_mode = match proxy_mode.as_deref().unwrap_or("direct") {
+        "system" | "custom" => proxy_mode.unwrap(),
+        _ => "direct".into(),
     };
     s.proxy_url = proxy_url.unwrap_or_default();
     s.no_proxy = no_proxy.unwrap_or_default();

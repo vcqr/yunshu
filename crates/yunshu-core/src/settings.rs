@@ -17,7 +17,7 @@ pub struct Settings {
     pub stealth_mode: bool,
     /// 远程控制固定密码（pbkdf2-sha256 加盐哈希，格式 pbkdf2-sha256$rounds$salt$hash）
     pub remote_fixed_password_hash: Option<String>,
-    /// 代理模式：direct 直连 | system 跟随系统（默认） | custom 自定义
+    /// 代理模式：direct 直连（默认） | system 跟随系统 | custom 自定义
     pub proxy_mode: String,
     /// 自定义代理地址（http/https/socks5://host:port，仅 custom 模式生效）
     pub proxy_url: String,
@@ -39,7 +39,7 @@ impl Default for Settings {
             dnd_mode: true,
             stealth_mode: false,
             remote_fixed_password_hash: None,
-            proxy_mode: "system".into(),
+            proxy_mode: "direct".into(),
             proxy_url: String::new(),
             no_proxy: String::new(),
         }

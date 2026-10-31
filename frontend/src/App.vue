@@ -70,13 +70,13 @@ const settingsForm = ref({
   device_name: '', port: 34256, save_dir: '', autostart: false, dnd_mode: false,
   stealth_mode: false,
   machine_id: '', remote_fixed_password: '', has_fixed_password: false,
-  proxy_mode: 'system', proxy_url: '', no_proxy: '',
+  proxy_mode: 'direct', proxy_url: '', no_proxy: '',
 })
 
-/* 代理三态：直连 / 跟随系统 / 自定义（企业网络常用） */
+/* 代理三态：直连（默认）/ 跟随系统 / 自定义（企业网络常用） */
 const proxyOptions = [
-  { value: 'direct', label: '直连', desc: '不使用任何代理，直接连接网络' },
-  { value: 'system', label: '跟随系统', desc: '读取操作系统代理设置与环境变量（默认）' },
+  { value: 'direct', label: '直连', desc: '不使用任何代理，直接连接网络（默认）' },
+  { value: 'system', label: '跟随系统', desc: '读取操作系统代理设置与环境变量' },
   { value: 'custom', label: '自定义', desc: '手动指定代理地址与 NO_PROXY 例外列表' },
 ]
 
@@ -88,7 +88,7 @@ async function openSettings() {
       autostart: s.autostart, dnd_mode: s.dnd_mode, stealth_mode: !!s.stealth_mode,
       machine_id: s.machine_id || '',
       remote_fixed_password: '', has_fixed_password: !!s.remote_fixed_password_hash,
-      proxy_mode: ['direct', 'system', 'custom'].includes(s.proxy_mode) ? s.proxy_mode : 'system',
+      proxy_mode: ['direct', 'system', 'custom'].includes(s.proxy_mode) ? s.proxy_mode : 'direct',
       proxy_url: s.proxy_url || '',
       no_proxy: s.no_proxy || '',
     }

@@ -723,7 +723,7 @@ pub async fn push_control(st: &AppState, peer_id: &str, wire: PigeonWire) -> boo
 }
 
 pub fn peers_event(st: &AppState) -> CoreEvent {
-    let mut v: Vec<PigeonPeerInfo> = {
+    let v: Vec<PigeonPeerInfo> = {
         let known = st.pigeon_peers.lock().unwrap();
         let conns = st.pigeon_conns.lock().unwrap();
         let manual = st.manual_hosts.lock().unwrap();
