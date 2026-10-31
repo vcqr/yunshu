@@ -9,8 +9,7 @@
 //! → ProcessOutput），encode() 内同步泵事件；任一步失败由 make_encoder 回退
 //! openh264 软编。真机行为待 Windows 实测（CI 只保证编译）。
 
-use std::ffi::c_void;
-use std::ptr::{null_mut, NonNull};
+use std::ptr::null_mut;
 use std::mem::ManuallyDrop;
 use std::time::{Duration, Instant};
 

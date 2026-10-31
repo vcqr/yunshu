@@ -9,7 +9,7 @@ use super::{Frame, ScreenSource, XcapSource};
 use std::sync::{Arc, Mutex};
 use windows_capture::{
     capture::{CaptureControl, Context, GraphicsCaptureApiHandler},
-    frame::Frame,
+    frame::Frame as WgcFrame,
     monitor::Monitor,
     settings::{
         ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
@@ -34,8 +34,8 @@ impl GraphicsCaptureApiHandler for WgcHandler {
 
     fn on_frame_arrived(
         &mut self,
-        frame: &mut Frame,
-        _capture_control: windows_capture::capture::InternalCaptureControl,
+        frame: &mut WgcFrame,
+        _capture_control: windows_capture::graphics_capture_api::InternalCaptureControl,
     ) -> Result<(), Self::Error> {
         let (w, h) = (frame.width.max(0) as u32, frame.height.max(0) as u32);
         if w == 0 || h == 0 {
