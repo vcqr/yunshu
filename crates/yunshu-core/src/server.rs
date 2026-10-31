@@ -93,6 +93,8 @@ pub struct AppState {
     pub(crate) trust_rejected: Mutex<std::collections::HashSet<String>>,
     // ---- 远程控制（PC↔PC 屏幕共享 + 键鼠注入）----
     pub(crate) remote: Mutex<crate::remote::RemoteState>,
+    /// 局域网聊天落库（飞鸽单聊/广播/手机文本，收发两侧）
+    pub(crate) chat_log: crate::chatlog::ChatLog,
 }
 
 /// 正在接收的加密推送批次：offer_id -> 组装状态（半成品在 .yunshu-parts/{id}/，manifest 支持续传）
@@ -239,6 +241,7 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
     let addr = format!("{}:{}", ip, cfg.port);
 
     let data_dir = crate::config_dir().unwrap_or_else(std::env::temp_dir);
+    let chat_db = data_dir.join("chat.db");
     let state = Arc::new(AppState {
         cfg: cfg.clone(),
         // 飞鸽发现身份用稳定机器 ID（静态密钥指纹）：随启动随机会导致对端每次
@@ -279,6 +282,7 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
         remote: Mutex::new(crate::remote::RemoteState::new(
             crate::settings::Settings::load_or_default().remote_fixed_password_hash,
         )),
+        chat_log: crate::chatlog::ChatLog::open(&chat_db),
     });
 
     state.emit(CoreEvent::ServerStarted { addr: addr.clone() });
@@ -375,6 +379,13 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                         }
                         let chars = text.chars().count();
                         st.push_ws(&WsOut::PcText { text: text.clone() });
+                        st.chat_log.record(
+                            crate::chatlog::ChatChannel::Phone,
+                            crate::chatlog::ChatDirection::Out,
+                            "phone",
+                            "手机",
+                            &text,
+                        );
                         st.new_transfer(TransferInfo::text(
                             uuid::Uuid::new_v4().simple().to_string(),
                             Direction::ToPhone,
@@ -410,9 +421,16 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                         let sent = crate::pigeon::try_push(
                             &st,
                             &peer_id,
-                            crate::protocol::PigeonWire::PcText { text },
+                            crate::protocol::PigeonWire::PcText { text: text.clone() },
                         );
                         if sent {
+                            st.chat_log.record(
+                                crate::chatlog::ChatChannel::Peer,
+                                crate::chatlog::ChatDirection::Out,
+                                &peer_id,
+                                &name,
+                                &text,
+                            );
                             st.new_transfer(TransferInfo::text(
                                 uuid::Uuid::new_v4().simple().to_string(),
                                 Direction::ToPhone,
@@ -506,6 +524,13 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                             sent
                         };
                         if n > 0 {
+                            st.chat_log.record(
+                                crate::chatlog::ChatChannel::Broadcast,
+                                crate::chatlog::ChatDirection::Out,
+                                "broadcast",
+                                &st.cfg.pc_name,
+                                &text,
+                            );
                             st.new_transfer(TransferInfo::text(
                                 uuid::Uuid::new_v4().simple().to_string(),
                                 Direction::ToPhone,
@@ -1610,6 +1635,13 @@ async fn handle_socket(st: Arc<AppState>, mut socket: WebSocket) {
                 }
                 // 手机发来的文本按普通聊天消息处理，不写入电脑剪贴板
                 let chars = text.chars().count();
+                st.chat_log.record(
+                    crate::chatlog::ChatChannel::Phone,
+                    crate::chatlog::ChatDirection::In,
+                    "phone",
+                    "手机",
+                    &text,
+                );
                 st.new_transfer(TransferInfo::text(
                     uuid::Uuid::new_v4().simple().to_string(),
                     Direction::FromPhone,

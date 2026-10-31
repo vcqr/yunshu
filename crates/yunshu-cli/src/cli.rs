@@ -9,7 +9,7 @@ use yunshu_core::UiRequest;
 const HELP: &str = "命令：
   peers                        查看飞鸽主机列表
   status                       本机状态（服务/传输/待确认事项/最近聊天）
-  log [条数]                   查看最近收到的聊天（默认 20 条）
+  log [条数]                   查看最近聊天记录（SQLite 落库，收发双向）
   send <peer> <文本…>           发加密文本（peer 支持 id/机器ID 前缀或精确名字）
   sendfile <peer> <路径…>       发文件/文件夹（空格分隔多个，路径不能含空格）
   accept <offer_id前缀>         接受来件批次
@@ -225,6 +225,30 @@ fn status(shared: &Shared) {
 }
 
 fn log(shared: &Shared, n: usize) {
+    // 优先读 SQLite 聊天记录库（收发双向、跨重启留存）；库不存在退回本会话内存镜像
+    let db = yunshu_core::config_dir()
+        .map(|d| d.join("chat.db"))
+        .and_then(|p| yunshu_core::chatlog::ChatLog::open_readonly(&p));
+    if let Some(l) = db {
+        let entries = l.recent(None, n);
+        if entries.is_empty() {
+            println!("（聊天记录为空）");
+            return;
+        }
+        for e in entries {
+            let time = chrono::DateTime::from_timestamp_millis(e.ts)
+                .map(|t| t.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+                .unwrap_or_default();
+            let dir = if e.direction == "out" { "→" } else { "←" };
+            let chan = match e.channel.as_str() {
+                "broadcast" => "（广播）",
+                "phone" => "（手机）",
+                _ => "",
+            };
+            println!("{time} {dir}{chan}「{}」{}", e.peer_name, e.text);
+        }
+        return;
+    }
     let m = shared.mirror.lock().unwrap();
     let skip = m.chats.len().saturating_sub(n);
     for c in m.chats.iter().skip(skip) {

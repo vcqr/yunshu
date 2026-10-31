@@ -39,6 +39,7 @@ md-5 = "0.10"
 base64 = "0.22"
 # install_rustls_provider()：reqwest(ring) 与 axum-server(aws-lc-rs) 同存时消歧
 rustls = "0.23"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 # VideoToolbox 硬件 H.264 编码（encoder.rs 的 VtH264Encoder）

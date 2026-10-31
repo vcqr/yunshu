@@ -1299,6 +1299,13 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
     match msg {
         PigeonIn::Control(PigeonWire::PcText { text }) => {
             let peer_name = link_name(st, peer_id);
+            st.chat_log.record(
+                crate::chatlog::ChatChannel::Peer,
+                crate::chatlog::ChatDirection::In,
+                peer_id,
+                &peer_name,
+                &text,
+            );
             tracing::info!("收到「{peer_name}」的聊天消息：{text}");
             st.emit(CoreEvent::ChatFromPc {
                 peer_id: peer_id.to_string(),
@@ -1307,12 +1314,20 @@ async fn dispatch(st: &Arc<AppState>, peer_id: &str, msg: PigeonIn) {
             });
         }
         PigeonIn::Control(PigeonWire::BroadcastText { text }) => {
+            let peer_name = link_name(st, peer_id);
+            // 落库不受防打扰影响：记录层如实反映线上收到的一切消息
+            st.chat_log.record(
+                crate::chatlog::ChatChannel::Broadcast,
+                crate::chatlog::ChatDirection::In,
+                peer_id,
+                &peer_name,
+                &text,
+            );
             // 防打扰：广播消息整体静音（能连上的都是已信任设备，按用户要求一并静音）
             if st.dnd.load(Ordering::Relaxed) {
                 tracing::info!("防打扰：已静音来自「{}」的广播消息", link_name(st, peer_id));
                 return;
             }
-            let peer_name = link_name(st, peer_id);
             tracing::info!("收到「{peer_name}」的广播消息：{text}");
             st.emit(CoreEvent::ChatBroadcast {
                 peer_id: peer_id.to_string(),
@@ -2171,6 +2186,100 @@ pub async fn drop_link(st: Arc<AppState>, peer_id: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 最小可用 AppState（dispatch 落库测试用；配置目录按 tag 隔离避免并行互扰）
+    fn test_state(dnd: bool, tag: &str) -> Arc<AppState> {
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::CoreEvent>();
+        let dir = std::env::temp_dir().join(format!("yunshu_pigeon_test_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir); // 清掉上次运行的残留记录
+        let _ = std::fs::create_dir_all(&dir);
+        Arc::new(AppState {
+            cfg: crate::CoreConfig {
+                port: 0,
+                https_port: 0,
+                save_dir: dir.clone(),
+                pc_name: "测试机".into(),
+                dnd_mode: dnd,
+                stealth_mode: true,
+            },
+            self_id: "self-id".into(),
+            data_dir: dir.join("cfg"),
+            pairing: Mutex::new(crate::pairing::Pairing::default()),
+            conn: Mutex::new(None),
+            offers: Mutex::new(HashMap::new()),
+            transfers: Mutex::new(Vec::new()),
+            progress_last: Mutex::new(HashMap::new()),
+            batches: Mutex::new(HashMap::new()),
+            event_tx: tx,
+            rt_handle: tokio::runtime::Handle::current(),
+            dnd: AtomicBool::new(dnd),
+            dnd_skipped: Mutex::new(HashMap::new()),
+            stealth: AtomicBool::new(true),
+            announce_now: AtomicBool::new(false),
+            pigeon_peers: Mutex::new(HashMap::new()),
+            pigeon_conns: Mutex::new(HashMap::new()),
+            pigeon_connecting: Mutex::new(std::collections::HashSet::new()),
+            manual_hosts: Mutex::new(HashMap::new()),
+            recv_files: tokio::sync::Mutex::new(HashMap::new()),
+            pigeon_incoming: Mutex::new(HashMap::new()),
+            pigeon_ready: Mutex::new(HashMap::new()),
+            pigeon_offers: Mutex::new(HashMap::new()),
+            pigeon_push_cancel: Mutex::new(HashMap::new()),
+            pigeon_push_paused: Mutex::new(HashMap::new()),
+            pigeon_push_resume: Mutex::new(HashMap::new()),
+            pending_trusts: Mutex::new(HashMap::new()),
+            trust_rejected: Mutex::new(std::collections::HashSet::new()),
+            remote: Mutex::new(crate::remote::RemoteState::new(None)),
+            chat_log: crate::chatlog::ChatLog::open(&dir.join("chat.db")),
+        })
+    }
+
+    #[tokio::test]
+    async fn dispatch_records_peer_and_broadcast_chats() {
+        let st = test_state(false, "dispatch_chat");
+        dispatch(
+            &st,
+            "peer-9",
+            PigeonIn::Control(PigeonWire::PcText {
+                text: "单聊进来".into(),
+            }),
+        )
+        .await;
+        dispatch(
+            &st,
+            "peer-9",
+            PigeonIn::Control(PigeonWire::BroadcastText {
+                text: "广播进来".into(),
+            }),
+        )
+        .await;
+        let rows = st.chat_log.recent(None, 10);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].channel, "pigeon");
+        assert_eq!(rows[0].direction, "in");
+        assert_eq!(rows[0].peer_id, "peer-9");
+        assert_eq!(rows[0].text, "单聊进来");
+        assert_eq!(rows[1].channel, "broadcast");
+        assert_eq!(rows[1].direction, "in");
+        assert_eq!(rows[1].text, "广播进来");
+    }
+
+    #[tokio::test]
+    async fn broadcast_recorded_even_when_dnd_mutes() {
+        let st = test_state(true, "dnd_mute");
+        dispatch(
+            &st,
+            "peer-9",
+            PigeonIn::Control(PigeonWire::BroadcastText {
+                text: "被静音也要留痕".into(),
+            }),
+        )
+        .await;
+        let rows = st.chat_log.recent(None, 10);
+        assert_eq!(rows.len(), 1, "防打扰静音不应影响落库: {rows:?}");
+        assert_eq!(rows[0].channel, "broadcast");
+        assert_eq!(rows[0].text, "被静音也要留痕");
+    }
 
     #[test]
     fn batch_id_stable_and_sensitive() {
