@@ -907,41 +907,47 @@ enum InputCmd {
     Paste { text: String },
 }
 
-/// 键名 → enigo::Key（单字符走 Unicode，按受控端本机布局解析）
-fn map_key(name: &str) -> Option<enigo::Key> {
+/// 键名解析结果：具名键直映 enigo 虚拟键码；单字符走 Unicode 文本事件注入
+enum MappedKey {
+    Named(enigo::Key),
+    Char(char),
+}
+
+/// 键名 → MappedKey（单字符按字符注入，具名键按 enigo::Key 注入）
+fn map_key(name: &str) -> Option<MappedKey> {
     use enigo::Key as K;
     Some(match name {
-        "Enter" => K::Return,
-        "Backspace" => K::Backspace,
-        "Delete" => K::Delete,
-        "Tab" => K::Tab,
-        "Escape" => K::Escape,
-        "ArrowUp" => K::UpArrow,
-        "ArrowDown" => K::DownArrow,
-        "ArrowLeft" => K::LeftArrow,
-        "ArrowRight" => K::RightArrow,
-        "Home" => K::Home,
-        "End" => K::End,
-        "PageUp" => K::PageUp,
-        "PageDown" => K::PageDown,
-        "CapsLock" => K::CapsLock,
-        "ControlLeft" | "ControlRight" => K::Control,
-        "ShiftLeft" | "ShiftRight" => K::Shift,
-        "AltLeft" | "AltRight" => K::Alt,
-        "MetaLeft" | "MetaRight" => K::Meta,
-        "F1" => K::F1,
-        "F2" => K::F2,
-        "F3" => K::F3,
-        "F4" => K::F4,
-        "F5" => K::F5,
-        "F6" => K::F6,
-        "F7" => K::F7,
-        "F8" => K::F8,
-        "F9" => K::F9,
-        "F10" => K::F10,
-        "F11" => K::F11,
-        "F12" => K::F12,
-        s if s.chars().count() == 1 => K::Unicode(s.chars().next()?),
+        "Enter" => MappedKey::Named(K::Return),
+        "Backspace" => MappedKey::Named(K::Backspace),
+        "Delete" => MappedKey::Named(K::Delete),
+        "Tab" => MappedKey::Named(K::Tab),
+        "Escape" => MappedKey::Named(K::Escape),
+        "ArrowUp" => MappedKey::Named(K::UpArrow),
+        "ArrowDown" => MappedKey::Named(K::DownArrow),
+        "ArrowLeft" => MappedKey::Named(K::LeftArrow),
+        "ArrowRight" => MappedKey::Named(K::RightArrow),
+        "Home" => MappedKey::Named(K::Home),
+        "End" => MappedKey::Named(K::End),
+        "PageUp" => MappedKey::Named(K::PageUp),
+        "PageDown" => MappedKey::Named(K::PageDown),
+        "CapsLock" => MappedKey::Named(K::CapsLock),
+        "ControlLeft" | "ControlRight" => MappedKey::Named(K::Control),
+        "ShiftLeft" | "ShiftRight" => MappedKey::Named(K::Shift),
+        "AltLeft" | "AltRight" => MappedKey::Named(K::Alt),
+        "MetaLeft" | "MetaRight" => MappedKey::Named(K::Meta),
+        "F1" => MappedKey::Named(K::F1),
+        "F2" => MappedKey::Named(K::F2),
+        "F3" => MappedKey::Named(K::F3),
+        "F4" => MappedKey::Named(K::F4),
+        "F5" => MappedKey::Named(K::F5),
+        "F6" => MappedKey::Named(K::F6),
+        "F7" => MappedKey::Named(K::F7),
+        "F8" => MappedKey::Named(K::F8),
+        "F9" => MappedKey::Named(K::F9),
+        "F10" => MappedKey::Named(K::F10),
+        "F11" => MappedKey::Named(K::F11),
+        "F12" => MappedKey::Named(K::F12),
+        s if s.chars().count() == 1 => MappedKey::Char(s.chars().next()?),
         _ => return None,
     })
 }
@@ -1005,7 +1011,7 @@ fn spawn_input_thread(bounds: Arc<Mutex<(u32, u32)>>) -> std::sync::mpsc::Sender
                         }
                     }
                     InputCmd::Key { name, down } => match map_key(&name) {
-                        Some(k) => {
+                        Some(MappedKey::Named(k)) => {
                             let dir = if down {
                                 enigo::Direction::Press
                             } else {
@@ -1013,13 +1019,29 @@ fn spawn_input_thread(bounds: Arc<Mutex<(u32, u32)>>) -> std::sync::mpsc::Sender
                             };
                             enigo.key(k, dir)
                         }
+                        Some(MappedKey::Char(c)) => {
+                            // enigo 的 Key::Unicode 在 macOS 走 TIS/UCKeyTranslate 布局
+                            // 翻译：中文输入法下 uchr 布局数据为 NULL，UCKeyTranslate
+                            // 解引用空指针段错误（panic=abort 杀掉整个 app）。
+                            // 改走 text() 的 Unicode 字符串事件，不经键盘布局，任意
+                            // 输入法安全；顺带修掉非 ASCII 字符（中文/标点）被映射
+                            // 不到而误打 'a' 的问题。字符键按下即出字，抬起无需动作
+                            if down {
+                                enigo.text(&c.to_string())
+                            } else {
+                                Ok(())
+                            }
+                        }
                         None => Ok(()),
                     },
                     InputCmd::Paste { text } => {
                         crate::clipboard::copy_text(&text);
-                        // 注入平台粘贴组合键（macOS Cmd+V，其余 Ctrl+V）
+                        // 注入平台粘贴组合键（macOS Cmd+V，其余 Ctrl+V）。'v' 不能用
+                        // Key::Unicode：macOS 上同样过 TIS 布局翻译会崩，改传原始
+                        // 虚拟键码（macOS kVK_ANSI_V = 9）；Windows/Linux 的
+                        // Key::Unicode 走 VK/keysym 映射无此问题，保持原样
                         let (modifier, v) = if cfg!(target_os = "macos") {
-                            (enigo::Key::Meta, enigo::Key::Unicode('v'))
+                            (enigo::Key::Meta, enigo::Key::Other(9))
                         } else {
                             (enigo::Key::Control, enigo::Key::Unicode('v'))
                         };
