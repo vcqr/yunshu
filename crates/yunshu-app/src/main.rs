@@ -898,8 +898,16 @@ fn main() {
                                 Some(info.clone());
                             open_viewer_window(&handle, &info);
                         }
-                        CoreEvent::RemoteSessionEnded { side, .. } if side == "controller" => {
-                            *handle.state::<AppState>().remote_view.lock().unwrap() = None;
+                        CoreEvent::RemoteSessionEnded { side, peer_id, .. }
+                            if side == "controller" =>
+                        {
+                            // 按 peer 匹配才清：旧会话重连预算耗尽的事件
+                            // 不得清掉新会话的观看信息（否则新会话断线后无法自动重连）
+                            let state = handle.state::<AppState>();
+                            let mut rv = state.remote_view.lock().unwrap();
+                            if rv.as_ref().is_some_and(|v| &v.peer_id == peer_id) {
+                                *rv = None;
+                            }
                         }
                         // 被控端醒目指示（托盘变红 + 一键断开）
                         CoreEvent::RemoteSessionStarted { name, side, .. }

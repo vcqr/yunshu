@@ -279,7 +279,7 @@ async function apply(ev: any) {
       mutations.closeControlDialog()
       {
         const ip = store.meIp || (store.serverAddr || '').split(':')[0] || ''
-        mutations.setRemoteViewing({ name: ev.name, view_token: ev.view_token, port: ev.port, ip })
+        mutations.setRemoteViewing({ name: ev.name, view_token: ev.view_token, port: ev.port, ip, peerId: ev.peer_id })
       }
       break
     case 'remote_connect_failed':
@@ -297,7 +297,10 @@ async function apply(ev: any) {
         mutations.setRemoteControlled(null)
         toast.info(`远程控制会话已结束（${ev.reason || '对端断开'}）`)
       } else if (ev.side === 'controller') {
-        mutations.setRemoteViewing(null)
+        // 按 peer 匹配才清：旧会话重连预算耗尽的事件不得清掉新会话的观看状态
+        if (!store.remoteViewing || store.remoteViewing.peerId === ev.peer_id) {
+          mutations.setRemoteViewing(null)
+        }
         toast.info(`与「${ev.name}」的远程观看已结束`)
       }
       break

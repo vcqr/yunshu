@@ -1292,7 +1292,15 @@ pub async fn handle_remote_socket(
         } else {
             name.trim().to_string()
         };
-        controller_machine = machine_id;
+        // 身份绑定：自报机器 ID 必须与 Noise 静态公钥派生值一致（诚实客户端恒等）。
+        // 不符以派生值为准并告警——防托盘/UI 显示伪造的控制来源（认证边界仍是密码）
+        let derived = machine_id_from_static(&remote_static);
+        if machine_id != derived {
+            tracing::warn!(
+                "控制端自报机器 ID {machine_id} 与加密通道身份 {derived} 不符，以派生值为准"
+            );
+        }
+        controller_machine = derived;
         // 防打扰：未信任设备凭临时/固定密码连入 → 拒绝；一次性密码是用户现场同意的凭据，不受限
         let dnd_untrusted =
             st.dnd.load(Ordering::Relaxed) && !crate::pigeon::is_pinned(&remote_static);
@@ -1752,6 +1760,8 @@ pub async fn handle_remote_socket(
     // ---- 主循环：收（输入/画质/剪贴板/结束）发（控制消息/视频帧）----
     // 控制消息走 FIFO 分支，视频帧走最新帧信箱单独发送
     let mut end_reason = "对端断开".to_string();
+    // 最近一次收到观看端 Pong 的时刻（None = 尚未收到，看门狗未启用）
+    let mut last_pong: Option<Instant> = None;
     loop {
         tokio::select! {
             msg = stream.next() => match msg {
@@ -1761,6 +1771,7 @@ pub async fn handle_remote_socket(
                     }
                     Ok(RemoteIn::Control(RemoteWire::Pong { t, lost })) => {
                         // RTT 指数滑动平均 + 观看端丢帧累计（采集线程结算窗口消费）
+                        last_pong = Some(Instant::now());
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
@@ -1895,6 +1906,24 @@ pub async fn handle_remote_socket(
             _ = tokio::time::sleep(Duration::from_millis(200)) => {
                 if killed.load(Ordering::Relaxed) {
                     end_reason = "本机断开了会话".into();
+                    // 主动结束显式告知对端：控制端据此区分「被踢」与网络抖动，
+                    // 不进入自动重连。链路已死时发不出去也无妨（对端走自身超时）
+                    if let Ok(frame) = seal_msg(
+                        &noise,
+                        &RemoteOut::Control(RemoteWire::RemoteEnd {
+                            reason: Some("受控端结束了会话".into()),
+                        }),
+                    ) {
+                        let _ = sink.send(Message::Binary(frame.into())).await;
+                    }
+                    break;
+                }
+                // Pong 看门狗：对端静默掉线（合盖/断网，无 FIN）时 TCP 写失败要等
+                // 内核重传超时（分钟级），会话僵死并占着「被控」状态与单会话锁。
+                // Ping 每 1s 一次，15s 无 Pong 即判链路死亡。仅在收到过首个 Pong
+                // 后启用——旧版观看端不回 Pong，不能误杀
+                if last_pong.is_some_and(|t| t.elapsed() > PONG_WATCHDOG) {
+                    end_reason = "观看端无响应（链路超时）".into();
                     break;
                 }
             }
@@ -2413,6 +2442,8 @@ struct SessionOutcome {
 
 /// 重连退避序列（秒）：覆盖 ~30s 内的 Wi-Fi 抖动/AP 切换
 const RECONNECT_DELAYS: [u64; 5] = [1, 2, 4, 8, 15];
+/// 受控端 Pong 看门狗：Ping 每 1s 一次，超过该时长无 Pong 判定链路死亡
+const PONG_WATCHDOG: Duration = Duration::from_secs(15);
 
 pub async fn remote_connect(
     st: Arc<AppState>,
@@ -2432,7 +2463,7 @@ pub async fn remote_connect(
     {
         r.cancelled.store(true, Ordering::Relaxed);
     }
-    let outcome = match remote_connect_inner(&st, &machine, &password).await {
+    let outcome = match remote_connect_inner(&st, &machine, &password, true).await {
         Ok(o) => o,
         Err(e) => {
             tracing::info!("远程控制连接失败：{e}");
@@ -2465,17 +2496,19 @@ pub async fn remote_connect(
         if attempt >= RECONNECT_DELAYS.len() {
             break; // 重试预算用尽（每次成功重建会话后重新计数）
         }
+        // 新会话已接管观看（用户手动连了别的机器）：本次重连作废，立即收尾
+        if st.remote.lock().unwrap().viewing.is_some() {
+            break 'retry;
+        }
         for _ in 0..RECONNECT_DELAYS[attempt] * 2 {
             if cancelled.load(Ordering::Relaxed) {
                 break 'retry;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        st.emit(CoreEvent::RemoteConnecting {
-            peer_id: machine.clone(),
-            name: last.name.clone(),
-        });
-        match remote_connect_inner(&st, &machine, &password).await {
+        // 重试不重发 RemoteConnecting：连接中提示只在首连发一次，
+        // 重试进展由「连接中断，正在自动重连…」toast 与观看页遮罩承载
+        match remote_connect_inner(&st, &machine, &password, false).await {
             Ok(o) => {
                 if !o.reconnectable {
                     finish_session(&st, &machine, o);
@@ -2517,6 +2550,7 @@ async fn remote_connect_inner(
     st: &Arc<AppState>,
     machine: &str,
     password: &str,
+    notify_connecting: bool,
 ) -> Result<SessionOutcome, String> {
     if st.remote.lock().unwrap().viewing.is_some() {
         return Err("已有远程控制会话进行中".into());
@@ -2542,10 +2576,12 @@ async fn remote_connect_inner(
             }
         }
     };
-    st.emit(CoreEvent::RemoteConnecting {
-        peer_id: machine.to_string(),
-        name: name.clone(),
-    });
+    if notify_connecting {
+        st.emit(CoreEvent::RemoteConnecting {
+            peer_id: machine.to_string(),
+            name: name.clone(),
+        });
+    }
 
     let tcp = tokio::time::timeout(
         Duration::from_secs(5),
@@ -2670,18 +2706,26 @@ async fn remote_connect_inner(
     // 文件推送期间键鼠延迟不受影响
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<RemoteOut>(256);
     let (file_tx, mut file_rx) = tokio::sync::mpsc::channel::<RemoteOut>(64);
-    st.remote.lock().unwrap().viewing = Some(ViewingSession {
-        peer_id: machine.to_string(),
-        name: pc_name.clone(),
-        token: token.clone(),
-        view_token: view_token.clone(),
-        closed: closed.clone(),
-        out: out_tx.clone(),
-        file_out: file_tx.clone(),
-        bridge: bridge_tx.clone(),
-        codec: AtomicU8::new(crate::encoder::CODEC_JPEG),
-        viewer_caps: Mutex::new(HashMap::new()),
-    });
+    {
+        // check+set 同锁原子：并发两次连接时后来者在此失败，
+        // 而非覆盖前者已注册的观看会话（TOCTOU）
+        let mut remote = st.remote.lock().unwrap();
+        if remote.viewing.is_some() {
+            return Err("已有远程控制会话进行中".into());
+        }
+        remote.viewing = Some(ViewingSession {
+            peer_id: machine.to_string(),
+            name: pc_name.clone(),
+            token: token.clone(),
+            view_token: view_token.clone(),
+            closed: closed.clone(),
+            out: out_tx.clone(),
+            file_out: file_tx.clone(),
+            bridge: bridge_tx.clone(),
+            codec: AtomicU8::new(crate::encoder::CODEC_JPEG),
+            viewer_caps: Mutex::new(HashMap::new()),
+        });
+    }
     st.emit(CoreEvent::RemoteViewReady {
         peer_id: machine.to_string(),
         name: pc_name.clone(),
@@ -2787,7 +2831,14 @@ async fn remote_connect_inner(
                         break;
                     }
                 },
-                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => {
+                    // Close 握手只能由对端应用主动发起（网络死亡不会有 Close 帧）：
+                    // 视为对端主动结束（如受控端用户踢人），不进入自动重连
+                    end_reason = "对方结束了会话".into();
+                    peer_ended = true;
+                    break;
+                }
+                None => {
                     end_reason = "对方断开连接".into();
                     break;
                 }
