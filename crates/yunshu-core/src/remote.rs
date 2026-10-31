@@ -19,6 +19,8 @@
 
 use crate::server::AppState;
 use crate::{CoreEvent, UiRequest};
+#[cfg(windows)]
+pub mod wgc;
 use futures_util::{SinkExt, StreamExt};
 use sha2::Digest as ShaDigest;
 use snow::TransportState;
@@ -814,6 +816,13 @@ impl ScreenSource for FakeSource {
 pub fn make_screen_source() -> Result<Box<dyn ScreenSource>, String> {
     if fake_screen_enabled() {
         return Ok(Box::new(FakeSource::new()));
+    }
+    // Windows 优先 WGC（DXGI 桌面复制）推送式采集：60fps、自带光标、无全屏
+    // 同步拷贝；失败（Win10 1903 以下等）回退 xcap GDI 同步截屏
+    #[cfg(windows)]
+    if let Some(s) = wgc::WgcSource::new() {
+        tracing::info!("远程控制采集源: WGC（DXGI 推送式）");
+        return Ok(Box::new(s) as Box<dyn ScreenSource>);
     }
     XcapSource::new()
         .map(|s| Box::new(s) as Box<dyn ScreenSource>)
