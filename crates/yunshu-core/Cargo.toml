@@ -60,3 +60,4 @@ windows = { version = "0.61", features = [
     "Win32_System_Ole",
     "Win32_System_Variant",
 ] }
+windows-capture = "2.0.1"
