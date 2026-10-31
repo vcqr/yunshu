@@ -58,6 +58,10 @@ pinBtn.addEventListener('click', () => {
 
 let ws = null
 let closedByUs = false
+/* 断线自动重连：lastToken 用于识别 core 重连后的新会话；finalEnd = 已收到终态 end */
+let lastToken = ''
+let reconnecting = false
+let finalEnd = false
 let imgW = 0
 let imgH = 0
 let peerName = '远程控制'
@@ -295,6 +299,17 @@ function hasIdr(data) {
 }
 
 /* ---------- 输入捕获 ---------- */
+/* 本地点击回显：点击瞬间画波纹（左键黄/右键蓝），不等远程画面绕一圈回来 */
+const clickFx = document.getElementById('click-fx')
+function spawnRipple(x, y, right) {
+  const el = document.createElement('span')
+  el.className = 'click-ripple' + (right ? ' right' : '')
+  el.style.left = x + 'px'
+  el.style.top = y + 'px'
+  clickFx.appendChild(el)
+  el.addEventListener('animationend', () => el.remove())
+}
+
 let lastMoveSent = 0
 canvas.addEventListener('pointermove', (e) => {
   const now = performance.now()
@@ -306,6 +321,7 @@ canvas.addEventListener('pointermove', (e) => {
 canvas.addEventListener('pointerdown', (e) => {
   canvas.focus()
   if (e.button > 2) return // 侧键（前进/后退）不映射，避免误当左键注入
+  spawnRipple(e.clientX, e.clientY, e.button === 2)
   const btn = e.button === 1 ? 1 : e.button === 2 ? 2 : 0
   send({ t: 'mouse_down', btn })
 })
@@ -445,12 +461,19 @@ async function main() {
   pinBtn.classList.toggle('active', toolbarPinned)
   scheduleToolbarCollapse()
   fillMonitors([]) // hello 消息到达后再填充
+  openBridge(info)
+}
 
+/* 建立本地观看桥；断线后凭新 token 可重入（自动重连期间 core 会换新会话） */
+function openBridge(info) {
+  lastToken = info.token
+  peerName = info.name
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
   ws = new WebSocket(`${proto}://127.0.0.1:${info.port}/remote-view-ws?token=${info.token}`)
   ws.binaryType = 'arraybuffer'
 
   ws.onopen = () => {
+    reconnecting = false
     hideMask()
     dot.classList.remove('off')
     sendQuality()
@@ -505,6 +528,9 @@ async function main() {
         } else if (m.t === 'hello') {
           fillMonitors(m.monitors || [])
         } else if (m.t === 'end') {
+          // 终态：core 只在彻底结束（用户断开/对端结束/重连失败）时发 end
+          finalEnd = true
+          reconnecting = false
           dot.classList.add('off')
           showMask(`远程控制已结束：${m.reason || '对端断开'}`, false)
         }
@@ -512,14 +538,43 @@ async function main() {
     }
   }
   ws.onerror = () => {
-    if (!closedByUs) showMask('观看通道连接失败', false)
+    if (!closedByUs && !reconnecting) showMask('观看通道连接失败', false)
   }
   ws.onclose = () => {
-    if (!closedByUs) {
-      dot.classList.add('off')
-      showMask('连接已断开，可关闭本窗口', false)
-    }
+    if (closedByUs || finalEnd) return // 终态遮罩已就位
+    startReconnect()
   }
+}
+
+/* 断线重连：轮询 get_view_info 直到 core 侧自动重连成功（token 更新）或超时放弃。
+   可重连的中断 core 侧不发 end 消息，本页据此进入此流程 */
+function startReconnect() {
+  reconnecting = true
+  dot.classList.add('off')
+  showMask('连接中断，正在重连…', true)
+  let tries = 0
+  const timer = setInterval(async () => {
+    if (closedByUs || !reconnecting) {
+      clearInterval(timer)
+      return
+    }
+    tries++
+    try {
+      const info = await invoke('get_view_info')
+      if (info.token && info.token !== lastToken) {
+        reconnecting = false
+        clearInterval(timer)
+        hideMask()
+        openBridge(info)
+      }
+    } catch {
+      if (tries >= 20) {
+        reconnecting = false
+        clearInterval(timer)
+        showMask('连接已断开（自动重连失败），可关闭本窗口', false)
+      }
+    }
+  }, 1500)
 }
 
 function fillMonitors(monitors) {

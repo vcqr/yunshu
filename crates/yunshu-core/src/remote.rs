@@ -1100,8 +1100,7 @@ pub enum BridgeMsg {
 }
 
 /// 受控端正在接收的文件回传：id → 组装状态
-pub struct RemoteRecvState {
-    pub row_id: String,
+pub struct RemoteRecvState {    pub row_id: String,
     /// 半成品目录（收完即删）
     pub dir: std::path::PathBuf,
     /// 最终落盘目录（远程回传/<批次名或文件名>/）
@@ -1112,6 +1111,13 @@ pub struct RemoteRecvState {
     pub got: u64,
     pub file: Option<std::fs::File>,
     pub running_hash: Option<sha2::Sha256>,
+}
+
+/// 控制端自动重连状态：会话异常中断后的重试凭据；cancelled 供用户打断
+pub struct Reconnecting {
+    pub machine: String,
+    pub password: String,
+    pub cancelled: Arc<AtomicBool>,
 }
 
 /// 远程控制共享状态（AppState.remote）
@@ -1127,6 +1133,8 @@ pub struct RemoteState {
     pub send_offers: Mutex<HashMap<String, crate::server::BatchSource>>,
     /// 控制端正在推送的回传批次：id → 取消标记
     pub send_cancel: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// 控制端会话异常中断后的自动重连（None = 没有进行中的重连）
+    pub reconnecting: Mutex<Option<Reconnecting>>,
 }
 
 impl RemoteState {
@@ -1139,6 +1147,7 @@ impl RemoteState {
             recv_files: Mutex::new(HashMap::new()),
             send_offers: Mutex::new(HashMap::new()),
             send_cancel: Mutex::new(HashMap::new()),
+            reconnecting: Mutex::new(None),
         }
     }
 }
@@ -2362,21 +2371,122 @@ fn start_remote_file_push(st: &Arc<AppState>, id: String, src: crate::server::Ba
 
 // ---------- 控制端（发起方） ----------
 
-pub async fn remote_connect(st: Arc<AppState>, machine: String, password: String) {
-    if let Err(e) = remote_connect_inner(&st, &machine, &password).await {
-        tracing::info!("远程控制连接失败：{e}");
-        st.emit(CoreEvent::RemoteConnectFailed {
-            peer_id: machine,
-            reason: e,
-        });
+/// 控制端会话结束结果：bridge 供收尾时转发结束消息；reconnectable = 网络类中断
+/// （用户主动断开 / 对端主动结束为 false）
+struct SessionOutcome {
+    name: String,
+    reason: String,
+    reconnectable: bool,
+    bridge: tokio::sync::broadcast::Sender<BridgeMsg>,
+}
+
+/// 重连退避序列（秒）：覆盖 ~30s 内的 Wi-Fi 抖动/AP 切换
+const RECONNECT_DELAYS: [u64; 5] = [1, 2, 4, 8, 15];
+
+pub async fn remote_connect(
+    st: Arc<AppState>,
+    machine: String,
+    password: String,
+    reconnectable: bool,
+) {
+    // 新的连接请求取代进行中的自动重连
+    if let Some(r) = st
+        .remote
+        .lock()
+        .unwrap()
+        .reconnecting
+        .lock()
+        .unwrap()
+        .take()
+    {
+        r.cancelled.store(true, Ordering::Relaxed);
     }
+    let outcome = match remote_connect_inner(&st, &machine, &password).await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::info!("远程控制连接失败：{e}");
+            st.emit(CoreEvent::RemoteConnectFailed {
+                peer_id: machine,
+                reason: e,
+            });
+            return;
+        }
+    };
+    if !reconnectable || !outcome.reconnectable {
+        // 一次性密码会话 / 用户或对端主动结束：不做自动重连
+        *st.remote.lock().unwrap().reconnecting.lock().unwrap() = None;
+        finish_session(&st, &machine, outcome);
+        return;
+    }
+    // 会话异常中断（Wi-Fi 抖动等）→ 自动重连：退避重试，可被用户取消
+    let cancelled = Arc::new(AtomicBool::new(false));
+    *st.remote.lock().unwrap().reconnecting.lock().unwrap() = Some(Reconnecting {
+        machine: machine.clone(),
+        password: password.clone(),
+        cancelled: cancelled.clone(),
+    });
+    st.emit(CoreEvent::Toast {
+        text: format!("与「{}」的连接中断，正在自动重连…", outcome.name),
+    });
+    let mut last = outcome;
+    let mut attempt = 0usize;
+    'retry: loop {
+        if attempt >= RECONNECT_DELAYS.len() {
+            break; // 重试预算用尽（每次成功重建会话后重新计数）
+        }
+        for _ in 0..RECONNECT_DELAYS[attempt] * 2 {
+            if cancelled.load(Ordering::Relaxed) {
+                break 'retry;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        st.emit(CoreEvent::RemoteConnecting {
+            peer_id: machine.clone(),
+            name: last.name.clone(),
+        });
+        match remote_connect_inner(&st, &machine, &password).await {
+            Ok(o) => {
+                if !o.reconnectable {
+                    finish_session(&st, &machine, o);
+                    break;
+                }
+                last = o; // 会话再次异常中断：重置重试预算，继续
+                attempt = 0;
+            }
+            Err(e) => {
+                tracing::info!("自动重连失败：{e}（第 {} 次重试）", attempt + 1);
+                last.reason = e;
+                attempt += 1;
+            }
+        }
+    }
+    *st.remote.lock().unwrap().reconnecting.lock().unwrap() = None;
+    if cancelled.load(Ordering::Relaxed) {
+        last.reason = "已停止自动重连".into();
+    } else if last.reconnectable {
+        last.reason = format!("{}（自动重连失败）", last.reason);
+    }
+    finish_session(&st, &machine, last);
+}
+
+/// 会话最终收尾：给观看页发结束消息 + 通知 UI（只在彻底结束时调用一次）
+fn finish_session(st: &Arc<AppState>, machine: &str, outcome: SessionOutcome) {
+    let _ = outcome.bridge.send(BridgeMsg::Json(
+        serde_json::json!({ "t": "end", "reason": outcome.reason }).to_string(),
+    ));
+    st.emit(CoreEvent::RemoteSessionEnded {
+        peer_id: machine.to_string(),
+        name: outcome.name,
+        side: "controller".into(),
+        reason: Some(outcome.reason),
+    });
 }
 
 async fn remote_connect_inner(
     st: &Arc<AppState>,
     machine: &str,
     password: &str,
-) -> Result<(), String> {
+) -> Result<SessionOutcome, String> {
     if st.remote.lock().unwrap().viewing.is_some() {
         return Err("已有远程控制会话进行中".into());
     }
@@ -2567,6 +2677,7 @@ async fn remote_connect_inner(
     // 键鼠等小消息与文件回传块各走 FIFO 分支，互不阻塞
     let mut assembler = FrameAssembler::default();
     let mut end_reason = "观看已结束".to_string();
+    let mut peer_ended = false;
     loop {
         tokio::select! {
             msg = stream.next() => match msg {
@@ -2635,6 +2746,7 @@ async fn remote_connect_inner(
                     }
                     Ok(RemoteIn::Control(RemoteWire::RemoteEnd { reason })) => {
                         end_reason = reason.unwrap_or_else(|| "对方结束了会话".into());
+                        peer_ended = true;
                         break;
                     }
                     Ok(_) => {}
@@ -2701,6 +2813,7 @@ async fn remote_connect_inner(
     }
 
     // ---- 清理 ----
+    let user_closed = closed.load(Ordering::Relaxed);
     closed.store(true, Ordering::Relaxed);
     let _ = sink.close().await;
     {
@@ -2709,9 +2822,6 @@ async fn remote_connect_inner(
         remote.send_offers.lock().unwrap().clear();
         remote.send_cancel.lock().unwrap().clear();
     }
-    let _ = bridge_tx.send(BridgeMsg::Json(
-        serde_json::json!({"t": "end", "reason": end_reason}).to_string(),
-    ));
     // 未完成的回传行收尾
     {
         let pending: Vec<String> = st
@@ -2732,13 +2842,14 @@ async fn remote_connect_inner(
             st.update_transfer(&id, 0, None, crate::TransferStatus::Cancelled, None);
         }
     }
-    st.emit(CoreEvent::RemoteSessionEnded {
-        peer_id: machine.to_string(),
+    // 结束消息与 SessionEnded 事件由外层（自动重连包装）在彻底结束时统一发出：
+    // 可重连的中断不发 end 消息，观看页据此进入重连流程
+    Ok(SessionOutcome {
         name: pc_name,
-        side: "controller".into(),
-        reason: Some(end_reason),
-    });
-    Ok(())
+        reason: end_reason,
+        reconnectable: !user_closed && !peer_ended,
+        bridge: bridge_tx,
+    })
 }
 
 // ---------- 本地观看桥（/remote-view-ws，token 鉴权） ----------
@@ -2971,7 +3082,8 @@ pub fn on_assist_response(
     });
     let st2 = st.clone();
     tokio::spawn(async move {
-        remote_connect(st2, machine, password).await;
+        // 一次性密码用后即焚，断线后无法重连，不做自动重试
+        remote_connect(st2, machine, password, false).await;
     });
 }
 
@@ -2986,14 +3098,31 @@ pub fn handle_ui_request(st: &Arc<AppState>, req: UiRequest) {
             // 本函数运行在 UI 请求线程（非 runtime 线程），必须经 rt_handle 投递回 runtime
             let st2 = st.clone();
             st.rt_handle.spawn(async move {
-                remote_connect(st2, machine_id, password).await;
+                remote_connect(st2, machine_id, password, true).await;
             });
         }
         UiRequest::RemoteDisconnect => {
+            let reconnect_cancel = st
+                .remote
+                .lock()
+                .unwrap()
+                .reconnecting
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|r| r.cancelled.clone());
             let remote = st.remote.lock().unwrap();
             if let Some(view) = remote.viewing.as_ref() {
                 view.closed.store(true, Ordering::Relaxed);
                 tracing::info!("用户断开了远程观看会话");
+            } else if let Some(flag) = reconnect_cancel {
+                // 正在自动重连：打断重试
+                flag.store(true, Ordering::Relaxed);
+                tracing::info!("用户停止了远程控制自动重连");
+                drop(remote);
+                st.emit(CoreEvent::Toast {
+                    text: "已停止自动重连".into(),
+                });
             } else if let Some(ctl) = remote.controlled.as_ref() {
                 ctl.killed.store(true, Ordering::Relaxed);
                 tracing::info!("用户断开了来自「{}」的远程控制", ctl.peer_name);

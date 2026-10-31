@@ -72,6 +72,12 @@ async fn main() {
                             text: text.to_string(),
                         });
                     }
+                    (Some("connect"), Some(machine), Some(password)) => {
+                        let _ = ui_tx.send(UiRequest::RemoteConnect {
+                            machine_id: machine.to_string(),
+                            password: password.to_string(),
+                        });
+                    }
                     _ => println!("EVENT {{\"unknown_cmd\":{line:?}}}"),
                 }
             }

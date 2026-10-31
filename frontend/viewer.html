@@ -67,10 +67,23 @@
       animation: spin 0.9s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+    /* 本地点击回显：点击瞬间画波纹，不等视频环路（对消延迟感） */
+    #click-fx { position: fixed; inset: 0; pointer-events: none; overflow: hidden; z-index: 30; }
+    .click-ripple {
+      position: absolute; width: 18px; height: 18px; margin: -9px 0 0 -9px;
+      border: 3px solid rgba(250, 204, 21, 0.95); border-radius: 50%;
+      animation: click-ripple .45s ease-out forwards;
+    }
+    .click-ripple.right { border-color: rgba(56, 189, 248, 0.95); }
+    @keyframes click-ripple {
+      from { transform: scale(0.35); opacity: 1; }
+      to { transform: scale(2.8); opacity: 0; }
+    }
   </style>
 </head>
 <body>
   <canvas id="screen" tabindex="0"></canvas>
+  <div id="click-fx"></div>
   <div id="toolbar-pill" title="展开工具栏">
     <span class="dot" id="pill-dot"></span>
     <span id="pill-text">–</span>
