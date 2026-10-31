@@ -111,6 +111,7 @@ function applyPeers(peers: any[]) {
   const devices = (peers || []).map((p: any) => ({
     id: p.id, name: p.name, ip: p.ip, online: p.connected,
     machineId: p.machine_id || '', manual: !!p.manual, addr: p.addr || '',
+    linkError: p.link_error || '',
   }))
   if (peersInitialized) {
     for (const d of devices) {

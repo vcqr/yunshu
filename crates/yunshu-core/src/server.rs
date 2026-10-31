@@ -91,6 +91,9 @@ pub struct AppState {
     pub(crate) pending_trusts: Mutex<HashMap<String, (String, String)>>,
     /// 本会话内被用户拒绝的设备（不再重复弹确认）
     pub(crate) trust_rejected: Mutex<std::collections::HashSet<String>>,
+    /// 飞鸽建链最近一次失败原因：peer_id（手动主机在握手前失败则记 addr）→ 原因。
+    /// 自动重试静默进行不弹窗，UI 靠它把「为什么离线」展示出来；链路注册成功即清除
+    pub(crate) pigeon_link_errors: Mutex<HashMap<String, String>>,
     // ---- 远程控制（PC↔PC 屏幕共享 + 键鼠注入）----
     pub(crate) remote: Mutex<crate::remote::RemoteState>,
     /// 局域网聊天落库（飞鸽单聊/广播/手机文本，收发两侧）
@@ -233,6 +236,40 @@ fn lan_ip() -> Option<IpAddr> {
     all_lan_ips().into_iter().next()
 }
 
+/// 发送目标的名字与离线原因：优先取存活链路里的对端名；链路不在则回退
+/// 发现表/手动主机表，避免出现空的「」；原因来自最近一次建链失败记录
+/// （自动重试静默进行，用户从这里看到「为什么发不出去」）
+fn peer_display(st: &AppState, peer_id: &str) -> (String, Option<String>) {
+    if let Some(l) = st.pigeon_conns.lock().unwrap().get(peer_id) {
+        return (l.name.clone(), None);
+    }
+    let name = st
+        .pigeon_peers
+        .lock()
+        .unwrap()
+        .get(peer_id)
+        .map(|p| p.name.clone())
+        .or_else(|| {
+            st.manual_hosts
+                .lock()
+                .unwrap()
+                .values()
+                .find(|m| m.peer_id.as_deref() == Some(peer_id))
+                .map(|m| m.name.clone())
+        })
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "对方".into());
+    let err = st.pigeon_link_errors.lock().unwrap().get(peer_id).cloned();
+    (name, err)
+}
+
+fn link_down_text(name: &str, err: Option<String>) -> String {
+    match err {
+        Some(e) => format!("「{name}」不在线，无法发送（{e}）"),
+        None => format!("「{name}」不在线，无法发送"),
+    }
+}
+
 pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver<UiRequest>) {
     let save_dir = cfg.save_dir.clone();
     let _ = std::fs::create_dir_all(&save_dir);
@@ -279,6 +316,7 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
         pigeon_push_resume: Mutex::new(HashMap::new()),
         pending_trusts: Mutex::new(HashMap::new()),
         trust_rejected: Mutex::new(std::collections::HashSet::new()),
+        pigeon_link_errors: Mutex::new(HashMap::new()),
         remote: Mutex::new(crate::remote::RemoteState::new(
             crate::settings::Settings::load_or_default().remote_fixed_password_hash,
         )),
@@ -410,15 +448,10 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                         st.emit(CoreEvent::Toast { text });
                     }
                     Ok(UiRequest::PigeonSendText { peer_id, text }) => {
-                        let name = st
-                            .pigeon_conns
-                            .lock()
-                            .unwrap()
-                            .get(&peer_id)
-                            .map(|l| l.name.clone())
-                            .unwrap_or_default();
+                        let (name, err) = peer_display(&st, &peer_id);
                         let chars = text.chars().count();
-                        let sent = crate::pigeon::try_push(
+                        let online = st.pigeon_conns.lock().unwrap().contains_key(&peer_id);
+                        let sent = online && crate::pigeon::try_push(
                             &st,
                             &peer_id,
                             crate::protocol::PigeonWire::PcText { text: text.clone() },
@@ -439,15 +472,21 @@ pub async fn serve(cfg: CoreConfig, event_tx: Sender<CoreEvent>, ui_rx: Receiver
                             ));
                         } else {
                             st.emit(CoreEvent::Toast {
-                                text: format!("「{name}」已断开，无法发送"),
+                                text: if online {
+                                    // 链路在但投递失败（队列满或正在断开）
+                                    format!("「{name}」发送失败，请稍后重试")
+                                } else {
+                                    link_down_text(&name, err)
+                                },
                             });
                         }
                     }
                     Ok(UiRequest::PigeonSendFiles { peer_id, paths }) => {
                         let connected = st.pigeon_conns.lock().unwrap().contains_key(&peer_id);
                         if !connected {
+                            let (name, err) = peer_display(&st, &peer_id);
                             st.emit(CoreEvent::Toast {
-                                text: "对方已断开，无法发送".into(),
+                                text: link_down_text(&name, err),
                             });
                             continue;
                         }
@@ -1235,6 +1274,7 @@ async fn handle_pigeon_socket(st: Arc<AppState>, socket: WebSocket) {
     }
 
     // ---- 注册链路 + 启动加密泵 ----
+    crate::pigeon::clear_link_error(&st, &[&peer_id]);
     let (plain_out_tx, plain_out_rx) = tokio::sync::mpsc::channel::<crate::pigeon::PigeonOut>(64);
     st.pigeon_conns.lock().unwrap().insert(
         peer_id.clone(),

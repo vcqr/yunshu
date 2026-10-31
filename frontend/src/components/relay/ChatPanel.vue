@@ -5,7 +5,7 @@
  */
 import { computed, ref, watch } from 'vue'
 import QRCode from 'qrcode'
-import { ListOrdered, MessageSquare, Radio, Smartphone, UploadCloud } from '@lucide/vue'
+import { ListOrdered, MessageSquare, Radio, RotateCw, Smartphone, UploadCloud } from '@lucide/vue'
 import RelayAvatar from './RelayAvatar.vue'
 import MessageList from './MessageList.vue'
 import Composer from './Composer.vue'
@@ -22,7 +22,7 @@ const peerName = computed(() =>
   isBroadcast.value ? '所有人' : isPhone.value ? (store.phoneConnected ? store.phoneName : '手机') : peerDevice.value?.name ?? '对方设备'
 )
 const peerOnline = computed(() =>
-  isBroadcast.value ? true : isPhone.value ? store.phoneConnected : Boolean(peerDevice.value)
+  isBroadcast.value ? true : isPhone.value ? store.phoneConnected : Boolean(peerDevice.value?.online)
 )
 const peerIp = computed(() => (isPhone.value ? '' : peerDevice.value?.ip ?? ''))
 
@@ -76,6 +76,12 @@ const dragActive = computed(() => dragState.active && store.selectedPeer === pro
 
 function switchChatStyle() {
   setChatStylePersist(store.chatStyle === 'bubble' ? 'list' : 'bubble')
+}
+
+/* 离线重连：直连该设备的 addr（core 侧失败会 toast 原因，成功后 peers 事件自动切换状态） */
+function reconnectPeer() {
+  const addr = peerDevice.value?.addr
+  if (addr) relayActions.connectHost(addr)
 }
 </script>
 
@@ -209,7 +215,17 @@ function switchChatStyle() {
       <!-- 输入区 -->
       <Composer v-if="peerOnline || isBroadcast" :peer="peer" :peer-name="peerName" />
       <div v-else class="shrink-0 border-t bg-card/60 p-4 text-center text-sm text-muted-foreground">
-        对方已离线，暂时无法发送
+        <p>对方已离线，暂时无法发送</p>
+        <!-- 自动重连在后台静默重试，这里展示最近一次建链失败原因 -->
+        <p v-if="peerDevice?.linkError" class="mt-1 text-xs text-destructive">{{ peerDevice.linkError }}</p>
+        <button
+          v-if="!isPhone && peerDevice?.addr"
+          class="mt-3 inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-xs font-medium text-foreground hover:bg-accent"
+          @click="reconnectPeer"
+        >
+          <RotateCw class="size-3.5" aria-hidden="true" />
+          重新连接
+        </button>
       </div>
 
       <!-- 拖拽遮罩 -->

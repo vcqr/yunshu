@@ -364,6 +364,7 @@ pub async fn pigeon_connect_manual(st: Arc<AppState>, addr: String, quiet: bool)
     match result {
         Ok(()) => {}
         Err(e) => {
+            record_link_error(&st, &addr, &e);
             tracing::info!("手动连接 {addr} 失败：{e}");
             if !quiet {
                 st.emit(CoreEvent::Toast {
@@ -537,6 +538,7 @@ async fn pigeon_connect_manual_inner(st: &Arc<AppState>, addr: &str) -> Result<(
         .unwrap_or_else(|| display_name.clone());
 
     // ---- 注册链路 + 加密泵（同发现流程）----
+    clear_link_error(st, &[peer_id.as_str(), addr]);
     let (plain_out_tx, plain_out_rx) = tokio::sync::mpsc::channel::<PigeonOut>(64);
     st.pigeon_conns.lock().unwrap().insert(
         peer_id.clone(),
@@ -727,20 +729,27 @@ pub fn peers_event(st: &AppState) -> CoreEvent {
         let known = st.pigeon_peers.lock().unwrap();
         let conns = st.pigeon_conns.lock().unwrap();
         let manual = st.manual_hosts.lock().unwrap();
+        let errors = st.pigeon_link_errors.lock().unwrap();
         let mut v: Vec<PigeonPeerInfo> = known
             .iter()
-            .map(|(id, p)| PigeonPeerInfo {
-                id: id.clone(),
-                name: p.name.clone(),
-                ip: p.ip.to_string(),
-                tcp_port: p.tcp_port,
-                connected: conns.contains_key(id),
-                machine_id: p.machine_id.clone(),
-                manual: manual.values().any(|m| {
-                    m.peer_id.as_deref() == Some(id.as_str())
-                        || same_addr(&m.addr, &p.ip.to_string(), p.tcp_port)
-                }),
-                addr: format!("{}:{}", p.ip, p.tcp_port),
+            .map(|(id, p)| {
+                let connected = conns.contains_key(id);
+                PigeonPeerInfo {
+                    id: id.clone(),
+                    name: p.name.clone(),
+                    ip: p.ip.to_string(),
+                    tcp_port: p.tcp_port,
+                    connected,
+                    machine_id: p.machine_id.clone(),
+                    manual: manual.values().any(|m| {
+                        m.peer_id.as_deref() == Some(id.as_str())
+                            || same_addr(&m.addr, &p.ip.to_string(), p.tcp_port)
+                    }),
+                    addr: format!("{}:{}", p.ip, p.tcp_port),
+                    link_error: (!connected)
+                        .then(|| errors.get(id).cloned())
+                        .flatten(),
+                }
             })
             .collect();
         // 手动主机在发现表覆盖不到时补条目：对方隐身不广播、或尚未连上（离线也可见）
@@ -759,8 +768,17 @@ pub fn peers_event(st: &AppState) -> CoreEvent {
                 .peer_id
                 .as_deref()
                 .is_some_and(|pid| conns.contains_key(pid));
+            let id = m.peer_id.clone().unwrap_or_else(|| format!("manual:{}", m.addr));
             v.push(PigeonPeerInfo {
-                id: m.peer_id.clone().unwrap_or_else(|| format!("manual:{}", m.addr)),
+                link_error: (!connected)
+                    .then(|| {
+                        errors
+                            .get(&id)
+                            .or_else(|| errors.get(&m.addr))
+                            .cloned()
+                    })
+                    .flatten(),
+                id,
                 name: m.name.clone(),
                 ip: addr_host(&m.addr).to_string(),
                 tcp_port: addr_port(&m.addr),
@@ -803,6 +821,28 @@ pub fn peers_event(st: &AppState) -> CoreEvent {
 
 pub fn emit_peers(st: &AppState) {
     st.emit(peers_event(st));
+}
+
+/// 记录建链失败原因；原因变化时才刷新设备列表（自动重试每 10 秒一次，避免刷屏）
+pub(crate) fn record_link_error(st: &AppState, key: &str, err: &str) {
+    let changed = {
+        let mut m = st.pigeon_link_errors.lock().unwrap();
+        m.insert(key.to_string(), err.to_string()).as_deref() != Some(err)
+    };
+    if changed {
+        emit_peers(st);
+    }
+}
+
+/// 链路注册成功：清掉该 peer 的失败记录（keys 一般是 [peer_id]，手动发起再带上 addr）
+pub(crate) fn clear_link_error(st: &AppState, keys: &[&str]) {
+    let removed = {
+        let mut m = st.pigeon_link_errors.lock().unwrap();
+        keys.iter().any(|k| m.remove(*k).is_some())
+    };
+    if removed {
+        emit_peers(st);
+    }
 }
 
 /// 本机发现身份（run_discovery 启动时登记，退出告别广播使用）
@@ -1020,6 +1060,7 @@ pub async fn pigeon_connect(st: Arc<AppState>, peer_id: String, ip: IpAddr, port
     let result = pigeon_connect_inner(&st, &peer_id, ip, port).await;
     st.pigeon_connecting.lock().unwrap().remove(&peer_id);
     if let Err(e) = result {
+        record_link_error(&st, &peer_id, &e);
         tracing::info!("连接「{peer_id}」失败：{e}（等对方下一次广播再试）");
     }
 }
@@ -1168,6 +1209,7 @@ async fn pigeon_connect_inner(
     }
 
     // ---- 注册链路 + 加密泵 ----
+    clear_link_error(st, &[peer_id]);
     let (plain_out_tx, plain_out_rx) = tokio::sync::mpsc::channel::<PigeonOut>(64);
     st.pigeon_conns.lock().unwrap().insert(
         peer_id.to_string(),
@@ -2229,6 +2271,7 @@ mod tests {
             pigeon_push_resume: Mutex::new(HashMap::new()),
             pending_trusts: Mutex::new(HashMap::new()),
             trust_rejected: Mutex::new(std::collections::HashSet::new()),
+            pigeon_link_errors: Mutex::new(HashMap::new()),
             remote: Mutex::new(crate::remote::RemoteState::new(None)),
             chat_log: crate::chatlog::ChatLog::open(&dir.join("chat.db")),
         })

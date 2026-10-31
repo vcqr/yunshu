@@ -13,6 +13,8 @@ export interface Device {
   manual?: boolean
   /** 可达地址 host:port（手动主机的移除/重连用） */
   addr?: string
+  /** 离线时的最近一次建链失败原因（自动重试静默，UI 展示用） */
+  linkError?: string
 }
 
 export type MessageKind = 'text' | 'system'

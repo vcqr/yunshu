@@ -155,6 +155,9 @@ pub struct PigeonPeerInfo {
     pub manual: bool,
     /// 可达地址 host:port（手动主机的移除/重连用）
     pub addr: String,
+    /// 未连接时的最近一次建链失败原因（自动重试静默，UI 展示用；已连接为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_error: Option<String>,
 }
 
 /// 核心线程 → UI 的事件
