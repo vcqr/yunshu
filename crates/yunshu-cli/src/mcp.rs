@@ -188,7 +188,7 @@ impl YunshuMcp {
 // version 随 workspace 版本一起改。
 // list_tools / get_tool / call_tool 手写（宏检测到已定义就不再生成）：
 // 微信通道是隐藏功能，YUNSHU_WEIXIN 未开启时 weixin_* 工具整体不可见。
-#[tool_handler(name = "yunshu-cli", version = "0.1.1")]
+#[tool_handler(name = "yunshu-cli", version = "0.1.3")]
 impl ServerHandler for YunshuMcp {
     async fn list_tools(
         &self,
