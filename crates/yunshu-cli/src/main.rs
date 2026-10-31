@@ -114,20 +114,24 @@ fn main() {
         .enable_all()
         .build()
         .expect("tokio runtime 创建失败");
-    // 有微信凭证则恢复长轮询（收消息 + 保活）
+    // 有微信凭证则恢复长轮询（收消息 + 保活；通道未开启时 core 内部直接跳过）
     rt.block_on(async {
         yunshu_core::weixin::init_polling();
     });
-    if yunshu_core::weixin::load_config()
-        .map(|c| c.logged_in())
-        .unwrap_or(false)
+    if yunshu_core::weixin::enabled()
+        && yunshu_core::weixin::load_config()
+            .map(|c| c.logged_in())
+            .unwrap_or(false)
     {
         eprintln!("[yunshu-cli] 微信通道已恢复（长轮询运行中）");
     }
     if opts.mcp {
-        eprintln!(
-            "[yunshu-cli] MCP stdio server 已启动（工具: pigeon_list_peers / pigeon_send_text / pigeon_send_files / weixin_status / weixin_send_text / weixin_send_files / weixin_inbox）"
-        );
+        let tools = if yunshu_core::weixin::enabled() {
+            "pigeon_list_peers / pigeon_send_text / pigeon_send_files / weixin_status / weixin_send_text / weixin_send_files / weixin_inbox"
+        } else {
+            "pigeon_list_peers / pigeon_send_text / pigeon_send_files"
+        };
+        eprintln!("[yunshu-cli] MCP stdio server 已启动（工具: {tools}）");
         if let Err(e) = rt.block_on(mcp::run(shared)) {
             eprintln!("[yunshu-cli] MCP server 退出: {e}");
             std::process::exit(1);

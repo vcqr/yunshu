@@ -8,6 +8,9 @@
 //! 「保存目录/微信/」。运行态（登录会话、轮询任务、冷却、收件箱）挂在
 //! 本模块全局 RUNTIME 上：应用启动时（有凭证则）与登录确认后拉起长轮询，
 //! token 失效按官方插件策略冷却 1 小时，重新扫码换新 token 后自动解除。
+//!
+//! 隐藏功能：环境变量 `YUNSHU_WEIXIN`（=1）开启，默认关闭——关闭时登录/收发
+//! 一律拒绝，桌面端入口、CLI wx 命令、MCP 工具也随之隐藏（enabled()）。
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -20,8 +23,22 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
-/// 媒体 CDN 基址（官方插件常量；getuploadurl 返回 upload_full_url 时优先用它）
+/// 微信通道总开关（隐藏功能）：环境变量 `YUNSHU_WEIXIN` 设为 1/true/yes/on
+/// （大小写不敏感）即开启，默认关闭。桌面端入口显隐、CLI wx 命令、MCP 工具
+/// 与本模块的登录/收发全部以此为准；关闭时登录与收发一律拒绝。
+pub fn enabled() -> bool {
+    match std::env::var("YUNSHU_WEIXIN") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+const DISABLED_MSG: &str = "微信通道未开启（设置环境变量 YUNSHU_WEIXIN=1 后重启生效）";
+
+const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";/// 媒体 CDN 基址（官方插件常量；getuploadurl 返回 upload_full_url 时优先用它）
 const CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
 /// 对齐插件 package.json 顶层 ilink_appid
 const ILINK_APP_ID: &str = "bot";
@@ -908,6 +925,9 @@ fn set_login(status: LoginStatus, message: Option<String>) {
 
 /// 发起扫码登录：取二维码 + 启动登录轮询任务。须在 tokio runtime 上下文中调用。
 pub async fn login_start() -> Result<LoginView, String> {
+    if !enabled() {
+        return Err(DISABLED_MSG.into());
+    }
     let cfg = load_config()?;
     let (qrcode, qr_url) = fetch_qrcode(Some(&cfg.token)).await?;
 
@@ -998,6 +1018,10 @@ pub fn logout() -> Result<(), String> {
 
 /// 应用启动时调用（有凭证则恢复长轮询）。须在 tokio runtime 上下文中调用。
 pub fn init_polling() {
+    if !enabled() {
+        tracing::debug!("[WEIXIN] 通道未开启（YUNSHU_WEIXIN），跳过长轮询恢复");
+        return;
+    }
     match load_config() {
         Ok(cfg) if cfg.logged_in() => start_poll_loop(),
         _ => {}
@@ -1531,6 +1555,9 @@ async fn send_item(ctx: &SendCtx, item: Value) -> Result<(), String> {
 
 /// 发送文本到指定用户（None 用默认目标）。返回消息条数。
 pub async fn send_text(to: Option<&str>, text: &str) -> Result<usize, String> {
+    if !enabled() {
+        return Err(DISABLED_MSG.into());
+    }
     let ctx = send_ctx(to).await?;
     let mut count = 0usize;
     for chunk in split_text(&strip_markdown(text)) {
@@ -1684,6 +1711,9 @@ pub async fn send_file(
     path: &Path,
     caption: Option<&str>,
 ) -> Result<String, String> {
+    if !enabled() {
+        return Err(DISABLED_MSG.into());
+    }
     if !path.exists() {
         return Err(format!("路径不存在：{}", path.display()));
     }
@@ -1799,6 +1829,25 @@ pub fn status_view() -> StatusView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enabled_env_parsing() {
+        // 环境变量是进程全局的：用互斥锁串行化，避免并行测试互扰（set_var 在
+        // 2024 edition 是 unsafe——多线程下改环境变量理论上有数据竞争）
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("YUNSHU_WEIXIN") };
+        assert!(!enabled(), "未设置 = 关闭");
+        for off in ["0", "false", "", "no", "off"] {
+            unsafe { std::env::set_var("YUNSHU_WEIXIN", off) };
+            assert!(!enabled(), "YUNSHU_WEIXIN={off} 应视为关闭");
+        }
+        for on in ["1", "true", "YES", "On", " true "] {
+            unsafe { std::env::set_var("YUNSHU_WEIXIN", on) };
+            assert!(enabled(), "YUNSHU_WEIXIN={on} 应视为开启");
+        }
+        unsafe { std::env::remove_var("YUNSHU_WEIXIN") };
+    }
 
     #[test]
     fn aes_roundtrip() {

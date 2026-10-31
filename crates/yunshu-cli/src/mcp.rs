@@ -185,9 +185,55 @@ impl YunshuMcp {
 }
 
 // 宏参数只收字面量（env!() 不行），缺省时 serverInfo 会落成 rmcp 自身——必须显式写；
-// version 随 workspace 版本一起改
+// version 随 workspace 版本一起改。
+// list_tools / get_tool / call_tool 手写（宏检测到已定义就不再生成）：
+// 微信通道是隐藏功能，YUNSHU_WEIXIN 未开启时 weixin_* 工具整体不可见。
 #[tool_handler(name = "yunshu-cli", version = "0.1.1")]
-impl ServerHandler for YunshuMcp {}
+impl ServerHandler for YunshuMcp {
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let supports_cache_hints = context.protocol_version().is_some_and(|version| {
+            version >= rmcp::model::ProtocolVersion::V_2026_07_28
+        });
+        let mut tools = Self::tool_router().list_all();
+        if !yunshu_core::weixin::enabled() {
+            tools.retain(|t| !t.name.starts_with("weixin_"));
+        }
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        if !yunshu_core::weixin::enabled() && name.starts_with("weixin_") {
+            return None;
+        }
+        Self::tool_router().get(name).cloned()
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        if !yunshu_core::weixin::enabled() && request.name.starts_with("weixin_") {
+            return Err(rmcp::ErrorData::invalid_params(
+                "微信通道未开启（设置环境变量 YUNSHU_WEIXIN=1 后重启 yunshu-cli 生效）",
+                None,
+            ));
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        Self::tool_router().call(tcc).await
+    }
+}
 
 /// 以 stdio 传输运行 MCP server（stdout 是协议通道，日志一律走 stderr）
 pub async fn run(shared: Arc<Shared>) -> Result<(), Box<dyn std::error::Error>> {

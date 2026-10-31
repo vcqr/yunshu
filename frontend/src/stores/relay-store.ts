@@ -58,6 +58,8 @@ export interface RelayState {
   weixinOutbound: Array<{ at_ms: number; text: string }>
   /** 微信通道：机器人是否已扫码登录（侧栏「微信」行状态灯用） */
   weixinLoggedIn: boolean
+  /** 微信通道隐藏开关（YUNSHU_WEIXIN，启动时由壳注入）：关闭时不显示任何微信入口 */
+  weixinEnabled: boolean
 }
 
 export const store = reactive<RelayState>({
@@ -93,6 +95,7 @@ export const store = reactive<RelayState>({
   weixinInbound: [],
   weixinOutbound: [],
   weixinLoggedIn: false,
+  weixinEnabled: false,
 })
 
 export const mutations = {

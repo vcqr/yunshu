@@ -36,6 +36,8 @@ fn state_snapshot() -> serde_json::Value {
         "remote_temp_password": null, "remote_controlled": null,
         "remote_machine_id": null,
         "weixin_inbox": [],
+        // 微信通道隐藏开关（YUNSHU_WEIXIN）：前端据此显隐微信入口
+        "weixin_enabled": yunshu_core::weixin::enabled(),
     })
 }
 

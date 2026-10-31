@@ -60,12 +60,16 @@ function rejectTrust() {
 const showSettings = ref(false)
 type SettingsTab = 'general' | 'remote' | 'proxy' | 'weixin'
 const settingsTab = ref<SettingsTab>('general')
-const settingsTabs: Array<{ key: SettingsTab; label: string; icon: typeof Settings2 }> = [
+const allSettingsTabs: Array<{ key: SettingsTab; label: string; icon: typeof Settings2 }> = [
   { key: 'general', label: '常规', icon: Settings2 },
   { key: 'remote', label: '远程控制', icon: MonitorUp },
   { key: 'proxy', label: '代理', icon: Globe },
   { key: 'weixin', label: '微信', icon: MessageCircle },
 ]
+// 微信通道是隐藏功能（YUNSHU_WEIXIN）：开关关闭时设置页不出现「微信」标签
+const settingsTabs = computed(() =>
+  allSettingsTabs.filter((t) => t.key !== 'weixin' || store.weixinEnabled),
+)
 const settingsForm = ref({
   device_name: '', port: 34256, save_dir: '', autostart: false, dnd_mode: false,
   stealth_mode: false,

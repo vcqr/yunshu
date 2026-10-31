@@ -478,6 +478,8 @@ export async function startRelay() {
     for (const t of snap.transfers || []) upsertFromInfo(t)
     if (snap.remote_temp_password) mutations.setRemoteTempPassword(snap.remote_temp_password)
     if (snap.remote_controlled) mutations.setRemoteControlled(snap.remote_controlled)
+    // 微信通道隐藏开关（YUNSHU_WEIXIN，壳启动时快照注入）
+    store.weixinEnabled = snap.weixin_enabled === true
   }
   if (!snap) {
     // 非 Tauri 环境（纯浏览器预览）：假装已连接，便于查看界面

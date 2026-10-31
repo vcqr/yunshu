@@ -17,14 +17,25 @@ const HELP: &str = "命令：
   trust <peer>                 信任新设备（指纹见确认提示）
   rejecttrust <peer>           拒绝新设备
   addhost <host:port> [名称]    手动添加并连接主机
-  connect <host:port>          重连已添加的主机
-  wx login                     微信通道：扫码登录（终端出二维码）
+  connect <host:port>          重连已添加的主机";
+
+/// 微信通道是隐藏功能（YUNSHU_WEIXIN=1）：开启时才在 help 里展示
+const HELP_WX: &str = "  wx login                     微信通道：扫码登录（终端出二维码）
   wx status | logout           微信通道：状态 / 退出登录
   wx send <文本…>               微信通道：发文本（默认扫码绑定的微信账号）
   wx sendto <user_id> <文本…>   微信通道：发文本给指定用户
   wx sendfile <路径…>           微信通道：发文件/图片/视频（空格分隔多个）
-  wx inbox [条数]              微信通道：最近收到的消息与媒体
-  quit                         广播下线并退出";
+  wx inbox [条数]              微信通道：最近收到的消息与媒体";
+
+const HELP_QUIT: &str = "  quit                         广播下线并退出";
+
+fn help_text() -> String {
+    if yunshu_core::weixin::enabled() {
+        format!("{HELP}\n{HELP_WX}\n{HELP_QUIT}")
+    } else {
+        format!("{HELP}\n{HELP_QUIT}")
+    }
+}
 
 pub fn run(rt: &tokio::runtime::Runtime, shared: Arc<Shared>) {
     println!("Yunshu 无头节点（交互模式）。help 查看命令。");
@@ -44,7 +55,7 @@ pub fn run(rt: &tokio::runtime::Runtime, shared: Arc<Shared>) {
         let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
         let rest = rest.trim();
         match cmd {
-            "help" | "?" => println!("{HELP}"),
+            "help" | "?" => println!("{}", help_text()),
             "peers" => peers(&shared),
             "status" => status(&shared),
             "log" => log(&shared, rest.parse().unwrap_or(20)),
@@ -321,6 +332,11 @@ const WX_HELP: &str = "wx 子命令：
 
 fn wx(rt: &tokio::runtime::Runtime, rest: &str) {
     use yunshu_core::weixin;
+    // 隐藏功能：环境变量未开启时整套 wx 命令拒答
+    if !weixin::enabled() {
+        println!("微信通道未开启（设置环境变量 YUNSHU_WEIXIN=1 后重启 yunshu-cli 生效）");
+        return;
+    }
     let (sub, arg) = rest.split_once(' ').unwrap_or((rest, ""));
     let arg = arg.trim();
     match sub {

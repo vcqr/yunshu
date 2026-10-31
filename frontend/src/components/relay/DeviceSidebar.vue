@@ -349,8 +349,9 @@ async function ctxSendFolderPhone() {
         >{{ phoneOnline ? '已配对' : '扫码配对' }}</span>
       </button>
 
-      <!-- 微信（个人微信机器人）：点击切到微信对话界面 -->
+      <!-- 微信（个人微信机器人）：点击切到微信对话界面；隐藏开关关闭时整个入口不渲染 -->
       <button
+        v-if="store.weixinEnabled"
         type="button"
         role="tab"
         :aria-selected="store.selectedPeer === 'weixin'"
