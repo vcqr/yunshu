@@ -1783,7 +1783,13 @@ pub async fn handle_remote_socket(
     });
 
     // ---- 主循环：收（输入/画质/剪贴板/结束）发（控制消息/视频帧）----
-    // 收流与发送彻底解耦：本循环不做任何可能阻塞的 socket 写入
+    // 收流与发送彻底解耦：本循环不做任何可能阻塞的 socket 写入。
+    // 轮询用固定节奏的 interval——不能用每次迭代新建的 sleep：帧每 ~33ms 到达
+    // 一次、循环随帧迭代，200ms 倒计时永远被重置，killed 检查与看门狗会变成
+    // 永不执行的死代码（「关窗后被控红条迟迟不消」的真正根因）
+    let mut poll_tick = tokio::time::interval(Duration::from_millis(200));
+    poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    poll_tick.reset(); // 首 tick 立即返回，重置后按 200ms 节奏触发
     let mut end_reason = "对端断开".to_string();
     // 最近一次收到观看端 Pong 的时刻（None = 尚未收到，看门狗未启用）
     let mut last_pong: Option<Instant> = None;
@@ -1919,7 +1925,7 @@ pub async fn handle_remote_socket(
                 }
                 Err(_) => break, // 信箱关闭：采集线程已退出，走正常收尾
             },
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {
+            _ = poll_tick.tick() => {
                 if killed.load(Ordering::Relaxed) {
                     end_reason = "本机断开了会话".into();
                     // 主动结束显式告知对端：控制端据此区分「被踢」与网络抖动，
@@ -2771,6 +2777,7 @@ async fn remote_connect_inner(
             codec: AtomicU8::new(crate::encoder::CODEC_JPEG),
             viewer_caps: Mutex::new(HashMap::new()),
         });
+        tracing::info!("会话登记: closed Arc = {:p}", Arc::as_ptr(&closed));
     }
     st.emit(CoreEvent::RemoteViewReady {
         peer_id: machine.to_string(),
@@ -2799,6 +2806,10 @@ async fn remote_connect_inner(
     let mut assembler = FrameAssembler::default();
     let mut end_reason = "观看已结束".to_string();
     let mut peer_ended = false;
+    // 固定节奏轮询（理由同受控端循环）：closed 检查不能依赖每次迭代新建的 sleep
+    let mut poll_tick = tokio::time::interval(Duration::from_millis(200));
+    poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    poll_tick.reset();
     loop {
         tokio::select! {
             msg = stream.next() => match msg {
@@ -2941,8 +2952,10 @@ async fn remote_connect_inner(
                     break;
                 }
             },
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                if closed.load(Ordering::Relaxed) {
+            _ = poll_tick.tick() => {
+                let v = closed.load(Ordering::Relaxed);
+                if v {
+                    tracing::info!("轮询分支读到 closed=true（{:p}），退出会话循环", Arc::as_ptr(&closed));
                     break;
                 }
             }
@@ -3264,7 +3277,10 @@ pub fn handle_ui_request(st: &Arc<AppState>, req: UiRequest) {
             let remote = st.remote.lock().unwrap();
             if let Some(view) = remote.viewing.as_ref() {
                 view.closed.store(true, Ordering::Relaxed);
-                tracing::info!("用户断开了远程观看会话");
+                tracing::info!(
+                    "用户断开了远程观看会话：closed Arc = {:p}",
+                    Arc::as_ptr(&view.closed)
+                );
             } else if let Some(flag) = reconnect_cancel {
                 // 正在自动重连：打断重试
                 flag.store(true, Ordering::Relaxed);

@@ -364,13 +364,15 @@ async fn remote_control_auth_stream_and_lockout() {
         let real_machine_id = yunshu_core::remote::machine_id();
         // ---- ④-0 负例：发现包携带伪造 mid → 连接必须失败（防机器 ID 伪造骗密码）----
         {
-            let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let spoof = serde_json::json!({
                 "v": 1, "kind": "entry", "id": "e2efake0002", "name": "e2e假节点",
                 "port": port2, "mid": "cafe5678"
             })
             .to_string();
+            // 每轮换新源端口：REUSEPORT 按 UDP 流哈希分流，单源端口会全部
+            // 落进同一绑定者（本机若还有别的 yunshu 实例在跑就一条都收不到）
             for _ in 0..20 {
+                let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
                 let _ = sock.send_to(spoof.as_bytes(), ("127.0.0.1", 34255u16));
                 tokio::time::sleep(Duration::from_millis(60)).await;
             }
@@ -392,14 +394,14 @@ async fn remote_control_auth_stream_and_lockout() {
             }
             panic_if_session_started(&mut ev2_rx).await;
         }
-        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let announce = serde_json::json!({
             "v": 1, "kind": "entry", "id": "e2efake0001", "name": "e2e假节点",
             "port": port2, "mid": real_machine_id
         })
         .to_string();
-        // 共享 UDP 端口存在负载均衡投递，多发几遍确保实例 1 的发现表收到
+        // 共享 UDP 端口按流哈希分流，每轮换新源端口确保实例 1 的发现表收到
         for _ in 0..20 {
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let _ = sock.send_to(announce.as_bytes(), ("127.0.0.1", 34255u16));
             tokio::time::sleep(Duration::from_millis(60)).await;
         }
