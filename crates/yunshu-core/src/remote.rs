@@ -1845,12 +1845,14 @@ pub async fn handle_remote_socket(
             },
             out = out_rx.recv() => match out {
                 Some(msg) => match seal_msg(&noise, &msg) {
-                    Ok(frame) => {
-                        if sink.send(Message::Binary(frame.into())).await.is_err() {
+                    Ok(frame) => match send_capped(&mut sink, Message::Binary(frame.into())).await {
+                        Err(()) => {
                             end_reason = "发送失败".into();
                             break;
                         }
-                    }
+                        // Stalled：丢弃这条小消息（实时语义，新值随后就到），回到主循环
+                        Ok(_) => {}
+                    },
                     Err(e) => {
                         tracing::warn!("远程控制加密失败: {e}");
                         break;
@@ -1880,19 +1882,26 @@ pub async fn handle_remote_socket(
                             codec: fm.codec,
                             data: part.to_vec(),
                         };
-                        match seal_msg(&noise, &chunk) {
-                            Ok(frame) => {
-                                if sink.send(Message::Binary(frame.into())).await.is_err() {
-                                    end_reason = "发送失败".into();
-                                    failed = true;
-                                    break;
-                                }
-                            }
+                        let outcome = match seal_msg(&noise, &chunk) {
+                            Ok(frame) => send_capped(&mut sink, Message::Binary(frame.into())).await,
                             Err(e) => {
                                 tracing::warn!("远程控制加密失败: {e}");
-                                failed = true;
-                                break;
+                                Err(())
                             }
+                        };
+                        match outcome {
+                            Err(()) => {
+                                end_reason = "发送失败".into();
+                                failed = true;
+                            }
+                            // Stalled：对端不再收流（如已关观看窗口）。放弃本帧剩余分块
+                            // 回到主循环——收流分支里对端的 Close 帧随即被处理，会话立刻
+                            // 结束；若只是链路抖动则自动恢复（对端按 seq 重组，缺块整帧不组装）
+                            Ok(false) => break,
+                            Ok(true) => {}
+                        }
+                        if failed {
+                            break;
                         }
                     }
                     send_frames.fetch_add(1, Ordering::Relaxed);
@@ -1914,7 +1923,8 @@ pub async fn handle_remote_socket(
                             reason: Some("受控端结束了会话".into()),
                         }),
                     ) {
-                        let _ = sink.send(Message::Binary(frame.into())).await;
+                        // 链路已死时发不出去也无妨，同样不能卡死收尾
+                        let _ = send_capped(&mut sink, Message::Binary(frame.into())).await;
                     }
                     break;
                 }
@@ -1930,7 +1940,9 @@ pub async fn handle_remote_socket(
         }
     }
 
-    let _ = sink.close().await;
+    // Close 握手受停滞上限约束：链路死透时直接放弃（socket 随即 drop，内核 RST），
+    // 决不能让收尾本身卡在发送上——end_session 通知（红条熄灭）就在它后面
+    let _ = tokio::time::timeout(SEND_STALL, sink.close()).await;
     drop(input_tx); // 注入线程退出（Enigo drop 自动释放按住的修饰键）
     // 文件回传半成品清理（无断点续传设计，会话结束即丢弃）
     {
@@ -2444,6 +2456,27 @@ struct SessionOutcome {
 const RECONNECT_DELAYS: [u64; 5] = [1, 2, 4, 8, 15];
 /// 受控端 Pong 看门狗：Ping 每 1s 一次，超过该时长无 Pong 判定链路死亡
 const PONG_WATCHDOG: Duration = Duration::from_secs(15);
+/// 单条出站消息的发送停滞上限。对端停止收流（关观看窗口、退出）后 TCP 背压
+/// 会把主循环卡死在发送分支里：收流分支还压着对端的 Close/RemoteEnd 帧，
+/// 看门狗分支也轮不到——会话僵死数分钟，受控端「被控」红条迟迟不消。
+/// 超过该时长即放弃本条消息（帧则连同剩余分块）回到主循环，让收流/看门狗
+/// 分支处理结束信号；链路恢复则后续帧自动续上（对端按 seq 重组，缺块整帧不组装）
+const SEND_STALL: Duration = Duration::from_secs(3);
+
+/// 带停滞上限的发送。Sent = 已发出；Stalled = 超时放弃（调用方按语义丢帧或丢消息）；
+/// Failed = 发送出错（调用方结束会话）
+async fn send_capped<M, S>(sink: &mut S, msg: M) -> Result<bool, ()>
+where
+    S: futures_util::Sink<M> + Unpin,
+    S::Error: std::fmt::Debug,
+{
+    use futures_util::SinkExt;
+    match tokio::time::timeout(SEND_STALL, sink.send(msg)).await {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(_)) => Err(()),
+        Err(_) => Ok(false),
+    }
+}
 
 pub async fn remote_connect(
     st: Arc<AppState>,
@@ -2851,9 +2884,13 @@ async fn remote_connect_inner(
             out = out_rx.recv() => match out {
                 Some(msg) => match seal_msg(&noise, &msg) {
                     Ok(frame) => {
-                        if sink.send(tokio_tungstenite::tungstenite::Message::binary(frame)).await.is_err() {
-                            end_reason = "发送失败".into();
-                            break;
+                        match send_capped(&mut sink, tokio_tungstenite::tungstenite::Message::binary(frame)).await {
+                            Err(()) => {
+                                end_reason = "发送失败".into();
+                                break;
+                            }
+                            // Stalled：输入/画质等实时消息丢弃即可，回到主循环处理收流
+                            Ok(_) => {}
                         }
                     }
                     Err(e) => {
@@ -2870,7 +2907,12 @@ async fn remote_connect_inner(
             file = file_rx.recv() => match file {
                 Some(msg) => match seal_msg(&noise, &msg) {
                     Ok(frame) => {
-                        if sink.send(tokio_tungstenite::tungstenite::Message::binary(frame)).await.is_err() {
+                        // 文件分块不能丢（丢了接收端就是文件破洞），停滞按发送失败收场：
+                        // 会话收尾会把未完成的回传行标记取消，用户可重新推送
+                        if send_capped(&mut sink, tokio_tungstenite::tungstenite::Message::binary(frame))
+                            .await
+                            .is_err()
+                        {
                             end_reason = "发送失败".into();
                             break;
                         }
@@ -2897,7 +2939,8 @@ async fn remote_connect_inner(
     // ---- 清理 ----
     let user_closed = closed.load(Ordering::Relaxed);
     closed.store(true, Ordering::Relaxed);
-    let _ = sink.close().await;
+    // Close 握手受停滞上限约束：链路死透时直接放弃（socket 随即 drop，内核 RST）
+    let _ = tokio::time::timeout(SEND_STALL, sink.close()).await;
     {
         let mut remote = st.remote.lock().unwrap();
         remote.viewing = None;
@@ -3299,6 +3342,61 @@ pub fn handle_ui_request(st: &Arc<AppState>, req: UiRequest) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 发送永远停滞的 sink：poll_flush 永远 Pending（模拟对端停止收流后的
+    /// TCP 背压；回环链路上内核缓冲能吞数 MB，集成测试造不出这种停滞，
+    /// 只能在这里用 mock 验证 SEND_STALL 语义）
+    struct PendingSink;
+    impl<M> futures_util::Sink<M> for PendingSink {
+        type Error = std::io::Error;
+        fn poll_ready(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, _: M) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+        fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// 立即成功的 sink
+    struct OkSink;
+    impl<M> futures_util::Sink<M> for OkSink {
+        type Error = std::io::Error;
+        fn poll_ready(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, _: M) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn send_capped_stall_returns_in_time() {
+        let t0 = Instant::now();
+        let out = send_capped(&mut PendingSink, ()).await;
+        assert_eq!(out, Ok(false), "停滞应返回 Ok(false)（放弃发送）");
+        let el = t0.elapsed();
+        assert!(
+            el >= SEND_STALL - Duration::from_millis(500) && el <= SEND_STALL + Duration::from_secs(3),
+            "应约在 SEND_STALL({SEND_STALL:?}) 处放弃，实际 {el:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_capped_healthy_sink_sends() {
+        assert_eq!(send_capped(&mut OkSink, 1u8).await, Ok(true));
+    }
 
     #[test]
     fn password_hash_roundtrip() {
