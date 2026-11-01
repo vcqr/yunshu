@@ -286,9 +286,9 @@ onMounted(async () => {
       手机观看
     </button>
 
-    <!-- 手机观看二维码弹窗 -->
-    <div v-if="showPhoneView" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45" @click.self="showPhoneView = false">
-      <div class="bg-card w-full max-w-sm rounded-xl border p-5 text-center shadow-xl">
+    <!-- 手机观看二维码弹窗（无蒙版：误触不关闭，点弹窗外可正常操作页面） -->
+    <div v-if="showPhoneView" class="pointer-events-none fixed inset-0 z-50 flex items-center justify-center">
+      <div class="pointer-events-auto bg-card w-full max-w-sm rounded-xl border p-5 text-center shadow-xl">
         <p class="mb-1 text-sm font-semibold">手机观看「{{ store.remoteViewing?.name }}」</p>
         <p class="mb-3 text-xs text-muted-foreground">同一局域网的手机扫码即可只看不控</p>
         <img v-if="phoneViewQr" :src="phoneViewQr" alt="手机观看二维码" class="mx-auto rounded-lg border" />
@@ -300,8 +300,8 @@ onMounted(async () => {
     </div>
 
     <!-- 远程协助请求（反向协助） -->
-    <div v-if="currentAssist" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45" @click.self="relayActions.assistRespond(currentAssist.peer_id, false)">
-      <div class="bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
+    <div v-if="currentAssist" class="pointer-events-none fixed inset-0 z-50 flex items-center justify-center">
+      <div class="pointer-events-auto bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
         <div class="mb-1 flex items-center gap-2.5 text-base font-semibold">
           <HandMetal class="size-5 text-amber-500" />
           远程协助请求
@@ -318,8 +318,8 @@ onMounted(async () => {
     </div>
 
     <!-- 远程控制密码弹窗 -->
-    <div v-if="store.controlDialog" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45" @click.self="closeControlDialog">
-      <div class="bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
+    <div v-if="store.controlDialog" class="pointer-events-none fixed inset-0 z-50 flex items-center justify-center">
+      <div class="pointer-events-auto bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
         <div class="mb-1 flex items-center gap-2.5 text-base font-semibold">
           <MonitorUp class="size-5 text-emerald-600" />
           远程控制
@@ -353,8 +353,8 @@ onMounted(async () => {
     </div>
 
     <!-- 新设备信任确认（TOFU） -->
-    <div v-if="currentTrust" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45" @click.self="rejectTrust">
-      <div class="bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
+    <div v-if="currentTrust" class="pointer-events-none fixed inset-0 z-50 flex items-center justify-center">
+      <div class="pointer-events-auto bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
         <div class="mb-1 flex items-center gap-2.5 text-base font-semibold">
           <ShieldCheck class="size-5 text-emerald-600" />
           新设备待确认

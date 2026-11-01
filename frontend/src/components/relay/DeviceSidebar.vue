@@ -643,10 +643,9 @@ async function ctxSendFolderPhone() {
     <Teleport to="body">
       <div
         v-if="showAdd"
-        class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45"
-        @click.self="showAdd = false"
+        class="pointer-events-none fixed inset-0 z-50 flex items-center justify-center"
       >
-        <div class="bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
+        <div class="pointer-events-auto bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
           <div class="mb-1 flex items-center gap-2.5 text-base font-semibold">
             <Plus class="size-5 text-emerald-600" />
             添加主机

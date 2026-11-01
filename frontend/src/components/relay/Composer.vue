@@ -174,8 +174,8 @@ function confirmSendClipboard() {
     </div>
 
     <!-- 剪贴板预览确认 -->
-    <div v-if="clipboardOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45" @click.self="clipboardOpen = false">
-      <div class="bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
+    <div v-if="clipboardOpen" class="pointer-events-none fixed inset-0 z-50 flex items-center justify-center">
+      <div class="pointer-events-auto bg-card w-full max-w-md rounded-xl border p-5 shadow-xl">
         <div class="mb-1 flex items-center gap-2 text-base font-semibold">
           <UploadCloud class="size-5 text-emerald-600 dark:text-emerald-400" />
           发送剪贴板内容

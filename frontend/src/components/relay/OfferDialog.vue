@@ -47,8 +47,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 </script>
 
 <template>
-  <div v-if="open" class="fixed inset-0 z-50 flex items-center justify-center bg-foreground/45" @click.self="handleDismiss">
-    <div class="bg-card relative w-full max-w-md rounded-xl border p-5 shadow-xl">
+  <div v-if="open" class="pointer-events-none fixed inset-0 z-50 flex items-center justify-center">
+    <div class="pointer-events-auto bg-card relative w-full max-w-md rounded-xl border p-5 shadow-xl">
       <button
         aria-label="稍后处理"
         title="稍后处理：关闭弹窗，请求保留在传输列表中"
