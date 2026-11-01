@@ -141,11 +141,34 @@ jobs:
             tail -25 "$LOG"
           } | tr -d '\r' | cut -c1-360 | sed 's/^/::error::/'
 
+      # tauri 默认不打签名，产物是 linker 随机标识（每次构建必变）。macOS 的本地
+      # 网络/屏幕录制/辅助功能授权按「签名标识 + bundle id」匹配记录：标识一变，
+      # 旧授权查无记录而系统又不再弹窗，形成死锁。tauri.conf.json 里
+      # signingIdentity "-" 走 ad-hoc（标识取 Info.plist 的 CFBundleIdentifier），
+      # 这里校验兜底，漂移即失败
+      - name: verify macOS signing identity
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
+        run: |
+          APP=$(find "target/${{ matrix.target }}/release/bundle/macos" -maxdepth 1 -name '*.app' | head -1)
+          ID=$(codesign -dv "$APP" 2>&1 | sed -n 's/^Identifier=//p')
+          echo "签名标识: $ID"
+          [ "$ID" = "com.yunshu.desktop" ] || {
+            echo "::error::签名标识漂移：期望 com.yunshu.desktop，实际 ${ID:-未签名}（TCC 授权会随构建丢失）"
+            exit 1
+          }
+
       # yunshu-cli（无头节点 / MCP server）：独立 zip 与 GUI 安装包解耦分发，
       # 同 --target 构建以落进 target/<triple>/release（依赖与 tauri build 共享缓存）
       - name: build yunshu-cli
         shell: bash
         run: cargo build --release -p yunshu-cli --target ${{ matrix.target }}
+
+      # 裸二进制不经 tauri 打包，需显式固定 ad-hoc 标识（同上，跨构建保留本地网络授权）
+      - name: sign yunshu-cli (macos)
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
+        run: codesign --force --sign - --identifier com.yunshu.cli "target/${{ matrix.target }}/release/yunshu-cli"
 
       - name: package yunshu-cli (zip)
         shell: pwsh

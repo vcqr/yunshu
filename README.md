@@ -35,6 +35,8 @@ cargo run --release
 
 产物为单文件 `target/release/yunshu.exe`（约 5 MB，无任何运行时依赖）。
 
+macOS 下每次重编译后跑 `scripts/codesign-macos.sh` 固定 ad-hoc 签名标识：本地网络、屏幕录制、辅助功能等授权按「签名标识 + bundle id」匹配，cargo 默认的 linker 随机标识会让已授权失效且系统不再弹窗（排查链见 `docs/macos-授权与签名排障.md`）。
+
 ### 前端开发（热重载）
 
 ```bash
@@ -170,7 +172,7 @@ MCP 客户端配置（如 Claude Desktop 的 claude_desktop_config.json）：
 
 | 平台 | 采集 | 键鼠注入 | 说明 |
 |---|---|---|---|
-| macOS | 需「屏幕录制」授权 | 需「辅助功能」授权 | 系统设置 → 隐私与安全性；开发期 ad-hoc 签名每次重编译后可能需重新授权 |
+| macOS | 需「屏幕录制」授权 | 需「辅助功能」授权 | 系统设置 → 隐私与安全性；重编译后跑 `scripts/codesign-macos.sh` 固定签名标识，授权跨构建保留 |
 | Windows | 无需 | 无需 | 用户态看不到 UAC 弹窗/锁屏/安全桌面 |
 | Linux X11 | 无需 | 无需（XTEST） | Wayland 采集走 portal、注入需额外授权，以实际可用为准 |
 

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 合并进 Tauri 生成的默认 Info.plist。
+	     macOS 15+ 对 UDP 广播等局域网流量按「本地网络」授权管控，
+	     无此键时授权记录无法绑定文案，弹窗/放行行为不可预期。 -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>云书需要在本地网络中发现并连接附近设备，用于互传文件、飞鸽主机与远程控制。</string>
+</dict>
+</plist>
