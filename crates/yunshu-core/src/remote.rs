@@ -1757,8 +1757,33 @@ pub async fn handle_remote_socket(
         });
     }
 
+    // ---- 发送任务：唯一的 socket 写入者 ----
+    // 主循环只密封消息并 try_send 投递（永不阻塞），socket 写入（含 TCP 背压等待）
+    // 全部隔离在这里：对端的 Close/RemoteEnd 何时到都能被主循环立即读出，
+    // 会话结束不再取决于发送是否停滞——「控制端关窗后被控红条迟迟不消」的根治
+    let link_broken = Arc::new(AtomicBool::new(false));
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<(bool, Vec<u8>)>(8);
+    let cap_link_broken = link_broken.clone();
+    let cap_w_frames = send_frames.clone();
+    let cap_w_ms = send_ms.clone();
+    let mut writer = tokio::spawn(async move {
+        while let Some((is_frame, frame)) = writer_rx.recv().await {
+            let t = Instant::now();
+            if sink.send(Message::Binary(frame.into())).await.is_err() {
+                cap_link_broken.store(true, Ordering::Relaxed);
+                break;
+            }
+            if is_frame {
+                cap_w_frames.fetch_add(1, Ordering::Relaxed);
+                // 发送耗时计入自适应窗口（含 TCP 背压等待，链路带不动的直接信号）
+                cap_w_ms.fetch_add(t.elapsed().as_millis() as u64, Ordering::Relaxed);
+            }
+        }
+        let _ = tokio::time::timeout(SEND_STALL, sink.close()).await;
+    });
+
     // ---- 主循环：收（输入/画质/剪贴板/结束）发（控制消息/视频帧）----
-    // 控制消息走 FIFO 分支，视频帧走最新帧信箱单独发送
+    // 收流与发送彻底解耦：本循环不做任何可能阻塞的 socket 写入
     let mut end_reason = "对端断开".to_string();
     // 最近一次收到观看端 Pong 的时刻（None = 尚未收到，看门狗未启用）
     let mut last_pong: Option<Instant> = None;
@@ -1845,14 +1870,11 @@ pub async fn handle_remote_socket(
             },
             out = out_rx.recv() => match out {
                 Some(msg) => match seal_msg(&noise, &msg) {
-                    Ok(frame) => match send_capped(&mut sink, Message::Binary(frame.into())).await {
-                        Err(()) => {
-                            end_reason = "发送失败".into();
-                            break;
-                        }
-                        // Stalled：丢弃这条小消息（实时语义，新值随后就到），回到主循环
-                        Ok(_) => {}
-                    },
+                    Ok(frame) => {
+                        // 通道满（链路严重滞后）即丢弃：Ping/光标/剪贴板都是
+                        // 周期性实时量，下个周期会有新值
+                        let _ = writer_tx.try_send((false, frame));
+                    }
                     Err(e) => {
                         tracing::warn!("远程控制加密失败: {e}");
                         break;
@@ -1870,10 +1892,10 @@ pub async fn handle_remote_socket(
                     };
                     // 取帧即上报：采集线程据此解除滞留、继续产出下一帧
                     sent_seq.store(fm.seq, Ordering::Relaxed);
-                    // 发送耗时计入自适应窗口（含 TCP 背压等待，链路带不动的直接信号）
-                    let t_send = Instant::now();
                     let total = fm.data.len().div_ceil(CHUNK_SIZE) as u16;
-                    let mut failed = false;
+                    // 密封各分块交发送任务；通道满 = 发送滞后于产出，丢整帧
+                    // （对端按 seq 重组，缺块整帧不组装）——主循环永不因发送阻塞，
+                    // 对端的结束信号（Close/RemoteEnd）随时能被收流分支读出
                     for (i, part) in fm.data.chunks(CHUNK_SIZE).enumerate() {
                         let chunk = RemoteOut::FrameChunk {
                             seq: fm.seq,
@@ -1882,32 +1904,17 @@ pub async fn handle_remote_socket(
                             codec: fm.codec,
                             data: part.to_vec(),
                         };
-                        let outcome = match seal_msg(&noise, &chunk) {
-                            Ok(frame) => send_capped(&mut sink, Message::Binary(frame.into())).await,
+                        match seal_msg(&noise, &chunk) {
+                            Ok(frame) => {
+                                if writer_tx.try_send((true, frame)).is_err() {
+                                    break;
+                                }
+                            }
                             Err(e) => {
                                 tracing::warn!("远程控制加密失败: {e}");
-                                Err(())
+                                break;
                             }
-                        };
-                        match outcome {
-                            Err(()) => {
-                                end_reason = "发送失败".into();
-                                failed = true;
-                            }
-                            // Stalled：对端不再收流（如已关观看窗口）。放弃本帧剩余分块
-                            // 回到主循环——收流分支里对端的 Close 帧随即被处理，会话立刻
-                            // 结束；若只是链路抖动则自动恢复（对端按 seq 重组，缺块整帧不组装）
-                            Ok(false) => break,
-                            Ok(true) => {}
                         }
-                        if failed {
-                            break;
-                        }
-                    }
-                    send_frames.fetch_add(1, Ordering::Relaxed);
-                    send_ms.fetch_add(t_send.elapsed().as_millis() as u64, Ordering::Relaxed);
-                    if failed {
-                        break;
                     }
                 }
                 Err(_) => break, // 信箱关闭：采集线程已退出，走正常收尾
@@ -1916,16 +1923,19 @@ pub async fn handle_remote_socket(
                 if killed.load(Ordering::Relaxed) {
                     end_reason = "本机断开了会话".into();
                     // 主动结束显式告知对端：控制端据此区分「被踢」与网络抖动，
-                    // 不进入自动重连。链路已死时发不出去也无妨（对端走自身超时）
+                    // 不进入自动重连。链路已死时投递不出去也无妨（对端走自身超时）
                     if let Ok(frame) = seal_msg(
                         &noise,
                         &RemoteOut::Control(RemoteWire::RemoteEnd {
                             reason: Some("受控端结束了会话".into()),
                         }),
                     ) {
-                        // 链路已死时发不出去也无妨，同样不能卡死收尾
-                        let _ = send_capped(&mut sink, Message::Binary(frame.into())).await;
+                        let _ = writer_tx.try_send((false, frame));
                     }
+                    break;
+                }
+                if link_broken.load(Ordering::Relaxed) {
+                    end_reason = "发送失败".into();
                     break;
                 }
                 // Pong 看门狗：对端静默掉线（合盖/断网，无 FIN）时 TCP 写失败要等
@@ -1940,9 +1950,12 @@ pub async fn handle_remote_socket(
         }
     }
 
-    // Close 握手受停滞上限约束：链路死透时直接放弃（socket 随即 drop，内核 RST），
-    // 决不能让收尾本身卡在发送上——end_session 通知（红条熄灭）就在它后面
-    let _ = tokio::time::timeout(SEND_STALL, sink.close()).await;
+    // 发送任务收尾：余量发完后自行 close（其 close 受 SEND_STALL 约束）；
+    // 卡死在 send 上（链路死透）时 1s 后 abort 释放 socket——end_session
+    // 通知（红条熄灭）决不能等它
+    drop(writer_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(1), &mut writer).await;
+    writer.abort();
     drop(input_tx); // 注入线程退出（Enigo drop 自动释放按住的修饰键）
     // 文件回传半成品清理（无断点续传设计，会话结束即丢弃）
     {
@@ -2939,6 +2952,18 @@ async fn remote_connect_inner(
     // ---- 清理 ----
     let user_closed = closed.load(Ordering::Relaxed);
     closed.store(true, Ordering::Relaxed);
+    // 用户关窗：应用层显式发会话结束消息。对端读到即结束会话、红条熄灭，
+    // 并区分「对方停止观看」与网络异常（WS Close 仅是传输层信号，语义弱）
+    if user_closed
+        && let Ok(frame) = seal_msg(
+            &noise,
+            &RemoteOut::Control(RemoteWire::RemoteEnd {
+                reason: Some("对方已停止观看".into()),
+            }),
+        )
+    {
+        let _ = send_capped(&mut sink, tokio_tungstenite::tungstenite::Message::binary(frame)).await;
+    }
     // Close 握手受停滞上限约束：链路死透时直接放弃（socket 随即 drop，内核 RST）
     let _ = tokio::time::timeout(SEND_STALL, sink.close()).await;
     {
