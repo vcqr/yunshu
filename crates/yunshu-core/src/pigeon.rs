@@ -987,6 +987,12 @@ struct Announce {
     mid: String,
 }
 
+/// 链路本地地址（IPv4 169.254/16，DHCP 失败期系统自配）：只在本地网段可达，
+/// 且对方防火墙通常按「无法识别的网络」拦掉入站。发现广播只走 IPv4。
+fn is_link_local(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(v4) if v4.is_link_local())
+}
+
 async fn handle_packet(st: &Arc<AppState>, data: &[u8], from: SocketAddr) {
     let Ok(p) = serde_json::from_slice::<Announce>(data) else {
         return;
@@ -1001,23 +1007,30 @@ async fn handle_packet(st: &Arc<AppState>, data: &[u8], from: SocketAddr) {
         return;
     }
     if p.id != st.self_id && !p.id.is_empty() && p.kind == "entry" {
-        let is_new = {
+        let (is_new, chosen_ip) = {
             let mut known = st.pigeon_peers.lock().unwrap();
             let is_new = !known.contains_key(&p.id);
+            // 同一设备可能从多个地址发广播（网卡残留 DHCP 失败期的 169.254 自配地址，
+            // 同一 burst 里总是后到）：链路本地的包不覆盖已记录的可达地址，
+            // 否则发现表 ip 被翻成不可达地址，远程控制拿它去连必然超时
+            let chosen_ip = match known.get(&p.id) {
+                Some(old) if is_link_local(from.ip()) && !is_link_local(old.ip) => old.ip,
+                _ => from.ip(),
+            };
             known.insert(
                 p.id.clone(),
                 PeerRecord {
                     name: p.name.clone(),
-                    ip: from.ip(),
+                    ip: chosen_ip,
                     tcp_port: p.port,
                     machine_id: p.mid,
                     last_seen: Instant::now(),
                 },
             );
-            is_new
+            (is_new, chosen_ip)
         };
         if is_new {
-            tracing::info!("发现电脑「{}」（{}:{}）", p.name, from.ip(), p.port);
+            tracing::info!("发现电脑「{}」（{}:{}）", p.name, chosen_ip, p.port);
             emit_peers(st);
         }
         // 只要没有链路就尝试连接（覆盖：首次发现 / 链路断开后重连）。
@@ -1033,7 +1046,7 @@ async fn handle_packet(st: &Arc<AppState>, data: &[u8], from: SocketAddr) {
         if should_connect {
             let st2 = st.clone();
             let id = p.id.clone();
-            let ip = from.ip();
+            let ip = chosen_ip;
             tokio::spawn(async move {
                 pigeon_connect(st2, id, ip, p.port).await;
             });
@@ -2322,6 +2335,35 @@ mod tests {
         assert_eq!(rows.len(), 1, "防打扰静音不应影响落库: {rows:?}");
         assert_eq!(rows[0].channel, "broadcast");
         assert_eq!(rows[0].text, "被静音也要留痕");
+    }
+
+    /// 同一设备从全局地址和 169.254 自配地址各发一包广播（后者总在后）：
+    /// 发现表 ip 必须停在可达的全局地址上，不被链路本地的包翻走
+    #[tokio::test]
+    async fn announce_prefers_global_ip_over_link_local() {
+        let st = test_state(false, "announce_linklocal");
+        let announce = |id: &str| {
+            serde_json::json!({
+                "v": 1, "kind": "entry", "id": id, "name": "Win-Pc", "port": 8000, "mid": id
+            })
+            .to_string()
+            .into_bytes()
+        };
+        // 先链路本地后全局：取全局
+        handle_packet(&st, &announce("pc-1"), "169.254.41.202:8000".parse().unwrap()).await;
+        handle_packet(&st, &announce("pc-1"), "192.168.0.3:8000".parse().unwrap()).await;
+        // 先全局后链路本地（真实设备两个地址交替广播、链路本地总后到）：不回退
+        handle_packet(&st, &announce("pc-1"), "169.254.41.202:8000".parse().unwrap()).await;
+        assert_eq!(
+            st.pigeon_peers.lock().unwrap()["pc-1"].ip.to_string(),
+            "192.168.0.3"
+        );
+        // 设备整体换网（全局→另一个全局）：照常更新
+        handle_packet(&st, &announce("pc-1"), "192.168.31.26:8000".parse().unwrap()).await;
+        assert_eq!(
+            st.pigeon_peers.lock().unwrap()["pc-1"].ip.to_string(),
+            "192.168.31.26"
+        );
     }
 
     #[test]
