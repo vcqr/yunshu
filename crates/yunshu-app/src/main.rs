@@ -823,6 +823,11 @@ fn main() {
     if win_service::try_dispatch() {
         return;
     }
+    // 无人值守三期：SYSTEM 安全助手（服务拉起，锁屏采集/输入见 remote/secure.rs）
+    #[cfg(windows)]
+    if yunshu_core::remote::secure::try_run_helper_command() {
+        return;
+    }
     // CLI 覆盖（单机双实例测试用）：yunshu.exe --port 8001 --name testa
     // 覆盖只影响本次运行，不写入 config.toml
     let mut args = std::env::args().skip(1);

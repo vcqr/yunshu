@@ -10,11 +10,16 @@
 #![cfg(windows)]
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Security::{
+    DuplicateTokenEx, SetTokenInformation, SecurityImpersonation, TokenPrimary, TokenSessionId,
+    TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+};
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, DETACHED_PROCESS,
-    PROCESS_INFORMATION, STARTUPINFOW, WaitForSingleObject,
+    GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, DETACHED_PROCESS, PROCESS_INFORMATION,
+    STARTUPINFOW, WaitForSingleObject,
 };
 use windows::core::PWSTR;
 use windows_service::service::{
@@ -109,6 +114,9 @@ fn run_service(_args: Vec<std::ffi::OsString>) -> windows_service::Result<()> {
 /// 服务主循环：每 3 秒检查活动控制台会话，agent 未运行则以登录用户身份拉起
 fn agent_loop(stop_rx: std::sync::mpsc::Receiver<()>) {
     let mut child: Option<HANDLE> = None;
+    let mut helper: Option<HANDLE> = None;
+    // 三期：接管令牌每次服务启动随机生成，分别下发给助手与 agent
+    let secure_token = yunshu_core::remote::secure::random_token();
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(_) => return,
@@ -121,7 +129,7 @@ fn agent_loop(stop_rx: std::sync::mpsc::Receiver<()>) {
         {
             break;
         }
-        // 回收已退出的 agent
+        // 回收已退出的 agent / 安全助手
         if let Some(h) = child {
             unsafe {
                 if WaitForSingleObject(h, 0) == WAIT_OBJECT_0 {
@@ -130,15 +138,31 @@ fn agent_loop(stop_rx: std::sync::mpsc::Receiver<()>) {
                 }
             }
         }
-        if child.is_some() {
-            continue;
+        if let Some(h) = helper {
+            unsafe {
+                if WaitForSingleObject(h, 0) == WAIT_OBJECT_0 {
+                    let _ = CloseHandle(h);
+                    helper = None;
+                }
+            }
         }
         let session = unsafe { WTSGetActiveConsoleSessionId() };
         // 0xFFFFFFFF = 无活动会话（未登录/锁屏前一瞬间）
         if session == u32::MAX {
             continue;
         }
-        match unsafe { spawn_agent_in_session(&exe, session) } {
+        // 三期：SYSTEM 安全助手（控制台会话内），锁屏采集/输入的执行者。
+        // 登录界面即可拉起（不依赖用户令牌）；agent 死亡不影响助手存活
+        if helper.is_none() {
+            match unsafe { spawn_secure_helper(&exe, session, &secure_token) } {
+                Ok(h) => helper = Some(h),
+                Err(e) => eprintln!("安全助手拉起失败（session {session}）: {e}"),
+            }
+        }
+        if child.is_some() {
+            continue;
+        }
+        match unsafe { spawn_agent_in_session(&exe, session, &secure_token) } {
             Ok(h) => child = Some(h),
             // 会话刚登录令牌未就绪等情况：静默重试
             Err(e) => eprintln!("拉起会话代理失败（session {session}）: {e}"),
@@ -147,11 +171,74 @@ fn agent_loop(stop_rx: std::sync::mpsc::Receiver<()>) {
     // 退出时不杀 agent：用户可能正用着，agent 随下次注销/关机退出
 }
 
+/// 以 SYSTEM 身份在控制台会话内启动安全助手（yunshu.exe secure --token …）。
+/// SYSTEM + 控制台会话 ⇒ 可采集安全桌面（锁屏）、SendInput 可达安全桌面。
+/// SAFETY: 运行于 SYSTEM 服务上下文；令牌/句柄由 RAII guard 释放
+unsafe fn spawn_secure_helper(
+    exe: &std::path::Path,
+    session: u32,
+    token_hex: &str,
+) -> windows::core::Result<HANDLE> {
+    unsafe {
+        let mut cur = HANDLE::default();
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY | TOKEN_ADJUST_SESSIONID,
+            &mut cur,
+        )?;
+        let _cur_guard = HandleGuard(cur);
+
+        let mut dup = HANDLE::default();
+        DuplicateTokenEx(
+            cur,
+            TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY | TOKEN_ADJUST_SESSIONID,
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut dup,
+        )?;
+        let _dup_guard = HandleGuard(dup);
+
+        // 会话重定向到活动控制台会话（服务本体在会话 0）
+        SetTokenInformation(
+            dup,
+            TokenSessionId,
+            &(session as i32) as *const i32 as *const core::ffi::c_void,
+            4,
+        )?;
+
+        let args = format!(""{}" secure --token {token_hex}", exe.display());
+        let args_w: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            ..Default::default()
+        };
+        let mut pi = PROCESS_INFORMATION::default();
+        CreateProcessAsUserW(
+            Some(dup),
+            PWSTR::null(),
+            Some(PWSTR(args_w.as_mut_ptr())),
+            None,
+            None,
+            false,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            None,
+            None,
+            &si,
+            &mut pi,
+        )?;
+        windows::Win32::System::Threading::ResumeThread(pi.hThread);
+        let _ = CloseHandle(pi.hThread);
+        Ok(pi.hProcess)
+    }
+}
+
 /// 以会话用户身份在控制台会话内启动 agent（yunshu.exe）
 /// SAFETY: 运行于 SYSTEM 服务上下文；token/env 句柄由 RAII guard 释放
 unsafe fn spawn_agent_in_session(
     exe: &std::path::Path,
     session: u32,
+    secure_token: &str,
 ) -> windows::core::Result<HANDLE> {
     unsafe {
         let mut token = HANDLE::default();
@@ -160,7 +247,25 @@ unsafe fn spawn_agent_in_session(
 
         let mut env: *mut core::ffi::c_void = std::ptr::null_mut();
         CreateEnvironmentBlock(&mut env, Some(token_guard.0), false)?;
-        struct EnvGuard(*mut core::ffi::c_void);
+        // 追加 YUNSHU_SECURE_TOKEN（三期）：agent 据此与 SYSTEM 安全助手互信。
+        // 环境块 = 双 0 结尾的字符串序列，把新变量拼在结尾
+        let extra: Vec<u16> = format!("YUNSHU_SECURE_TOKEN={secure_token} ")
+            .encode_utf16()
+            .collect();
+        let mut n = 0usize;
+        loop {
+            let p = env as *const u16;
+            if *p.add(n) == 0 && *p.add(n + 1) == 0 {
+                n += 2;
+                break;
+            }
+            n += 1;
+        }
+        let mut merged: Vec<u16> = Vec::with_capacity(n + extra.len() + 1);
+        merged.extend_from_slice(std::slice::from_raw_parts(env as *const u16, n - 1));
+        merged.extend_from_slice(&extra);
+        merged.push(0);
+        struct EnvGuard(*mut core::ffi::c_void, Vec<u16>);
         impl Drop for EnvGuard {
             fn drop(&mut self) {
                 unsafe {
@@ -168,7 +273,7 @@ unsafe fn spawn_agent_in_session(
                 }
             }
         }
-        let _env_guard = EnvGuard(env);
+        let _env_guard = EnvGuard(env, merged);
 
         let exe_w: Vec<u16> = exe
             .to_string_lossy()
@@ -180,6 +285,7 @@ unsafe fn spawn_agent_in_session(
             ..Default::default()
         };
         let mut pi = PROCESS_INFORMATION::default();
+        let merged_env = _env_guard.1.as_ptr();
         CreateProcessAsUserW(
             Some(token_guard.0),
             PWSTR(exe_w.as_ptr() as *mut u16),
@@ -188,7 +294,7 @@ unsafe fn spawn_agent_in_session(
             None,
             false,
             CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | DETACHED_PROCESS,
-            Some(env),
+            Some(merged_env as *mut core::ffi::c_void),
             None,
             &si,
             &mut pi,

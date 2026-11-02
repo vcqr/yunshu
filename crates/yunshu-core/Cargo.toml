@@ -50,7 +50,16 @@ objc2-video-toolbox = { version = "0.3", features = ["VTBase", "VTErrors", "VTSe
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56.0"
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
+    "Win32_Security",
+] }
 # MediaFoundation 硬件 H.264 编码（encoder.rs 的 MfH264Encoder）；
 # ICodecAPI（强推关键帧/低延迟）在 DirectShow 模块，VARIANT 用于其 SetValue
 windows = { version = "0.61", features = [

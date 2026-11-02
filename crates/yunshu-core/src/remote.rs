@@ -21,6 +21,7 @@ use crate::server::AppState;
 use crate::{CoreEvent, UiRequest};
 #[cfg(windows)]
 pub mod wgc;
+pub mod secure;
 use futures_util::{SinkExt, StreamExt};
 use sha2::Digest as ShaDigest;
 use snow::TransportState;
@@ -982,7 +983,36 @@ fn map_button(btn: u8) -> enigo::Button {
 
 /// 注入线程：Enigo 生命周期绑定在线程内（跨平台 Send 保证不齐），会话结束随 Sender drop 退出。
 /// bounds 为共享引用：显示器切换后由采集线程更新，移动事件实时读取。
-fn spawn_input_thread(bounds: Arc<Mutex<(u32, u32)>>) -> std::sync::mpsc::Sender<InputCmd> {
+/// InputCmd → InputEvent 反变换（锁屏时输入改道 SYSTEM 助手用；Paste 无意义返回 None）
+/// 非 Windows 构建无调用点（路由块仅 Windows），保留逻辑供单测
+#[cfg_attr(not(windows), allow(dead_code))]
+fn cmd_to_event(cmd: &InputCmd) -> Option<InputEvent> {
+    match cmd {
+        InputCmd::Move { x, y } => Some(InputEvent::MouseMove { x: *x, y: *y }),
+        InputCmd::Button { btn, down } => {
+            if *down {
+                Some(InputEvent::MouseDown { btn: *btn })
+            } else {
+                Some(InputEvent::MouseUp { btn: *btn })
+            }
+        }
+        InputCmd::Wheel { dy } => Some(InputEvent::Wheel { dy: *dy }),
+        InputCmd::Key { name, down } => {
+            if *down {
+                Some(InputEvent::KeyDown { key: name.clone() })
+            } else {
+                Some(InputEvent::KeyUp { key: name.clone() })
+            }
+        }
+        InputCmd::Paste { .. } => None, // 锁屏下剪贴板粘贴无意义
+    }
+}
+
+fn spawn_input_thread(
+    bounds: Arc<Mutex<(u32, u32)>>,
+    #[cfg(windows)] secure_route: Option<Arc<secure::Route>>,
+    #[cfg(not(windows))] _secure_route: Option<()>,
+) -> std::sync::mpsc::Sender<InputCmd> {
     let (tx, rx) = std::sync::mpsc::channel::<InputCmd>();
     let fake = fake_screen_enabled();
     std::thread::Builder::new()
@@ -1001,6 +1031,15 @@ fn spawn_input_thread(bounds: Arc<Mutex<(u32, u32)>>) -> std::sync::mpsc::Sender
                 }
             };
             for cmd in rx {
+                // 三期（Windows）：锁屏时注入改道 SYSTEM 安全助手（可达安全桌面）
+                #[cfg(windows)]
+                if let Some(route) = &secure_route
+                    && route.locked.load(Ordering::Relaxed)
+                    && let Some(ev) = cmd_to_event(&cmd)
+                {
+                    route.pipe.lock().unwrap().as_ref().map(|p| p.send_input(&ev));
+                    continue;
+                }
                 let r: Result<(), _> = match cmd {
                     InputCmd::Move { x, y } => {
                         let (bw, bh) = {
@@ -1485,7 +1524,14 @@ pub async fn handle_remote_socket(
     // 发送侧窗口统计（主循环累计、采集线程结算消费）：已发帧数 / 每帧发送耗时 ms
     let send_frames = Arc::new(AtomicU64::new(0));
     let send_ms = Arc::new(AtomicU64::new(0));
-    let input_tx = spawn_input_thread(bounds.clone());
+    // 三期（Windows）：锁屏时采集/输入切换到 SYSTEM 安全助手（secure.rs）
+    #[cfg(windows)]
+    let mut secure_helper = secure::AgentSecure::new();
+    #[cfg(windows)]
+    let secure_route = Some(secure_helper.route());
+    #[cfg(not(windows))]
+    let secure_route = None;
+    let input_tx = spawn_input_thread(bounds.clone(), secure_route);
     // 会话级编码格式（观看端能力协商后经 RemoteUseCodec 更新）；显示器切换请求
     let codec_flag = Arc::new(std::sync::atomic::AtomicU8::new(crate::encoder::CODEC_JPEG));
     let monitor_switch = Arc::new(Mutex::new(None::<u32>));
@@ -1505,6 +1551,8 @@ pub async fn handle_remote_socket(
         let cap_sent_seq = sent_seq.clone();
         let cap_send_frames = send_frames.clone();
         let cap_send_ms = send_ms.clone();
+        #[cfg(windows)]
+        let cap_secure = secure_helper;
         let capture_thread = std::thread::Builder::new()
             .name("remote-capture".into())
             .spawn(move || {
@@ -1532,6 +1580,28 @@ pub async fn handle_remote_socket(
                 loop {
                     if cap_killed.load(Ordering::Relaxed) {
                         break;
+                    }
+                    // 三期（Windows）：锁屏时由 SYSTEM 安全助手接管采集，
+                    // 编码帧经管道直达（已缩放已编码，跳过本地采集）
+                    #[cfg(windows)]
+                    {
+                        let (mw, q) = {
+                            let p = cap_params.lock().unwrap();
+                            (p.max_width, p.quality)
+                        };
+                        if let Some(fr) = cap_secure.poll(mw, q) {
+                            seq = seq.wrapping_add(1);
+                            queued_seq = seq;
+                            sent_seq.store(seq, Ordering::Relaxed);
+                            let _ = cap_frame_tx.send(Some(Arc::new(FrameMsg {
+                                seq,
+                                codec: fr.codec,
+                                data: fr.data,
+                            })));
+                            last_sent = std::time::Instant::now();
+                            std::thread::sleep(std::time::Duration::from_millis(30));
+                            continue;
+                        }
                     }
                     // 显示器切换请求（控制端下发）
                     if let Some(index) = cap_monitor.lock().unwrap().take()
