@@ -20,16 +20,18 @@ jobs:
       matrix:
         include:
           # macOS ARM64（Apple Silicon）
+          # bundles 必须含 app：仅 dmg 时 .app 是中间产物，打完即被清理，
+          # 下面的签名校验就没东西可查了
           - platform: macos-15
             target: aarch64-apple-darwin
-            bundles: "dmg"
+            bundles: "app,dmg"
             files: |
               target/aarch64-apple-darwin/release/bundle/dmg/yunshu_*.dmg
               yunshu-cli_*_aarch64-apple-darwin.zip
           # macOS x86_64（Intel）
           - platform: macos-15-intel
             target: x86_64-apple-darwin
-            bundles: "dmg"
+            bundles: "app,dmg"
             files: |
               target/x86_64-apple-darwin/release/bundle/dmg/yunshu_*.dmg
               yunshu-cli_*_x86_64-apple-darwin.zip
@@ -151,6 +153,10 @@ jobs:
         shell: bash
         run: |
           APP=$(find "target/${{ matrix.target }}/release/bundle/macos" -maxdepth 1 -name '*.app' | head -1)
+          if [ -z "$APP" ]; then
+            echo "::error::bundle/macos 下没有 .app——矩阵 bundles 需含 app（仅 dmg 时 .app 作为中间产物会被清理）"
+            exit 1
+          fi
           ID=$(codesign -dv "$APP" 2>&1 | sed -n 's/^Identifier=//p')
           echo "签名标识: $ID"
           [ "$ID" = "com.yunshu.desktop" ] || {
