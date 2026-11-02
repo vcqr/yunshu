@@ -124,7 +124,9 @@ mod tests {
 }
 
 /// 接管路由：输入线程据此把注入改道到平台助手（锁屏期间）。
-/// Windows = 命名管道（采集帧 + 输入）；macOS = unix 套接字（仅输入，采集保持本地）
+/// Windows = 命名管道（采集帧 + 输入）；macOS = unix 套接字（仅输入，采集保持本地）。
+/// 仅三期平台（Windows/macOS）存在：依赖的平台助手与管道/套接字客户端 Linux 上没有
+#[cfg(any(windows, target_os = "macos"))]
 pub struct Route {
     pub locked: AtomicBool,
     #[cfg(windows)]
@@ -133,6 +135,7 @@ pub struct Route {
     pub sock: Mutex<Option<macos::UnixInputClient>>,
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 impl Route {
     pub fn new() -> Self {
         Route {
@@ -145,6 +148,7 @@ impl Route {
     }
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 impl Default for Route {
     fn default() -> Self {
         Self::new()
@@ -769,7 +773,7 @@ mod win {
 }
 
 #[cfg(windows)]
-pub use win::{AgentSecure, PipeClient, Route};
+pub use win::{AgentSecure, PipeClient};
 #[cfg(target_os = "macos")]
 pub use macos::{AgentSecure, plist_installed};
 
@@ -1039,11 +1043,8 @@ pub fn try_run_helper_command() -> bool {
         .and_then(|_| args.next())
         .unwrap_or_default();
     #[cfg(windows)]
-    win::run_helper(&token);
-    #[cfg(windows)]
     {
-        win::run_helper(&token);
-        false
+        win::run_helper(&token)
     }
     #[cfg(target_os = "macos")]
     {
