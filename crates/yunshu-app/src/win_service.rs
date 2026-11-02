@@ -11,15 +11,15 @@
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Security::{
-    DuplicateTokenEx, SetTokenInformation, SecurityImpersonation, TokenPrimary, TokenSessionId,
-    TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+    DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TOKEN_ADJUST_SESSIONID,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, TokenPrimary, TokenSessionId,
 };
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW, CREATE_SUSPENDED,
-    CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, DETACHED_PROCESS, PROCESS_INFORMATION,
-    STARTUPINFOW, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+    DETACHED_PROCESS, GetCurrentProcess, OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW,
+    WaitForSingleObject,
 };
 use windows::core::PWSTR;
 use windows_service::service::{
@@ -50,6 +50,7 @@ pub fn try_dispatch() -> bool {
                     Ok(()) => println!("Yunshu 服务已安装（开机自启，登录会话内自动拉起）"),
                     Err(e) => {
                         eprintln!("安装失败: {e}");
+                        show_error_box("Yunshu 服务安装失败", &e);
                         std::process::exit(1);
                     }
                 }
@@ -60,6 +61,7 @@ pub fn try_dispatch() -> bool {
                     Ok(()) => println!("Yunshu 服务已卸载"),
                     Err(e) => {
                         eprintln!("卸载失败: {e}");
+                        show_error_box("Yunshu 服务卸载失败", &e);
                         std::process::exit(1);
                     }
                 }
@@ -207,8 +209,8 @@ unsafe fn spawn_secure_helper(
             4,
         )?;
 
-        let args = format!(""{}" secure --token {token_hex}", exe.display());
-        let args_w: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
+        let args = format!("\"{}\" secure --token {token_hex}", exe.display());
+        let mut args_w: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
         let si = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
             ..Default::default()
@@ -249,8 +251,9 @@ unsafe fn spawn_agent_in_session(
         CreateEnvironmentBlock(&mut env, Some(token_guard.0), false)?;
         // 追加 YUNSHU_SECURE_TOKEN（三期）：agent 据此与 SYSTEM 安全助手互信。
         // 环境块 = 双 0 结尾的字符串序列，把新变量拼在结尾
-        let extra: Vec<u16> = format!("YUNSHU_SECURE_TOKEN={secure_token} ")
+        let extra: Vec<u16> = format!("YUNSHU_SECURE_TOKEN={secure_token}")
             .encode_utf16()
+            .chain(std::iter::once(0))
             .collect();
         let mut n = 0usize;
         loop {
@@ -337,7 +340,7 @@ fn install() -> Result<(), String> {
         account_password: None,
     };
     let service = manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG)
+        .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
         .map_err(|e| e.to_string())?;
     // 失败自动重启（崩溃/被杀后 30 秒拉起）
     let actions = vec![
@@ -364,6 +367,8 @@ fn install() -> Result<(), String> {
             actions: Some(actions),
         })
         .map_err(|e| e.to_string())?;
+    // 装完立即启动：RunAs 提权上下文内有权限；已在运行则忽略
+    let _ = service.start::<&std::ffi::OsStr>(&[]);
     Ok(())
 }
 
@@ -382,4 +387,111 @@ fn uninstall() -> Result<(), String> {
     let _ = service.stop();
     service.delete().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 查询服务状态（设置页显示用）：not_installed / stopped / running
+pub fn status() -> Result<String, String> {
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| e.to_string())?;
+    // 未注册（open 失败）= 未安装，不是错误
+    let service = match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        Ok(s) => s,
+        Err(_) => return Ok("not_installed".into()),
+    };
+    let st = service.query_status().map_err(|e| e.to_string())?;
+    Ok(match st.current_state {
+        ServiceState::Running => "running",
+        _ => "stopped",
+    }
+    .into())
+}
+
+/// 提权子进程无可见控制台（release 为 GUI 子系统），失败原因以弹窗透出
+fn show_error_box(title: &str, msg: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    use windows::core::PCWSTR;
+    let wide = |s: &str| -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let (t, m) = (wide(title), wide(msg));
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(m.as_ptr()),
+            PCWSTR(t.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+/// 以管理员权限运行自身子命令（UAC 弹窗）。直接 ShellExecuteExW(runas)，
+/// 不经 powershell Start-Process 中转——实测部分环境 spawn powershell 报 os error 50。
+/// 等待子进程退出并检查退出码（0 = 成功）。
+pub fn run_elevated(args: &[&str]) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED};
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
+    use windows::Win32::UI::Shell::{
+        SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
+    use windows::core::PCWSTR;
+
+    // ShellExecuteExW 需要 COM：STA 初始化；RPC_E_CHANGED_MODE = 线程已有套间，复用不配对释放
+    let com_initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+
+    let run = || -> Result<(), String> {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let wide = |s: &std::ffi::OsStr| -> Vec<u16> {
+            s.encode_wide().chain(std::iter::once(0)).collect()
+        };
+        let exe_w = wide(exe.as_os_str());
+        let verb_w: Vec<u16> = "runas\0".encode_utf16().collect();
+        let params_w: Vec<u16> = args
+            .join(" ")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let mut sei = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOASYNC | SEE_MASK_NOCLOSEPROCESS,
+            lpVerb: PCWSTR(verb_w.as_ptr()),
+            lpFile: PCWSTR(exe_w.as_ptr()),
+            lpParameters: PCWSTR(params_w.as_ptr()),
+            ..Default::default()
+        };
+        if let Err(e) = unsafe { ShellExecuteExW(&mut sei) } {
+            if e.code() == windows::core::HRESULT::from_win32(ERROR_CANCELLED.0) {
+                return Err("已取消（需要管理员授权才能安装/卸载服务）".into());
+            }
+            return Err(format!("提权启动失败：{e}"));
+        }
+        unsafe {
+            if sei.hProcess.is_invalid() {
+                return Err("提权启动失败（未取得进程句柄）".into());
+            }
+            let _ = WaitForSingleObject(sei.hProcess, INFINITE);
+            let mut code = 0u32;
+            let _ = GetExitCodeProcess(sei.hProcess, &mut code);
+            let _ = CloseHandle(sei.hProcess);
+            if code == 0 {
+                Ok(())
+            } else {
+                Err("服务操作失败（详见弹窗提示）".into())
+            }
+        }
+    };
+
+    let result = run();
+    if com_initialized {
+        unsafe { CoUninitialize() };
+    }
+    result
 }

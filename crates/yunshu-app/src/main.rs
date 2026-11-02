@@ -391,14 +391,17 @@ fn shell_open_and_select(
     existing: &std::path::Path,
 ) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
     use windows::Win32::System::Com::{
-        CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
+        COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
     };
     use windows::Win32::UI::Shell::{ILFindLastID, SHOpenFolderAndSelectItems, SHParseDisplayName};
+    use windows::core::PCWSTR;
 
     fn wide(p: &std::path::Path) -> Vec<u16> {
-        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
     unsafe {
@@ -610,25 +613,12 @@ fn remote_send_files(state: tauri::State<AppState>, paths: Vec<String>) {
     let _ = state.ui_tx.send(UiRequest::RemoteSendFiles { paths });
 }
 
-/// 以系统服务方式自启（Windows：提权安装；其余平台不支持）
+/// 以系统服务方式自启（Windows：UAC 提权运行自身 service install；其余平台不支持）
 #[tauri::command]
 fn service_install() -> Result<(), String> {
     #[cfg(windows)]
     {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let script = format!(
-            "Start-Process -Verb RunAs -FilePath '{}' -ArgumentList 'service','install' -Wait",
-            exe.display()
-        );
-        let status = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .status()
-            .map_err(|e| e.to_string())?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err("服务安装未完成（需要管理员授权）".into())
-        }
+        win_service::run_elevated(&["service", "install"])
     }
     #[cfg(not(windows))]
     {
@@ -636,29 +626,29 @@ fn service_install() -> Result<(), String> {
     }
 }
 
-/// 卸载系统服务（Windows：提权卸载）
+/// 卸载系统服务（Windows：UAC 提权运行自身 service uninstall）
 #[tauri::command]
 fn service_uninstall() -> Result<(), String> {
     #[cfg(windows)]
     {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let script = format!(
-            "Start-Process -Verb RunAs -FilePath '{}' -ArgumentList 'service','uninstall' -Wait",
-            exe.display()
-        );
-        let status = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .status()
-            .map_err(|e| e.to_string())?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err("服务卸载未完成（需要管理员授权）".into())
-        }
+        win_service::run_elevated(&["service", "uninstall"])
     }
     #[cfg(not(windows))]
     {
         Err("系统服务自启仅支持 Windows".into())
+    }
+}
+
+/// 查询系统服务状态（设置页显示）：not_installed / stopped / running / unsupported
+#[tauri::command]
+fn service_status() -> String {
+    #[cfg(windows)]
+    {
+        win_service::status().unwrap_or_else(|e| format!("error:{e}"))
+    }
+    #[cfg(not(windows))]
+    {
+        "unsupported".into()
     }
 }
 
@@ -1041,6 +1031,7 @@ fn main() {
             remote_send_files,
             service_install,
             service_uninstall,
+            service_status,
             remote_assist_request,
             remote_assist_respond,
             get_view_info,

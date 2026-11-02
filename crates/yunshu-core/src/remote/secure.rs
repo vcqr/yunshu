@@ -193,7 +193,10 @@ mod win {
     struct PipeSec {
         sa: SECURITY_ATTRIBUTES,
         sd: [u8; 40],
+        // 被安全描述符以裸指针引用（ACE→SID），本体无直接读取，须保活
+        #[allow(dead_code)]
         acl: [u8; 256],
+        #[allow(dead_code)]
         sid: Vec<u8>,
     }
 

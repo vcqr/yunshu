@@ -99,6 +99,7 @@ async function openSettings() {
     mutations.setRemoteMachineId(s.machine_id || null)
   }
   showSettings.value = true
+  void refreshServiceStatus()
 }
 async function browseSaveDir() {
   const { open } = await import('@tauri-apps/plugin-dialog')
@@ -142,6 +143,44 @@ async function clearFixedPassword() {
   } catch (e) {
     toast.error(`清除失败：${String(e)}`)
   }
+}
+
+/* -------- 锁屏接管服务（三期无人值守）：SYSTEM 服务 + 安全助手，锁屏仍可控 -------- */
+const serviceState = ref('unknown')
+const serviceBusy = ref(false)
+const serviceStatusText = computed(() =>
+  ({
+    running: '已安装 · 运行中',
+    stopped: '已安装 · 未运行',
+    not_installed: '未安装',
+    unsupported: '仅 Windows 支持',
+    unknown: '',
+  })[serviceState.value] ?? '',
+)
+async function refreshServiceStatus() {
+  serviceState.value = await invoke<string>('service_status').catch(() => 'unknown')
+}
+async function installService() {
+  serviceBusy.value = true
+  try {
+    await invoke('service_install')
+    toast.success('服务已安装并启动，锁屏期间仍可远程控制')
+  } catch (e) {
+    toast.error(String(e))
+  }
+  serviceBusy.value = false
+  await refreshServiceStatus()
+}
+async function uninstallService() {
+  serviceBusy.value = true
+  try {
+    await invoke('service_uninstall')
+    toast.success('服务已卸载，锁屏后恢复不可控')
+  } catch (e) {
+    toast.error(String(e))
+  }
+  serviceBusy.value = false
+  await refreshServiceStatus()
 }
 
 /* --------------------------- 微信通道：见 WeixinPanel 组件 --------------------------- */
@@ -486,6 +525,44 @@ onMounted(async () => {
               <p class="text-[11px] leading-relaxed text-muted-foreground">
                 其他 Yunshu 凭「机器 ID + 密码」即可控制本机（密码正确即授权）。macOS 需授予「屏幕录制」与「辅助功能」权限。
               </p>
+
+              <!-- 锁屏接管服务（无人值守三期）：SYSTEM 服务 + 安全助手，锁屏仍可控可解锁 -->
+              <div class="grid gap-2 border-t pt-3">
+                <div class="flex items-start justify-between gap-2">
+                  <div class="min-w-0">
+                    <div class="text-sm font-medium">锁屏接管服务</div>
+                    <div class="text-xs text-muted-foreground">
+                      装上后开机自动启动，锁屏时仍可远程看到锁屏画面并输入密码解锁（仅 Windows）
+                    </div>
+                  </div>
+                  <span
+                    v-if="serviceStatusText"
+                    class="shrink-0 rounded-full border px-2 py-0.5 text-[11px]"
+                    :class="serviceState === 'running' ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'"
+                  >{{ serviceStatusText }}</span>
+                </div>
+                <div class="flex gap-2">
+                  <button
+                    v-if="serviceState === 'not_installed' || serviceState === 'unknown'"
+                    :disabled="serviceBusy"
+                    class="h-9 rounded-lg border px-3 text-sm hover:bg-accent disabled:opacity-50"
+                    @click="installService"
+                  >
+                    {{ serviceBusy ? '处理中…' : '安装服务' }}
+                  </button>
+                  <button
+                    v-if="serviceState === 'running' || serviceState === 'stopped'"
+                    :disabled="serviceBusy"
+                    class="h-9 rounded-lg border px-3 text-xs text-red-600 hover:bg-red-500/10 disabled:opacity-50 dark:text-red-400"
+                    @click="uninstallService"
+                  >
+                    卸载服务
+                  </button>
+                </div>
+                <p v-if="serviceState === 'stopped'" class="text-[11px] text-muted-foreground">
+                  服务已安装但未运行（可能被手动停止）：重启电脑后自动启动，或在「服务」管理器中启动 yunshu。
+                </p>
+              </div>
             </section>
 
             <!-- 代理（企业网络）：直连 / 跟随系统 / 自定义 -->

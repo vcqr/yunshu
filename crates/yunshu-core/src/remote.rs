@@ -1526,7 +1526,7 @@ pub async fn handle_remote_socket(
     let send_ms = Arc::new(AtomicU64::new(0));
     // 三期（Windows）：锁屏时采集/输入切换到 SYSTEM 安全助手（secure.rs）
     #[cfg(windows)]
-    let mut secure_helper = secure::AgentSecure::new();
+    let secure_helper = secure::AgentSecure::new();
     #[cfg(windows)]
     let secure_route = Some(secure_helper.route());
     #[cfg(not(windows))]
@@ -1552,7 +1552,7 @@ pub async fn handle_remote_socket(
         let cap_send_frames = send_frames.clone();
         let cap_send_ms = send_ms.clone();
         #[cfg(windows)]
-        let cap_secure = secure_helper;
+        let mut cap_secure = secure_helper;
         let capture_thread = std::thread::Builder::new()
             .name("remote-capture".into())
             .spawn(move || {
@@ -1592,7 +1592,7 @@ pub async fn handle_remote_socket(
                         if let Some(fr) = cap_secure.poll(mw, q) {
                             seq = seq.wrapping_add(1);
                             queued_seq = seq;
-                            sent_seq.store(seq, Ordering::Relaxed);
+                            cap_sent_seq.store(seq, Ordering::Relaxed);
                             let _ = cap_frame_tx.send(Some(Arc::new(FrameMsg {
                                 seq,
                                 codec: fr.codec,
