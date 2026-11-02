@@ -44,7 +44,7 @@ impl GraphicsCaptureApiHandler for WgcHandler {
         let mut row_padded = Vec::new();
         let rgba = frame.buffer()?.as_nopadding_buffer(&mut row_padded).to_vec();
         if rgba.len() == (w * h * 4) as usize {
-            *self.latest.lock().unwrap() = Some((w, h, rgba));
+            *self.latest.lock().unwrap_or_else(|p| p.into_inner()) = Some((w, h, rgba));
         }
         Ok(())
     }
@@ -122,7 +122,7 @@ impl ScreenSource for WgcSource {
 
     fn capture(&mut self) -> Option<Frame> {
         // 取 WGC 最新帧；槽空（刚启动/异常）回退 xcap 同步截屏
-        if let Some((w, h, rgba)) = self.latest.lock().unwrap().take() {
+        if let Some((w, h, rgba)) = self.latest.lock().unwrap_or_else(|p| p.into_inner()).take() {
             return Some(Frame {
                 width: w,
                 height: h,
@@ -139,7 +139,7 @@ impl ScreenSource for WgcSource {
     fn set_monitor(&mut self, index: u32) -> bool {
         if self.xcap.set_monitor(index) {
             self.current = index as usize;
-            self.latest.lock().unwrap().take();
+            self.latest.lock().unwrap_or_else(|p| p.into_inner()).take();
             self.start_capture();
             true
         } else {

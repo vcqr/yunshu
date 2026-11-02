@@ -829,6 +829,24 @@ pub fn make_screen_source() -> Result<Box<dyn ScreenSource>, String> {
         .ok_or_else(|| "无法枚举显示器".into())
 }
 
+/// 采集一步，吞掉采集器的 panic。Windows 锁屏/安全桌面/显示器热切换时
+/// WGC 停止推帧、GDI BitBlt 可能失败甚至 panic——采集线程（或建连探针）
+/// 一旦死掉，frame 信箱断流 + Pong 看门狗会把整个会话拖垮（无人值守锁屏即断）。
+/// 任何异常都按"本帧无画面"处理：会话保活，解锁/恢复后自动出画。
+fn safe_capture(source: &mut dyn ScreenSource) -> Option<Frame> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.capture())).unwrap_or_else(
+        |e| {
+            let msg = e
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "未知 panic".into());
+            tracing::warn!("屏幕采集 panic（已忽略，按无画面处理）: {msg}");
+            None
+        },
+    )
+}
+
 /// 盒滤波缩放（目标为最长边上限；不超上限原样返回）
 pub fn scale_frame(src: &Frame, max_side: u32) -> Frame {
     let longest = src.width.max(src.height);
@@ -1384,18 +1402,28 @@ pub async fn handle_remote_socket(
         }
     };
     let bounds = Arc::new(Mutex::new(source.input_bounds()));
-    let Some(probe) = source.capture() else {
-        let reason = "屏幕采集失败（macOS 需在系统设置授予「屏幕录制」权限后重启）".to_string();
-        let frame = seal_msg(
-            &noise,
-            &RemoteOut::Control(RemoteWire::RemoteEnd {
-                reason: Some(reason.clone()),
-            }),
-        )
-        .unwrap_or_default();
-        let _ = sink.send(Message::Binary(frame.into())).await;
-        end_session(&st, killed, controller_machine, peer_name, Some(reason));
-        return;
+    // 首帧探针：锁屏/安全桌面下可能一时拿不到画面。重试 ~3s 后仍失败
+    // 不再拒绝会话（旧逻辑直接 RemoteEnd，无人值守锁定时永远连不上），
+    // 改用纯色占位帧建立会话——解锁/采集恢复后真实画面自动跟上
+    let mut tries = 0usize;
+    let probe = loop {
+        if let Some(f) = safe_capture(source.as_mut()) {
+            break f;
+        }
+        tries += 1;
+        if tries >= 12 {
+            tracing::warn!("屏幕首帧探针失败（疑似锁屏或无显示输出），以占位帧继续会话");
+            let (w, h) = {
+                let b = bounds.lock().unwrap();
+                (b.0.max(640), b.1.max(360))
+            };
+            break Frame {
+                width: w,
+                height: h,
+                rgba: vec![16; (w * h * 4) as usize],
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     };
     let params = Arc::new(Mutex::new(QualityParams::default()));
     let first = scale_frame(&probe, params.lock().unwrap().max_width);
@@ -1533,7 +1561,11 @@ pub async fn handle_remote_socket(
                     // 上一帧滞留信箱（链路没跟上）：跳过本轮采集编码——
                     // 端到端永远只发最新帧，也不为会被覆盖的帧烧 CPU
                     let pending = queued_seq != cap_sent_seq.load(Ordering::Relaxed);
-                    if !pending && let Some(f) = source.capture() {
+                    // 锁屏/安全桌面下采集可能 panic：吞掉按"本帧无画面"处理，
+                    // 采集线程绝不能死（无人值守的核心保障）
+                    if !pending
+                        && let Some(f) = safe_capture(source.as_mut())
+                    {
                         let scaled = scale_frame(&f, max_side);
                         let hash = fnv_hash(&scaled.rgba);
                         // 静止画面每秒补发一帧（H.264 下强制 IDR）：首帧可能早于观看端
