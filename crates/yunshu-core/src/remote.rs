@@ -1010,8 +1010,8 @@ fn cmd_to_event(cmd: &InputCmd) -> Option<InputEvent> {
 
 fn spawn_input_thread(
     bounds: Arc<Mutex<(u32, u32)>>,
-    #[cfg(windows)] secure_route: Option<Arc<secure::Route>>,
-    #[cfg(not(windows))] _secure_route: Option<()>,
+    #[cfg(any(windows, target_os = "macos"))] secure_route: Option<Arc<secure::Route>>,
+    #[cfg(not(any(windows, target_os = "macos")))] _secure_route: Option<()>,
 ) -> std::sync::mpsc::Sender<InputCmd> {
     let (tx, rx) = std::sync::mpsc::channel::<InputCmd>();
     let fake = fake_screen_enabled();
@@ -1031,13 +1031,16 @@ fn spawn_input_thread(
                 }
             };
             for cmd in rx {
-                // 三期（Windows）：锁屏时注入改道 SYSTEM 安全助手（可达安全桌面）
-                #[cfg(windows)]
+                // 三期：锁屏时注入改道平台助手（Windows=SYSTEM 命名管道；macOS=root 助手）
+                #[cfg(any(windows, target_os = "macos"))]
                 if let Some(route) = &secure_route
                     && route.locked.load(Ordering::Relaxed)
                     && let Some(ev) = cmd_to_event(&cmd)
                 {
+                    #[cfg(windows)]
                     route.pipe.lock().unwrap().as_ref().map(|p| p.send_input(&ev));
+                    #[cfg(target_os = "macos")]
+                    route.sock.lock().unwrap().as_ref().map(|p| p.send_input(&ev));
                     continue;
                 }
                 let r: Result<(), _> = match cmd {
@@ -1524,12 +1527,12 @@ pub async fn handle_remote_socket(
     // 发送侧窗口统计（主循环累计、采集线程结算消费）：已发帧数 / 每帧发送耗时 ms
     let send_frames = Arc::new(AtomicU64::new(0));
     let send_ms = Arc::new(AtomicU64::new(0));
-    // 三期（Windows）：锁屏时采集/输入切换到 SYSTEM 安全助手（secure.rs）
-    #[cfg(windows)]
+    // 三期：锁屏时采集/输入切换到平台安全助手（Windows=SYSTEM 命名管道；macOS=root 输入助手）
+    #[cfg(any(windows, target_os = "macos"))]
     let secure_helper = secure::AgentSecure::new();
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     let secure_route = Some(secure_helper.route());
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     let secure_route = None;
     let input_tx = spawn_input_thread(bounds.clone(), secure_route);
     // 会话级编码格式（观看端能力协商后经 RemoteUseCodec 更新）；显示器切换请求
@@ -1551,7 +1554,7 @@ pub async fn handle_remote_socket(
         let cap_sent_seq = sent_seq.clone();
         let cap_send_frames = send_frames.clone();
         let cap_send_ms = send_ms.clone();
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         let mut cap_secure = secure_helper;
         let capture_thread = std::thread::Builder::new()
             .name("remote-capture".into())
@@ -1603,6 +1606,9 @@ pub async fn handle_remote_socket(
                             continue;
                         }
                     }
+                    // 三期（macOS）：采集保持本地（登录窗口可采），仅锁检测 + 输入改道
+                    #[cfg(target_os = "macos")]
+                    cap_secure.poll();
                     // 显示器切换请求（控制端下发）
                     if let Some(index) = cap_monitor.lock().unwrap().take()
                         && source.set_monitor(index)

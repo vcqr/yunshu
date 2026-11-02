@@ -12,12 +12,24 @@
 //! 命名管道，无任何网络面。安全边界与已知限制见 docs/远程控制功能调研.md 三期。
 
 use serde::{Deserialize, Serialize};
+#[cfg(any(windows, target_os = "macos"))]
+use std::sync::Mutex;
+#[cfg(any(windows, target_os = "macos"))]
+use std::sync::atomic::AtomicBool;
 
 // ===== 协议层（跨平台，单测覆盖）=====
 
 /// 服务每次启动随机生成的接管令牌（分别下发给助手与 agent）
 pub fn random_token() -> String {
     (0..32).map(|_| format!("{:02x}", rand::random::<u8>())).collect()
+}
+
+/// 恒时字符串比较（令牌握手用）
+fn constant_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// 本地命名管道名（按控制台会话区分）
@@ -108,6 +120,34 @@ mod tests {
         let s = serde_json::to_string(&req).unwrap();
         let back: SecureRequest = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, SecureRequest::Input { .. }));
+    }
+}
+
+/// 接管路由：输入线程据此把注入改道到平台助手（锁屏期间）。
+/// Windows = 命名管道（采集帧 + 输入）；macOS = unix 套接字（仅输入，采集保持本地）
+pub struct Route {
+    pub locked: AtomicBool,
+    #[cfg(windows)]
+    pub pipe: Mutex<Option<win::PipeClient>>,
+    #[cfg(target_os = "macos")]
+    pub sock: Mutex<Option<macos::UnixInputClient>>,
+}
+
+impl Route {
+    pub fn new() -> Self {
+        Route {
+            locked: AtomicBool::new(false),
+            #[cfg(windows)]
+            pipe: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            sock: Mutex::new(None),
+        }
+    }
+}
+
+impl Default for Route {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -509,13 +549,6 @@ mod win {
         // file drop 关闭句柄
     }
 
-    fn constant_eq(a: &str, b: &str) -> bool {
-        if a.len() != b.len() {
-            return false;
-        }
-        a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-    }
-
     /// 助手主循环：创建管道 → 等客户端 → 服务 → 断开后重建。永不返回
     pub fn run_helper(token: &str) -> ! {
         let session = console_session();
@@ -570,12 +603,6 @@ mod win {
         pub data: Vec<u8>,
     }
 
-    /// 共享路由：输入线程据此把注入改道助手（锁屏期间）
-    pub struct Route {
-        pub locked: AtomicBool,
-        pub pipe: Mutex<Option<PipeClient>>,
-    }
-
     /// agent 侧锁屏接管器：检测锁状态，管理与助手的管道
     pub struct AgentSecure {
         token: Option<String>,
@@ -589,10 +616,7 @@ mod win {
         pub fn new() -> Self {
             AgentSecure {
                 token: std::env::var("YUNSHU_SECURE_TOKEN").ok(),
-                route: Arc::new(Route {
-                    locked: AtomicBool::new(false),
-                    pipe: Mutex::new(None),
-                }),
+                route: Arc::new(Route::new()),
                 last_check: std::time::Instant::now() - std::time::Duration::from_secs(10),
                 sent_params: None,
             }
@@ -746,24 +770,285 @@ mod win {
 
 #[cfg(windows)]
 pub use win::{AgentSecure, PipeClient, Route};
+#[cfg(target_os = "macos")]
+pub use macos::{AgentSecure, plist_installed};
+
+
+// ===== macOS：锁检测 + root 输入助手（LaunchDaemon）+ 本地 unix 套接字 =====
+//
+// 平台差异：macOS 锁屏画面**用户级权限即可采集**（TCC 屏幕录制授权后，登录窗口
+// 出现在录屏流里），采集保持本地不动；真正被挡的是**输入**——loginwindow 属
+// root，用户会话的合成事件（CGEventPost）到不了安全桌面。因此 macOS 的三期
+// 助手是 root **输入助手**（LaunchDaemon 常驻），只做输入注入，不做采集。
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::*;
+    use crate::remote::InputEvent;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+
+    pub const SOCK_PATH: &str = "/var/run/yunshu-secure.sock";
+    const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/com.yunshu.secure.plist";
+
+    unsafe extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> *mut std::ffi::c_void;
+        fn CFDictionaryGetValue(dict: *const std::ffi::c_void, key: *const std::ffi::c_void)
+            -> *const std::ffi::c_void;
+        fn CFBooleanGetValue(boolean: *const std::ffi::c_void) -> bool;
+        fn CFRelease(cf: *const std::ffi::c_void);
+        fn CFStringCreateWithCString(
+            alloc: *const std::ffi::c_void,
+            c_str: *const std::ffi::c_char,
+            encoding: u32,
+        ) -> *const std::ffi::c_void;
+    }
+
+    /// 控制台会话是否锁定：CGSessionCopyCurrentDictionary 里
+    /// kCGSSessionOnConsoleKey 为假（或缺失）= 本会话已不持有控制台 = 已锁屏
+    pub fn console_locked() -> bool {
+        let dict = unsafe { CGSessionCopyCurrentDictionary() };
+        if dict.is_null() {
+            return false;
+        }
+        let key = unsafe {
+            CFStringCreateWithCString(
+                std::ptr::null(),
+                c"kCGSSessionOnConsoleKey".as_ptr(),
+                0x08000100, // kCFStringEncodingUTF8
+            )
+        };
+        let val = unsafe { CFDictionaryGetValue(dict, key) };
+        let on_console =
+            !val.is_null() && unsafe { CFBooleanGetValue(val) };
+        unsafe {
+            CFRelease(key);
+            CFRelease(dict);
+        }
+        !on_console
+    }
+
+    /// 从 LaunchDaemon 配置里取接管令牌（plist 全局可读）
+    pub fn token_from_plist() -> Option<String> {
+        let raw = std::fs::read_to_string(LAUNCHD_PLIST).ok()?;
+        let i = raw.find("--token")?;
+        let rest = raw[i + "--token".len()..].trim();
+        let tok: String = rest
+            .chars()
+            .skip_while(|c| c.is_whitespace() || *c == '<' || *c == '/' || *c == 's')
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect();
+        if tok.len() >= 16 {
+            Some(tok)
+        } else {
+            None
+        }
+    }
+
+    pub fn plist_installed() -> bool {
+        std::path::Path::new(LAUNCHD_PLIST).exists()
+    }
+
+    /// root 输入助手主循环：unix 套接字收 InputEvent → enigo 注入（root 可达登录窗口）
+    pub fn run_helper(token: &str) -> ! {
+        let _ = std::fs::remove_file(SOCK_PATH);
+        let listener = UnixListener::bind(SOCK_PATH).expect("助手套接字绑定失败");
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(SOCK_PATH, std::fs::Permissions::from_mode(0o666));
+        tracing::info!("macOS 输入助手就绪（{SOCK_PATH}）");
+        loop {
+            let (stream, _) = match listener.accept() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            serve_client(stream, token);
+        }
+    }
+
+    fn serve_client(stream: std::os::unix::net::UnixStream, token: &str) {
+        let mut reader = match stream.try_clone() {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let write = match stream.try_clone() {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        // 令牌握手
+        let ok = (|| -> Option<()> {
+            let (kind, payload) = read_frame(&mut reader).ok()?;
+            if kind != KIND_JSON {
+                return None;
+            }
+            match serde_json::from_slice::<SecureRequest>(&payload).ok()? {
+                SecureRequest::Hello { token: t } if constant_eq(&t, token) => Some(()),
+                _ => None,
+            }
+        })();
+        if ok.is_none() {
+            let _ = write_frame(
+                &mut { write },
+                KIND_JSON,
+                &serde_json::to_vec(&SecureResponse::Busy).unwrap_or_default(),
+            );
+            return;
+        }
+        let _ = write_frame(
+            &mut { write },
+            KIND_JSON,
+            &serde_json::to_vec(&SecureResponse::Ok).unwrap_or_default(),
+        );
+
+        let bounds = Arc::new(Mutex::new((0u32, 0u32)));
+        let input_tx = crate::remote::spawn_input_thread(bounds, None);
+        loop {
+            let (kind, payload) = match read_frame(&mut reader) {
+                Ok(v) => v,
+                Err(_) => break, // agent 断开（解锁切回本地）
+            };
+            if kind != KIND_JSON {
+                continue;
+            }
+            if let Ok(SecureRequest::Input { ev }) =
+                serde_json::from_slice::<SecureRequest>(&payload)
+            {
+                let _ = crate::remote::apply_input(&input_tx, ev);
+            }
+        }
+        let _ = write;
+    }
+
+    // ===== agent 侧接管器（仅输入路由；采集保持本地用户级）=====
+    pub struct AgentSecure {
+        route: Arc<Route>,
+        token: Option<String>,
+        last_check: std::time::Instant,
+    }
+
+    impl AgentSecure {
+        pub fn new() -> Self {
+            AgentSecure {
+                route: Arc::new(Route::new()),
+                token: token_from_plist(),
+                last_check: std::time::Instant::now() - std::time::Duration::from_secs(10),
+            }
+        }
+
+        pub fn route(&self) -> Arc<Route> {
+            self.route.clone()
+        }
+
+        /// 每次采集迭代调用（2s 节流）。锁屏时连接 root 输入助手（唤醒显示器）
+        pub fn poll(&mut self) {
+            if self.last_check.elapsed() < std::time::Duration::from_secs(2) {
+                return;
+            }
+            self.last_check = std::time::Instant::now();
+            let locked = console_locked();
+            let was = self.route.locked.swap(locked, Ordering::Relaxed);
+            if locked && !was {
+                let Some(token) = &self.token else {
+                    tracing::info!("屏幕已锁定：未安装输入助手（设置页安装后可远程解锁）");
+                    return;
+                };
+                match UnixInputClient::connect(token) {
+                    Ok(c) => {
+                        *self.route.sock.lock().unwrap() = Some(c);
+                        // caffeinate -u 模拟用户活动唤醒显示器
+                        let _ = std::process::Command::new("/usr/bin/caffeinate")
+                            .args(["-u", "-t", "2"])
+                            .spawn();
+                        tracing::info!("屏幕已锁定：输入切换到 root 助手（可远程输密码解锁）");
+                    }
+                    Err(e) => tracing::info!("锁屏输入助手连接失败: {e}"),
+                }
+            } else if !locked && was {
+                if let Some(c) = self.route.sock.lock().unwrap().take() {
+                    c.send_stop();
+                }
+                tracing::info!("屏幕已解锁：切回本地注入");
+            }
+        }
+    }
+
+    // ===== agent 侧客户端 =====
+
+    pub struct UnixInputClient {
+        stream: std::os::unix::net::UnixStream,
+    }
+
+    impl UnixInputClient {
+        pub fn connect(token: &str) -> std::io::Result<Self> {
+            use std::os::unix::net::UnixStream;
+            let stream = UnixStream::connect(SOCK_PATH)?;
+            let mut w = stream.try_clone()?;
+            write_frame(
+                &mut w,
+                KIND_JSON,
+                &serde_json::to_vec(&SecureRequest::Hello {
+                    token: token.to_string(),
+                })
+                .unwrap_or_default(),
+            )?;
+            let (kind, payload) = read_frame(&mut w)?;
+            if kind != KIND_JSON {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "握手格式"));
+            }
+            match serde_json::from_slice::<SecureResponse>(&payload) {
+                Ok(SecureResponse::Ok) => Ok(UnixInputClient { stream }),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "助手拒绝",
+                )),
+            }
+        }
+
+        pub fn send_input(&self, ev: &InputEvent) {
+            if let Ok(payload) = serde_json::to_vec(&SecureRequest::Input { ev: ev.clone() }) {
+                let mut w = match self.stream.try_clone() {
+                    Ok(w) => w,
+                    Err(_) => return,
+                };
+                let _ = write_frame(&mut w, KIND_JSON, &payload);
+            }
+        }
+
+        pub fn send_stop(&self) {
+            if let Ok(payload) = serde_json::to_vec(&SecureRequest::Stop) {
+                let mut w = match self.stream.try_clone() {
+                    Ok(w) => w,
+                    Err(_) => return,
+                };
+                let _ = write_frame(&mut w, KIND_JSON, &payload);
+            }
+        }
+    }
+}
 
 // ===== 平台入口分发 =====
 /// `yunshu secure --token <hex>`：进入 SYSTEM 安全助手（阻塞，永不返回）。
 /// 仅 Windows 且由服务拉起，其余情况返回 false 走正常启动流程
 pub fn try_run_helper_command() -> bool {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() != Some("secure") {
+        return false;
+    }
+    let token = args
+        .next()
+        .filter(|a| a == "--token")
+        .and_then(|_| args.next())
+        .unwrap_or_default();
+    #[cfg(windows)]
+    win::run_helper(&token);
     #[cfg(windows)]
     {
-        let mut args = std::env::args().skip(1);
-        if args.next().as_deref() == Some("secure") {
-            let token = args
-                .next()
-                .filter(|a| a == "--token")
-                .and_then(|_| args.next())
-                .unwrap_or_default();
-            win::run_helper(&token);
-        }
+        win::run_helper(&token);
         false
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::run_helper(&token)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     false
 }

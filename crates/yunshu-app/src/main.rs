@@ -620,9 +620,47 @@ fn service_install() -> Result<(), String> {
     {
         win_service::run_elevated(&["service", "install"])
     }
-    #[cfg(not(windows))]
+    // macOS：安装 root 输入助手（LaunchDaemon，开机常驻；令牌写在 plist 参数里）
+    #[cfg(target_os = "macos")]
     {
-        Err("系统服务自启仅支持 Windows（macOS 请用「开机自启」）".into())
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let token = yunshu_core::remote::secure::random_token();
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.yunshu.secure</string>
+  <key>ProgramArguments</key><array>
+    <string>{}</string>
+    <string>secure</string>
+    <string>--token</string>
+    <string>{}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict></plist>
+"#,
+            exe.display(),
+            token
+        );
+        std::fs::write("/tmp/com.yunshu.secure.plist", plist).map_err(|e| e.to_string())?;
+        let script = "mv /tmp/com.yunshu.secure.plist /Library/LaunchDaemons/com.yunshu.secure.plist && chown root:wheel /Library/LaunchDaemons/com.yunshu.secure.plist && chmod 644 /Library/LaunchDaemons/com.yunshu.secure.plist && launchctl bootstrap system /Library/LaunchDaemons/com.yunshu.secure.plist";
+        let st = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                &format!("do shell script \"{script}\" with administrator privileges"),
+            ])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if st.success() {
+            Ok(())
+        } else {
+            Err("安装未完成（需要管理员授权）".into())
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Err("系统服务自启仅支持 Windows".into())
     }
 }
 
@@ -633,7 +671,24 @@ fn service_uninstall() -> Result<(), String> {
     {
         win_service::run_elevated(&["service", "uninstall"])
     }
-    #[cfg(not(windows))]
+    // macOS：卸载 root 输入助手（LaunchDaemon）
+    #[cfg(target_os = "macos")]
+    {
+        let script = "launchctl bootout system/com.yunshu.secure 2>/dev/null; rm -f /Library/LaunchDaemons/com.yunshu.secure.plist";
+        let st = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                &format!("do shell script \"{script}\" with administrator privileges"),
+            ])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if st.success() {
+            Ok(())
+        } else {
+            Err("卸载未完成（需要管理员授权）".into())
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Err("系统服务自启仅支持 Windows".into())
     }
@@ -646,7 +701,16 @@ fn service_status() -> String {
     {
         win_service::status().unwrap_or_else(|e| format!("error:{e}"))
     }
-    #[cfg(not(windows))]
+    // macOS：LaunchDaemon 存在即视为已安装
+    #[cfg(target_os = "macos")]
+    {
+        if yunshu_core::remote::secure::plist_installed() {
+            "running".into()
+        } else {
+            "not_installed".into()
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         "unsupported".into()
     }
@@ -813,8 +877,8 @@ fn main() {
     if win_service::try_dispatch() {
         return;
     }
-    // 无人值守三期：SYSTEM 安全助手（服务拉起，锁屏采集/输入见 remote/secure.rs）
-    #[cfg(windows)]
+    // 无人值守三期：平台安全助手（服务拉起，锁屏采集/输入见 remote/secure.rs）
+    #[cfg(any(windows, target_os = "macos"))]
     if yunshu_core::remote::secure::try_run_helper_command() {
         return;
     }
