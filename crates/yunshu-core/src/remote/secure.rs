@@ -115,9 +115,9 @@ mod tests {
 #[cfg(windows)]
 mod win {
     use super::*;
-    use crate::remote::{InputCmd, InputEvent};
-    use std::io::Write;
+    use crate::remote::InputEvent;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+    use std::os::windows::io::FromRawHandle;
     use std::sync::{Arc, Mutex};
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Graphics::Gdi::{
@@ -128,20 +128,21 @@ mod win {
         AddAccessAllowedAce, ACL, GetTokenInformation, InitializeSecurityDescriptor,
         SECURITY_ATTRIBUTES, SetSecurityDescriptorDacl, TokenUser, WinLocalSystemSid, ACL_REVISION,
     };
+    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_ACCESS_DUPLEX,
-        PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+        PIPE_TYPE_BYTE, PIPE_WAIT,
     };
     use windows_sys::Win32::System::RemoteDesktop::{
         WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW, WTSINFOEXW,
-        WTS_CURRENT_SESSION, WTSSessionInfoEx,
+        WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSSessionInfoEx,
     };
     use windows_sys::Win32::System::StationsAndDesktops::{
         CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_READOBJECTS,
         DESKTOP_SWITCHDESKTOP, DESKTOP_WRITEOBJECTS,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
-    use windows_sys::core::{PWSTR, BOOL};
+    use windows_sys::core::PWSTR;
 
     /// 当前控制台会话 id
     pub fn console_session() -> u32 {
@@ -155,7 +156,7 @@ mod win {
             let mut buf: PWSTR = std::ptr::null_mut();
             let mut len = 0u32;
             if WTSQuerySessionInformationW(
-                0,
+                WTS_CURRENT_SERVER_HANDLE,
                 WTS_CURRENT_SESSION,
                 WTSSessionInfoEx,
                 &mut buf,
@@ -166,8 +167,8 @@ mod win {
             }
             let info = buf as *const WTSINFOEXW;
             // WTSINFOEXW = Level(u32) + union{Level1{SessionId,SessionState,SessionFlags…}}
-            // SessionFlags 位于偏移 12（Level 4 + SessionId 4 + SessionState 4）
-            let flags = unsafe { (*(info as *const u8)).add(12) as *const i32 };
+            // SessionFlags 位于偏移 12 字节（Level 4 + SessionId 4 + SessionState 4）
+            let flags = (info as *const u8).add(12) as *const i32;
             let locked = *flags == 1;
             WTSFreeMemory(buf as _);
             locked
@@ -197,7 +198,8 @@ mod win {
     }
 
     impl PipeSec {
-        unsafe fn build(session: u32) -> Option<Self> {
+        fn build(session: u32) -> Option<Self> {
+            unsafe {
             let mut user_tok = HANDLE::default();
             if windows_sys::Win32::System::RemoteDesktop::WTSQueryUserToken(
                 session,
@@ -253,6 +255,7 @@ mod win {
                 acl,
                 sid,
             })
+            }
         }
 
         fn as_sa(&self) -> SECURITY_ATTRIBUTES {
@@ -276,9 +279,9 @@ mod win {
             if desk.is_null() {
                 return None;
             }
-            // HDESK 用 CloseDesktop 释放（不能用 CloseHandle），函数末尾统一清理
+            // HDESK 用 CloseDesktop 释放（不能用 CloseHandle），所有路径都要关
             if SetThreadDesktop(desk) == 0 {
-                unsafe { CloseDesktop(desk) };
+                CloseDesktop(desk);
                 return None;
             }
             let w = GetSystemMetrics(SM_CXSCREEN).max(1) as u32;
@@ -319,6 +322,7 @@ mod win {
             SelectObject(mem, old);
             DeleteObject(bmp as _);
             DeleteDC(mem);
+            CloseDesktop(desk);
             if !ok {
                 return None;
             }
@@ -373,12 +377,13 @@ mod win {
                             );
                         }
                     }
-                    let scaled = crate::remote::scale_frame(&frame, params.max_width.load());
+                    let scaled =
+                        crate::remote::scale_frame(&frame, params.max_width.load(Ordering::Relaxed));
                     let hash = crate::remote::fnv_hash(&scaled.rgba);
                     let heartbeat = last_sent.elapsed() >= std::time::Duration::from_secs(1);
                     if hash != last_hash || heartbeat {
                         if let Some(jpeg) =
-                            crate::remote::encode_jpeg(&scaled, params.quality.load())
+                            crate::remote::encode_jpeg(&scaled, params.quality.load(Ordering::Relaxed))
                         {
                             let payload = {
                                 let mut p = vec![CODEC_JPEG_RELAY];
@@ -446,7 +451,7 @@ mod win {
             &serde_json::to_vec(&SecureResponse::Ok).unwrap_or_default(),
         );
 
-        let input_tx = crate::remote::spawn_input_thread(bounds.clone());
+        let input_tx = crate::remote::spawn_input_thread(bounds.clone(), None);
         let stop = Arc::new(AtomicBool::new(false));
         let mut capture: Option<std::thread::JoinHandle<()>> = None;
         let params = Arc::new(CaptureParams {
@@ -516,7 +521,7 @@ mod win {
         let bounds = Arc::new(Mutex::new((0u32, 0u32)));
         tracing::info!("安全助手启动（会话 {session}，管道 {name}）");
         loop {
-            let Some(sec) = (unsafe { PipeSec::build(session) }) else {
+            let Some(sec) = PipeSec::build(session) else {
                 std::thread::sleep(std::time::Duration::from_secs(3));
                 continue;
             };
@@ -537,7 +542,7 @@ mod win {
                 }
                 let _pipe_guard = handle_guard(handle);
                 // 阻塞等 agent 接入（锁屏触发；服务停时会杀本进程）
-                if ConnectNamedPipe(handle, std::ptr::null()) == 0 {
+                if ConnectNamedPipe(handle, std::ptr::null_mut()) == 0 {
                     let err = windows_sys::Win32::Foundation::GetLastError();
                     // ERROR_PIPE_CONNECTED：连接竞态下客户端已连上，直接服务
                     if err != 535 {
@@ -735,6 +740,9 @@ mod win {
         }
     }
 }
+
+#[cfg(windows)]
+pub use win::{AgentSecure, PipeClient, Route};
 
 // ===== 平台入口分发 =====
 /// `yunshu secure --token <hex>`：进入 SYSTEM 安全助手（阻塞，永不返回）。
